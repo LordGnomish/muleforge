@@ -14,12 +14,14 @@ pub mod checklist;
 pub mod ci_emitter;
 pub mod config_emitter;
 pub mod dataweave_emitter;
+pub mod docker_compose;
 pub mod env_generator;
 pub mod java_copier;
 pub mod k8s_emitter;
 pub mod kong_emitter;
 pub mod makefile_generator;
 pub mod munit_scaffold;
+pub mod route_diagram;
 pub mod routes_emitter;
 pub mod tests_emitter;
 

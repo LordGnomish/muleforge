@@ -41,7 +41,346 @@ pub fn try_pattern_convert(
         return Some(bean);
     }
 
+    if let Some(bean) = try_group_by(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_order_by(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_distinct_by(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_flatten(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_reduce(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_size_of(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_is_empty(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_upper_lower(trimmed, class_name) {
+        return Some(bean);
+    }
+
     None // No pattern matched — needs LLM
+}
+
+/// payload groupBy $.field
+fn try_group_by(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r"^payload\s+groupBy\s+\$\.(\w+)$").ok()?;
+    let caps = re.captures(body.trim())?;
+    let field = caps.get(1)?.as_str();
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * GroupBy: payload groupBy $.{field}
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        List<Map<String, Object>> payload = exchange.getIn().getBody(List.class);
+        Map<Object, List<Map<String, Object>>> grouped = payload.stream()
+            .collect(Collectors.groupingBy(item -> item.get("{field}")));
+        exchange.getIn().setBody(grouped);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload orderBy $.field
+fn try_order_by(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r"^payload\s+orderBy\s+\$\.(\w+)$").ok()?;
+    let caps = re.captures(body.trim())?;
+    let field = caps.get(1)?.as_str();
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * OrderBy: payload orderBy $.{field}
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        List<Map<String, Object>> payload = exchange.getIn().getBody(List.class);
+        List<Map<String, Object>> sorted = payload.stream()
+            .sorted(Comparator.comparing(item -> String.valueOf(item.get("{field}"))))
+            .collect(Collectors.toList());
+        exchange.getIn().setBody(sorted);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload distinctBy $.field
+fn try_distinct_by(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r"^payload\s+distinctBy\s+\$\.(\w+)$").ok()?;
+    let caps = re.captures(body.trim())?;
+    let field = caps.get(1)?.as_str();
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * DistinctBy: payload distinctBy $.{field}
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        List<Map<String, Object>> payload = exchange.getIn().getBody(List.class);
+        Set<Object> seen = new HashSet<>();
+        List<Map<String, Object>> distinct = payload.stream()
+            .filter(item -> seen.add(item.get("{field}")))
+            .collect(Collectors.toList());
+        exchange.getIn().setBody(distinct);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// flatten
+fn try_flatten(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if body != "flatten" && body != "payload flatten" && body != "flatten payload" {
+        return None;
+    }
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Flatten: nested arrays into single array.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        List<Object> payload = exchange.getIn().getBody(List.class);
+        List<Object> flat = payload.stream()
+            .flatMap(item -> {{
+                if (item instanceof List) {{
+                    return ((List<Object>) item).stream();
+                }}
+                return java.util.stream.Stream.of(item);
+            }})
+            .collect(Collectors.toList());
+        exchange.getIn().setBody(flat);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload reduce ($$, $) -> $$ ++ $ (sum/concat patterns)
+fn try_reduce(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    if !body.contains("reduce") {
+        return None;
+    }
+
+    // Simple sum: payload reduce ($$ + $)
+    if body.contains("$$ + $") || body.contains("$$+$") {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.List;
+
+/**
+ * Reduce (sum): payload reduce ($$ + $)
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        List<Number> payload = exchange.getIn().getBody(List.class);
+        double sum = payload.stream().mapToDouble(Number::doubleValue).sum();
+        exchange.getIn().setBody(sum);
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+
+    // Concat: payload reduce ($$ ++ $)
+    if body.contains("$$ ++ $") || body.contains("$$++$") {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * Reduce (concat): payload reduce ($$ ++ $)
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        List<Object> payload = exchange.getIn().getBody(List.class);
+        String result = payload.stream().map(String::valueOf).collect(Collectors.joining());
+        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+
+    None
+}
+
+/// sizeOf(payload)
+fn try_size_of(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if body != "sizeOf(payload)" && body != "sizeOf payload" {
+        return None;
+    }
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.Collection;
+
+/**
+ * sizeOf(payload) — returns the size/length of the payload.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        Object body = exchange.getIn().getBody();
+        int size;
+        if (body instanceof Collection) {{
+            size = ((Collection<?>) body).size();
+        }} else if (body instanceof String) {{
+            size = ((String) body).length();
+        }} else if (body instanceof byte[]) {{
+            size = ((byte[]) body).length;
+        }} else {{
+            size = String.valueOf(body).length();
+        }}
+        exchange.getIn().setBody(size);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// isEmpty(payload)
+fn try_is_empty(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if body != "isEmpty(payload)" && body != "payload is :empty" {
+        return None;
+    }
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.Collection;
+
+/**
+ * isEmpty(payload) — checks if payload is empty/null.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        Object body = exchange.getIn().getBody();
+        boolean empty;
+        if (body == null) {{
+            empty = true;
+        }} else if (body instanceof Collection) {{
+            empty = ((Collection<?>) body).isEmpty();
+        }} else if (body instanceof String) {{
+            empty = ((String) body).isEmpty();
+        }} else {{
+            empty = false;
+        }}
+        exchange.getIn().setBody(empty);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// upper(payload) / lower(payload)
+fn try_upper_lower(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    let (func, method) = if body == "upper(payload)" || body == "payload upper" {
+        ("upper", "toUpperCase")
+    } else if body == "lower(payload)" || body == "payload lower" {
+        ("lower", "toLowerCase")
+    } else {
+        return None;
+    };
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+
+/**
+ * {func}(payload) — converts payload string to {func}case.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        String body = exchange.getIn().getBody(String.class);
+        exchange.getIn().setBody(body != null ? body.{method}() : null);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
 }
 
 /// %dw 2.0 output application/json --- payload

@@ -166,7 +166,11 @@ pub async fn migrate(cfg: &MigrationConfig) -> Result<report::MigrationReport> {
     emitter::checklist::generate(&camel_ir, &report, &cfg.output_dir)?;
     emitter::env_generator::generate(&camel_ir, &cfg.output_dir)?;
     emitter::makefile_generator::generate(&camel_ir, &cfg.output_dir)?;
-    tracing::info!("generated CHECKLIST.md, .env.example, Makefile");
+    emitter::docker_compose::generate(&camel_ir, &cfg.output_dir)?;
+    emitter::route_diagram::generate(&camel_ir, &cfg.output_dir)?;
+    tracing::info!(
+        "generated CHECKLIST.md, .env.example, Makefile, docker-compose.yml, route-diagram.md"
+    );
 
     // 8. Git emit — init the output repo and commit.
     git::emit::emit(&cfg.output_dir, &cfg.git)?;
