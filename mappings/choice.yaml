@@ -1,0 +1,28 @@
+# Routing mappings: Mule choice/scatter-gather -> Camel EIP
+component: routing
+version: "1.0"
+
+mappings:
+  - id: choice-router
+    mule_ns: ""
+    mule_name: choice
+    camel_component: choice
+    notes: "Mule choice maps directly to Camel choice EIP"
+
+  - id: scatter-gather
+    mule_ns: ""
+    mule_name: scatter-gather
+    camel_component: multicast
+    notes: "Mule scatter-gather maps to Camel multicast with parallel processing"
+
+  - id: first-successful
+    mule_ns: ""
+    mule_name: first-successful
+    camel_component: failover
+    notes: "Mule first-successful maps to Camel failover load balancer"
+
+  - id: round-robin
+    mule_ns: ""
+    mule_name: round-robin
+    camel_component: loadBalance
+    notes: "Mule round-robin maps to Camel round-robin load balancer"

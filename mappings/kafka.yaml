@@ -1,0 +1,34 @@
+# Kafka connector mappings: Mule Kafka -> Camel Kafka
+component: kafka
+version: "1.0"
+
+mappings:
+  - id: kafka-consumer
+    mule_ns: kafka
+    mule_name: consumer
+    camel_uri: "kafka:{topic}"
+    camel_component: kafka
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-kafka
+    notes: "Kafka consumer maps to Camel kafka consumer endpoint"
+
+  - id: kafka-listener
+    mule_ns: kafka
+    mule_name: listener
+    camel_uri: "kafka:{topic}"
+    camel_component: kafka
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-kafka
+    notes: "Kafka listener (alias for consumer)"
+
+  - id: kafka-publish
+    mule_ns: kafka
+    mule_name: publish
+    camel_uri: "kafka:{topic}"
+    camel_component: kafka
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-kafka
+    notes: "Kafka publish maps to Camel kafka producer endpoint"

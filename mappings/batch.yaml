@@ -1,0 +1,28 @@
+# Batch processing mappings
+component: batch
+version: "1.0"
+
+mappings:
+  - id: batch-job
+    mule_ns: batch
+    mule_name: job
+    camel_component: split
+    notes: "Mule batch:job maps to Camel split + parallel processing + aggregation strategy. Complex — usually needs manual review."
+
+  - id: batch-step
+    mule_ns: batch
+    mule_name: step
+    camel_component: pipeline
+    notes: "Mule batch:step maps to a Camel pipeline stage within the split"
+
+  - id: batch-aggregator
+    mule_ns: batch
+    mule_name: aggregator
+    camel_component: aggregate
+    notes: "Mule batch:aggregator maps to Camel aggregate EIP"
+
+  - id: until-successful
+    mule_ns: ""
+    mule_name: until-successful
+    camel_component: loop
+    notes: "Mule until-successful maps to Camel loop with conditional break + error handler retry"

@@ -1,0 +1,34 @@
+# SFTP connector mappings: Mule SFTP -> Camel SFTP
+component: sftp
+version: "1.0"
+
+mappings:
+  - id: sftp-listener
+    mule_ns: sftp
+    mule_name: listener
+    camel_uri: "sftp:{host}:{port}/{directory}"
+    camel_component: sftp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-ftp
+    notes: "SFTP listener maps to Camel SFTP consumer"
+
+  - id: sftp-read
+    mule_ns: sftp
+    mule_name: read
+    camel_uri: "sftp:{host}:{port}/{directory}"
+    camel_component: sftp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-ftp
+    notes: "SFTP read maps to Camel SFTP consumer"
+
+  - id: sftp-write
+    mule_ns: sftp
+    mule_name: write
+    camel_uri: "sftp:{host}:{port}/{path}"
+    camel_component: sftp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-ftp
+    notes: "SFTP write maps to Camel SFTP producer"

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:kafka="http://www.mulesoft.org/schema/mule/kafka"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core
+                          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+                          http://www.mulesoft.org/schema/mule/kafka
+                          http://www.mulesoft.org/schema/mule/kafka/current/mule-kafka.xsd
+                          http://www.mulesoft.org/schema/mule/http
+                          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <kafka:consumer-config name="Kafka_Consumer_config" bootstrapServers="${kafka.brokers}"/>
+    <kafka:producer-config name="Kafka_Producer_config" bootstrapServers="${kafka.brokers}"/>
+
+    <flow name="orderIngest">
+        <kafka:message-listener config-ref="Kafka_Consumer_config"
+                                topic="orders.raw"
+                                groupId="order-ingest-group"/>
+        <logger level="INFO" message="Received order: #[payload]"/>
+        <kafka:publish config-ref="Kafka_Producer_config" topic="orders.validated"/>
+    </flow>
+
+</mule>

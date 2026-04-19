@@ -1,0 +1,49 @@
+[package]
+name = "muleforge-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Core transformation engine: Mule XML → Camel Quarkus project"
+license = "Apache-2.0"
+repository = "https://github.com/muleforge/muleforge"
+
+[lib]
+name = "muleforge_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "muleforge-core"
+path = "src/bin/main.rs"
+
+[dependencies]
+# XML parsing
+quick-xml = { version = "0.31", features = ["serialize"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# Templating for mapping rules
+minijinja = "1"
+
+# Error handling
+regex = "1"
+thiserror = "1"
+anyhow = "1"
+
+# CLI JSON-RPC protocol
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# HTTP client for LLM APIs
+reqwest = { version = "0.12", features = ["json"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+insta = "1"
+tempfile = "3"

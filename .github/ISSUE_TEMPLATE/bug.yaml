@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a bug in MuleForge
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please strip any secrets, customer data, or
+        proprietary Mule business logic from samples before submitting.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      placeholder: Describe the bug in a few sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproducer
+      description: |
+        A minimal Mule XML (secrets removed) and the command you ran.
+      render: xml
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MuleForge version
+      placeholder: "e.g., 0.2.0 or git sha"
+    validations:
+      required: true
+  - type: dropdown
+    id: llm
+    attributes:
+      label: LLM provider in use
+      options:
+        - Claude
+        - OpenAI
+        - Gemini
+        - Azure OpenAI
+        - Ollama
+        - None (--no-llm)
+    validations:
+      required: true

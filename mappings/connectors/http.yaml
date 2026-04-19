@@ -1,0 +1,60 @@
+# HTTP connector mapping rules
+# Each rule describes how a specific Mule HTTP element is translated into
+# a Camel Quarkus construct. The mapper engine reads these files and applies
+# them in declaration order within each file (first-match-wins for a given
+# element name).
+#
+# Schema version: 1
+
+schema_version: 1
+
+rules:
+  - id: mule.http.listener
+    description: |
+      Maps <http:listener> to a Camel platform-http consumer.
+      The listener path becomes the route's "from" URI.
+    match:
+      namespace: http
+      element: listener
+    emit:
+      route_source: consumer
+      camel_uri:
+        scheme: platform-http
+        path: "{{attr.path}}"
+        params:
+          httpMethodRestrict: "{{attr.allowedMethods | default('GET,POST,PUT,DELETE,PATCH')}}"
+    maven_dependencies:
+      - groupId: org.apache.camel.quarkus
+        artifactId: camel-quarkus-platform-http
+    quarkus_properties:
+      - key: quarkus.http.port
+        value: "{{listener_config.port | default('8080')}}"
+    notes: |
+      TLS: if the referenced listener-config defines TLS, emit:
+        quarkus.http.ssl.certificate.files=...
+        quarkus.http.ssl.certificate.key-files=...
+      These are added by the config emitter, not by this rule.
+
+  - id: mule.http.request
+    description: |
+      Maps <http:request> to a Camel HTTP producer call.
+    match:
+      namespace: http
+      element: request
+    emit:
+      route_source: producer
+      camel_uri:
+        scheme: "{{attr.method | lower}}"
+        # The concrete URL is built from the request-config's baseUri plus
+        # this element's "path" attribute. The emitter resolves this.
+        url_from: "{{request_config.baseUri}}{{attr.path}}"
+      headers:
+        # If the Mule element has <http:headers>, each becomes a .setHeader()
+        mapping: element.children.headers
+    maven_dependencies:
+      - groupId: org.apache.camel.quarkus
+        artifactId: camel-quarkus-http
+    notes: |
+      Authentication: basic, OAuth2, and client-credentials flows on the
+      request-config are mapped to Camel's http-component options or to
+      a Quarkus REST Client binding where applicable.

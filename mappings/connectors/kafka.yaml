@@ -1,0 +1,105 @@
+# Kafka connector mapping rules
+# Schema version: 1
+
+schema_version: 1
+
+rules:
+  - id: mule.kafka.consumer
+    description: |
+      Maps <kafka:message-listener> (or older <kafka:consumer>) to a
+      Camel Kafka consumer.
+    match:
+      namespace: kafka
+      element: ["message-listener", "consumer"]
+    emit:
+      route_source: consumer
+      camel_uri:
+        scheme: kafka
+        path: "{{attr.topic}}"
+        params:
+          brokers: "{{config.bootstrapServers}}"
+          groupId: "{{attr.groupId | default(flow.name + '-group')}}"
+          autoOffsetReset: "{{attr.autoOffsetReset | default('latest')}}"
+          securityProtocol: "{{config.securityProtocol | default('PLAINTEXT')}}"
+    maven_dependencies:
+      - groupId: org.apache.camel.quarkus
+        artifactId: camel-quarkus-kafka
+    quarkus_properties:
+      - key: camel.component.kafka.brokers
+        value: "{{config.bootstrapServers}}"
+    notes: |
+      For Confluent Cloud or SASL-authenticated clusters, the config emitter
+      adds:
+        camel.component.kafka.sasl-mechanism=PLAIN
+        camel.component.kafka.security-protocol=SASL_SSL
+        camel.component.kafka.sasl-jaas-config=...
+      Secrets are never inlined; they are emitted as MicroProfile Config
+      placeholders (e.g., ${kafka.sasl.password}).
+
+  - id: mule.kafka.publisher
+    description: |
+      Maps <kafka:publish> (or <kafka:message-publisher>) to a Camel
+      Kafka producer.
+    match:
+      namespace: kafka
+      element: ["publish", "message-publisher"]
+    emit:
+      route_source: producer
+      camel_uri:
+        scheme: kafka
+        path: "{{attr.topic}}"
+        params:
+          brokers: "{{config.bootstrapServers}}"
+          securityProtocol: "{{config.securityProtocol | default('PLAINTEXT')}}"
+    maven_dependencies:
+      - groupId: org.apache.camel.quarkus
+        artifactId: camel-quarkus-kafka
+    notes: |
+      Message key: if the Mule element sets a key expression, emit a
+      .setHeader("kafka.KEY", simple("...")) before the .to(...).
+
+  - id: mule.anypoint-mq.subscriber
+    description: |
+      Anypoint MQ has no direct open-source equivalent. By default MuleForge
+      redirects to Kafka. Users who prefer RabbitMQ, ActiveMQ, or Artemis
+      can override this rule via a user-supplied mapping override file.
+    match:
+      namespace: anypoint-mq
+      element: subscriber
+    emit:
+      route_source: consumer
+      camel_uri:
+        scheme: kafka
+        path: "{{attr.destination}}"
+        params:
+          brokers: "${kafka.brokers}"
+          groupId: "{{flow.name}}-group"
+    migration_report:
+      level: MANUAL_REVIEW
+      rationale: |
+        Anypoint MQ FIFO ordering, deduplication, and long-polling semantics
+        differ from Kafka. Review consumer behavior, especially if the flow
+        relies on visibility timeouts or message acknowledgment modes.
+    maven_dependencies:
+      - groupId: org.apache.camel.quarkus
+        artifactId: camel-quarkus-kafka
+
+  - id: mule.anypoint-mq.publisher
+    match:
+      namespace: anypoint-mq
+      element: publish
+    emit:
+      route_source: producer
+      camel_uri:
+        scheme: kafka
+        path: "{{attr.destination}}"
+        params:
+          brokers: "${kafka.brokers}"
+    migration_report:
+      level: MANUAL_REVIEW
+      rationale: |
+        Confirm that Kafka topic semantics (partitions, retention) match
+        the original Anypoint MQ queue/exchange expectations.
+    maven_dependencies:
+      - groupId: org.apache.camel.quarkus
+        artifactId: camel-quarkus-kafka

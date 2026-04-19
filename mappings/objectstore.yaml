@@ -1,0 +1,45 @@
+# Object Store / VM / Watermark mappings
+component: objectstore
+version: "1.0"
+
+mappings:
+  - id: os-store
+    mule_ns: os
+    mule_name: store
+    camel_uri: "infinispan:objectStore?operation=PUT"
+    camel_component: infinispan
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-infinispan
+    notes: "Mule Object Store maps to Camel Infinispan (or Redis) for distributed cache"
+
+  - id: os-retrieve
+    mule_ns: os
+    mule_name: retrieve
+    camel_uri: "infinispan:objectStore?operation=GET"
+    camel_component: infinispan
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-infinispan
+    notes: "Object Store retrieve maps to Camel Infinispan GET"
+
+  - id: vm-publish
+    mule_ns: vm
+    mule_name: publish
+    camel_uri: "seda:{queueName}"
+    camel_component: seda
+    notes: "VM queue publish maps to Camel SEDA (in-memory async queue)"
+
+  - id: vm-listener
+    mule_ns: vm
+    mule_name: listener
+    camel_uri: "seda:{queueName}"
+    camel_component: seda
+    notes: "VM queue listener maps to Camel SEDA consumer"
+
+  - id: vm-consume
+    mule_ns: vm
+    mule_name: consume
+    camel_uri: "seda:{queueName}?timeout=10000"
+    camel_component: seda
+    notes: "VM queue consume (request-reply) maps to Camel SEDA"

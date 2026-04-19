@@ -1,0 +1,24 @@
+# AMQP connector mappings
+component: amqp
+version: "1.0"
+
+mappings:
+  - id: amqp-listener
+    mule_ns: amqp
+    mule_name: listener
+    camel_uri: "amqp:queue:{destination}"
+    camel_component: amqp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-amqp
+    notes: "AMQP listener maps to Camel AMQP consumer"
+
+  - id: amqp-publish
+    mule_ns: amqp
+    mule_name: publish
+    camel_uri: "amqp:queue:{destination}"
+    camel_component: amqp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-amqp
+    notes: "AMQP publish maps to Camel AMQP producer"

@@ -1,0 +1,34 @@
+# File connector mappings: Mule File -> Camel File
+component: file
+version: "1.0"
+
+mappings:
+  - id: file-listener
+    mule_ns: file
+    mule_name: listener
+    camel_uri: "file:{directory}?recursive={recursive}"
+    camel_component: file
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-file
+    notes: "File listener maps to Camel file consumer"
+
+  - id: file-read
+    mule_ns: file
+    mule_name: read
+    camel_uri: "file:{directory}"
+    camel_component: file
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-file
+    notes: "File read maps to Camel file consumer"
+
+  - id: file-write
+    mule_ns: file
+    mule_name: write
+    camel_uri: "file:{path}"
+    camel_component: file
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-file
+    notes: "File write maps to Camel file producer"

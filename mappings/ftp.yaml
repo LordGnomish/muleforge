@@ -1,0 +1,34 @@
+# FTP connector mappings
+component: ftp
+version: "1.0"
+
+mappings:
+  - id: ftp-listener
+    mule_ns: ftp
+    mule_name: listener
+    camel_uri: "ftp://{host}:{port}/{directory}"
+    camel_component: ftp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-ftp
+    notes: "FTP listener maps to Camel FTP consumer"
+
+  - id: ftp-read
+    mule_ns: ftp
+    mule_name: read
+    camel_uri: "ftp://{host}:{port}/{directory}"
+    camel_component: ftp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-ftp
+    notes: "FTP read maps to Camel FTP consumer"
+
+  - id: ftp-write
+    mule_ns: ftp
+    mule_name: write
+    camel_uri: "ftp://{host}:{port}/{path}"
+    camel_component: ftp
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-ftp
+    notes: "FTP write maps to Camel FTP producer"

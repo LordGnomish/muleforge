@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+
+    <http:listener-config name="HTTP_Listener_config">
+        <http:listener-connection host="0.0.0.0" port="8081" />
+    </http:listener-config>
+
+    <!-- Simple hello endpoint -->
+    <flow name="helloFlow">
+        <http:listener config-ref="HTTP_Listener_config" path="/hello" allowedMethods="GET" />
+        <set-payload value="Hello from MuleForge!" />
+        <logger message="Hello endpoint called" level="INFO" />
+    </flow>
+
+    <!-- Echo endpoint with transformation -->
+    <flow name="echoFlow">
+        <http:listener config-ref="HTTP_Listener_config" path="/echo" allowedMethods="POST" />
+        <set-variable variableName="originalPayload" value="#[payload]" />
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    { echo: payload, timestamp: now(), source: "muleforge-demo" }
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <logger message="Echo response sent" level="INFO" />
+    </flow>
+
+    <!-- Routing example -->
+    <flow name="routerFlow">
+        <http:listener config-ref="HTTP_Listener_config" path="/route" allowedMethods="POST" />
+        <choice>
+            <when expression="#[payload.type == 'A']">
+                <set-payload value="Routed to handler A" />
+            </when>
+            <when expression="#[payload.type == 'B']">
+                <set-payload value="Routed to handler B" />
+            </when>
+            <otherwise>
+                <set-payload value="Default handler" />
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Error handling example -->
+    <flow name="safeFlow">
+        <http:listener config-ref="HTTP_Listener_config" path="/safe" allowedMethods="GET" />
+        <http:request method="GET" url="http://httpbin.org/get" />
+        <error-handler>
+            <on-error-continue type="HTTP:CONNECTIVITY">
+                <set-payload value="Service temporarily unavailable" />
+                <logger message="Upstream service unreachable" level="WARN" />
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- Sub-flow example -->
+    <sub-flow name="enrichPayload">
+        <set-variable variableName="enriched" value="true" />
+        <logger message="Payload enriched" level="DEBUG" />
+    </sub-flow>
+
+</mule>

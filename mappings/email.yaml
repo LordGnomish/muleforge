@@ -1,0 +1,34 @@
+# Email connector mappings
+component: email
+version: "1.0"
+
+mappings:
+  - id: email-listener
+    mule_ns: email
+    mule_name: listener-imap
+    camel_uri: "imap://{host}:{port}"
+    camel_component: mail
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-mail
+    notes: "IMAP listener maps to Camel mail consumer"
+
+  - id: email-send
+    mule_ns: email
+    mule_name: send
+    camel_uri: "smtp://{host}:{port}"
+    camel_component: mail
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-mail
+    notes: "Email send maps to Camel SMTP producer"
+
+  - id: email-listener-pop3
+    mule_ns: email
+    mule_name: listener-pop3
+    camel_uri: "pop3://{host}:{port}"
+    camel_component: mail
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-mail
+    notes: "POP3 listener maps to Camel POP3 consumer"
