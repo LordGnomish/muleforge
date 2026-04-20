@@ -66,7 +66,604 @@ pub fn try_pattern_convert(
         return Some(bean);
     }
 
+    if let Some(bean) = try_pluck(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_split_by(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_join_by(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_contains(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_replace(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_trim(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_now_uuid(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_write_read(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_if_else(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_object_merge(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_map_object(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_type_check(trimmed, class_name) {
+        return Some(bean);
+    }
+    if let Some(bean) = try_multi_field_construct(trimmed, class_name) {
+        return Some(bean);
+    }
+
     None // No pattern matched — needs LLM
+}
+
+/// payload pluck (val, key) -> { key: val }  —  object to array of key-value pairs
+fn try_pluck(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if !body.contains("pluck") {
+        return None;
+    }
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+
+/**
+ * Pluck: converts object entries to array of key-value pairs.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        Map<String, Object> payload = exchange.getIn().getBody(Map.class);
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (payload != null) {{
+            payload.forEach((key, value) -> {{
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("key", key);
+                entry.put("value", value);
+                result.add(entry);
+            }});
+        }}
+        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload splitBy ","  or  "string" splitBy regex
+fn try_split_by(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r#"^payload\s+splitBy\s+"([^"]+)"$"#).ok()?;
+    let caps = re.captures(body.trim())?;
+    let delimiter = caps.get(1)?.as_str();
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.Arrays;
+
+/**
+ * SplitBy: payload splitBy "{delimiter}"
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        String body = exchange.getIn().getBody(String.class);
+        exchange.getIn().setBody(Arrays.asList(body.split("{delimiter}")));
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload joinBy ","
+fn try_join_by(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r#"^payload\s+joinBy\s+"([^"]*)"$"#).ok()?;
+    let caps = re.captures(body.trim())?;
+    let delimiter = caps.get(1)?.as_str();
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * JoinBy: payload joinBy "{delimiter}"
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        List<Object> body = exchange.getIn().getBody(List.class);
+        String result = body.stream().map(String::valueOf).collect(Collectors.joining("{delimiter}"));
+        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload contains "value"  or  payload contains value
+fn try_contains(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r#"^payload\s+contains\s+"?([^"]*)"?$"#).ok()?;
+    let caps = re.captures(body.trim())?;
+    let value = caps.get(1)?.as_str();
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.Collection;
+
+/**
+ * Contains check: payload contains "{value}"
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        Object body = exchange.getIn().getBody();
+        boolean result;
+        if (body instanceof String) {{
+            result = ((String) body).contains("{value}");
+        }} else if (body instanceof Collection) {{
+            result = ((Collection<?>) body).contains("{value}");
+        }} else {{
+            result = String.valueOf(body).contains("{value}");
+        }}
+        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload replace "old" with "new"
+fn try_replace(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r#"^payload\s+replace\s+"([^"]*)"\s+with\s+"([^"]*)"$"#).ok()?;
+    let caps = re.captures(body.trim())?;
+    let old_str = caps.get(1)?.as_str();
+    let new_str = caps.get(2)?.as_str();
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+
+/**
+ * Replace: payload replace "{old_str}" with "{new_str}"
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        String body = exchange.getIn().getBody(String.class);
+        exchange.getIn().setBody(body != null ? body.replace("{old_str}", "{new_str}") : null);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// trim(payload)
+fn try_trim(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if body != "trim(payload)" && body != "payload trim" {
+        return None;
+    }
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+
+/**
+ * trim(payload)
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        String body = exchange.getIn().getBody(String.class);
+        exchange.getIn().setBody(body != null ? body.trim() : null);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// now(), uuid()
+fn try_now_uuid(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if body == "now()" {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.time.Instant;
+
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        exchange.getIn().setBody(Instant.now().toString());
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+    if body == "uuid()" {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.UUID;
+
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        exchange.getIn().setBody(UUID.randomUUID().toString());
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+    None
+}
+
+/// write(payload, "application/json") / read(payload, "application/json")
+fn try_write_read(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if body.starts_with("write(payload") {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+/**
+ * write(payload, ...) — serialize to JSON
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        Object body = exchange.getIn().getBody();
+        exchange.getIn().setBody(mapper.writeValueAsString(body));
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+    if body.starts_with("read(payload") {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.Map;
+
+/**
+ * read(payload, ...) — deserialize from JSON
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        String body = exchange.getIn().getBody(String.class);
+        exchange.getIn().setBody(mapper.readValue(body, Map.class));
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+    None
+}
+
+/// if (condition) value1 else value2
+fn try_if_else(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    let re = Regex::new(r#"^if\s*\((.+?)\)\s+"([^"]+)"\s+else\s+"([^"]+)"$"#).ok()?;
+    let caps = re.captures(body)?;
+    let condition = caps.get(1)?.as_str();
+    let then_val = caps.get(2)?.as_str();
+    let else_val = caps.get(3)?.as_str();
+
+    // Convert condition
+    let java_cond = condition
+        .replace("payload.", "body.get(\"")
+        .replace(" ==", "\").equals(")
+        .replace(" !=", "\") != null && !body.get(\"");
+    // Simplified — works for basic payload.field == "value" patterns
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.Map;
+
+/**
+ * Conditional: if ({condition}) "{then_val}" else "{else_val}"
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        Map<String, Object> body = exchange.getIn().getBody(Map.class);
+        // TODO: verify condition logic — auto-converted from DataWeave
+        boolean condition = {java_cond} != null;
+        exchange.getIn().setBody(condition ? "{then_val}" : "{else_val}");
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload ++ { newField: "value" }  —  object merge
+fn try_object_merge(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw);
+    let re = Regex::new(r"^payload\s*\+\+\s*\{(.+)\}$").ok()?;
+    let caps = re.captures(body.trim())?;
+    let fields = caps.get(1)?.as_str();
+
+    let field_re = Regex::new(r#"(\w+)\s*:\s*"([^"]*)""#).ok()?;
+    let pairs: Vec<(String, String)> = field_re
+        .captures_iter(fields)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect();
+
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let mut puts = String::new();
+    for (k, v) in &pairs {
+        puts.push_str(&format!("        result.put(\"{}\", \"{}\");\n", k, v));
+    }
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+
+/**
+ * Object merge: payload ++ {{ ... }}
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        Map<String, Object> payload = exchange.getIn().getBody(Map.class);
+        Map<String, Object> result = new LinkedHashMap<>(payload != null ? payload : Map.of());
+{puts}        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// payload mapObject { (key): value }
+fn try_map_object(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if !body.contains("mapObject") {
+        return None;
+    }
+
+    // Simple key transform: payload mapObject { (upper($$)): $ }
+    if body.contains("upper($$)") {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+
+/**
+ * mapObject: transform object keys to uppercase.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        Map<String, Object> payload = exchange.getIn().getBody(Map.class);
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (payload != null) {{
+            payload.forEach((k, v) -> result.put(k.toUpperCase(), v));
+        }}
+        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+
+    if body.contains("lower($$)") {
+        let java = format!(
+            r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+
+/**
+ * mapObject: transform object keys to lowercase.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        Map<String, Object> payload = exchange.getIn().getBody(Map.class);
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (payload != null) {{
+            payload.forEach((k, v) -> result.put(k.toLowerCase(), v));
+        }}
+        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+        );
+        return Some(make_bean(class_name, &java, dw));
+    }
+
+    None
+}
+
+/// payload is String / payload is Number / payload is Array
+fn try_type_check(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    let re = Regex::new(r"^payload\s+is\s+:?(\w+)$").ok()?;
+    let caps = re.captures(body)?;
+    let type_name = caps.get(1)?.as_str();
+
+    let java_check = match type_name {
+        "String" => "body instanceof String",
+        "Number" => "body instanceof Number",
+        "Boolean" => "body instanceof Boolean",
+        "Array" => "body instanceof java.util.List",
+        "Object" => "body instanceof java.util.Map",
+        "Null" | "null" => "body == null",
+        _ => return None,
+    };
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+
+/**
+ * Type check: payload is {type_name}
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    public void process(Exchange exchange) throws Exception {{
+        Object body = exchange.getIn().getBody();
+        exchange.getIn().setBody({java_check});
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
+}
+
+/// { field1: value1, field2: payload.x, field3: now(), ... } — complex object construction
+fn try_multi_field_construct(dw: &str, class_name: &str) -> Option<GeneratedBean> {
+    let body = extract_dw_body(dw).trim();
+    if !body.starts_with('{') || !body.ends_with('}') {
+        return None;
+    }
+    let inner = &body[1..body.len() - 1];
+
+    // Match patterns: field: "literal", field: payload.x, field: now(), field: uuid()
+    let field_re = Regex::new(r#"(\w+)\s*:\s*([^,}]+)"#).ok()?;
+    let fields: Vec<(String, String)> = field_re
+        .captures_iter(inner)
+        .map(|c| (c[1].to_string(), c[2].trim().to_string()))
+        .collect();
+
+    if fields.len() < 2 {
+        return None; // Single field handled by simpler patterns
+    }
+
+    let mut puts = String::new();
+    for (key, value) in &fields {
+        let java_value = if value.starts_with('"') && value.ends_with('"') {
+            value.clone() // literal string
+        } else if value.starts_with("payload.") {
+            let field = value.strip_prefix("payload.").unwrap_or(value);
+            format!("input.get(\"{}\")", field)
+        } else if value == "payload" {
+            "exchange.getIn().getBody()".into()
+        } else if value == "now()" {
+            "java.time.Instant.now().toString()".into()
+        } else if value == "uuid()" {
+            "java.util.UUID.randomUUID().toString()".into()
+        } else if value.starts_with("vars.") || value.starts_with("flowVars.") {
+            let var = value.split('.').nth(1).unwrap_or("unknown");
+            format!("exchange.getProperty(\"{}\", Object.class)", var)
+        } else if value.starts_with("attributes.") {
+            let attr = value.split('.').nth(1).unwrap_or("unknown");
+            format!("exchange.getIn().getHeader(\"{}\")", attr)
+        } else {
+            format!("\"{}\" /* TODO: verify */", value)
+        };
+        puts.push_str(&format!(
+            "        result.put(\"{}\", {});\n",
+            key, java_value
+        ));
+    }
+
+    let java = format!(
+        r#"import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import java.util.*;
+
+/**
+ * Object construction with multiple fields.
+ */
+@ApplicationScoped
+public class {class_name} implements Processor {{
+    @Override
+    @SuppressWarnings("unchecked")
+    public void process(Exchange exchange) throws Exception {{
+        Map<String, Object> input = exchange.getIn().getBody(Map.class);
+        if (input == null) input = Map.of();
+        Map<String, Object> result = new LinkedHashMap<>();
+{puts}        exchange.getIn().setBody(result);
+    }}
+}}
+"#
+    );
+    Some(make_bean(class_name, &java, dw))
 }
 
 /// payload groupBy $.field
