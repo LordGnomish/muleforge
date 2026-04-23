@@ -1,0 +1,114 @@
+metadata:
+  version: 1
+  daily_commits: {}
+
+items:
+  - id: mf-001
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: transformMessage
+    file_path: core/src/dataweave/converter.rs
+    priority: 10
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-002
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: setPayload
+    file_path: core/src/dataweave/patterns.rs
+    priority: 9
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-003
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: httpRequest
+    file_path: core/src/emitter/routes_emitter.rs
+    priority: 9
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-004
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: kafkaPublish
+    file_path: core/src/emitter/ci_emitter.rs
+    priority: 8
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-005
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: choiceRouter
+    file_path: core/src/mapper/mod.rs
+    priority: 8
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-006
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: errorHandler
+    file_path: core/src/parser/mod.rs
+    priority: 7
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-007
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: dbSelect
+    file_path: core/src/emitter/dataweave_emitter.rs
+    priority: 7
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-008
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: asyncScope
+    file_path: core/src/emitter/k8s_emitter.rs
+    priority: 6
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-009
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: scatterGather
+    file_path: core/src/emitter/tests_emitter.rs
+    priority: 6
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+
+  - id: mf-010
+    crate_name: muleforge-core
+    upstream_repo: mulesoft/mule
+    upstream_fn: melExpression
+    file_path: core/src/mel/mod.rs
+    priority: 5
+    status: pending
+    attempts: 0
+    branch: qwen/auto-2026-W17
+    repo_path: /Users/gnomish/Documents/claude/platform/muleforge
