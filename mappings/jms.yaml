@@ -1,0 +1,34 @@
+# JMS connector mappings: Mule JMS -> Camel JMS
+component: jms
+version: "1.0"
+
+mappings:
+  - id: jms-listener
+    mule_ns: jms
+    mule_name: listener
+    camel_uri: "jms:queue:{destination}"
+    camel_component: jms
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-jms
+    notes: "JMS listener maps to Camel JMS consumer"
+
+  - id: jms-publish
+    mule_ns: jms
+    mule_name: publish
+    camel_uri: "jms:queue:{destination}"
+    camel_component: jms
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-jms
+    notes: "JMS publish maps to Camel JMS producer"
+
+  - id: jms-consume
+    mule_ns: jms
+    mule_name: consume
+    camel_uri: "jms:queue:{destination}?receiveTimeout=10000"
+    camel_component: jms
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-jms
+    notes: "JMS consume (request-reply) maps to Camel JMS"

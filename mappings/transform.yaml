@@ -1,0 +1,43 @@
+# Transformation mappings: Mule transform/DataWeave -> Camel processors
+component: transformation
+version: "1.0"
+
+mappings:
+  - id: set-payload
+    mule_ns: ""
+    mule_name: set-payload
+    camel_component: setBody
+    notes: "Mule set-payload maps to Camel setBody"
+
+  - id: set-variable
+    mule_ns: ""
+    mule_name: set-variable
+    camel_component: setProperty
+    notes: "Mule set-variable maps to Camel exchange property"
+
+  - id: remove-variable
+    mule_ns: ""
+    mule_name: remove-variable
+    camel_component: removeProperty
+    notes: "Mule remove-variable maps to Camel removeProperty"
+
+  - id: transform-message
+    mule_ns: ee
+    mule_name: transform
+    camel_component: bean
+    notes: "Mule DataWeave transform requires LLM or manual conversion to Java bean"
+
+  - id: foreach
+    mule_ns: ""
+    mule_name: foreach
+    camel_component: split
+    notes: "Mule foreach maps to Camel split EIP"
+
+  - id: parse-template
+    mule_ns: ""
+    mule_name: parse-template
+    camel_component: freemarker
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-freemarker
+    notes: "Mule parse-template maps to Camel Freemarker component"

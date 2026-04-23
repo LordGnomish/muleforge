@@ -1,0 +1,22 @@
+# Rust build artifacts
+target/
+**/*.o
+**/*.d
+
+# Node / npm
+node_modules/
+dist/
+
+# Claude Code worktrees
+.claude/
+
+# macOS
+.DS_Store
+
+# Env files
+.env
+.env.local
+
+# Editor
+.idea/
+.vscode/

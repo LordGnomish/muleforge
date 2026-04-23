@@ -1,0 +1,22 @@
+# Error handling mappings: Mule error-handler -> Camel onException
+component: error-handling
+version: "1.0"
+
+mappings:
+  - id: on-error-propagate
+    mule_ns: ""
+    mule_name: on-error-propagate
+    camel_component: onException
+    notes: "Mule on-error-propagate maps to Camel onException(handled=false)"
+
+  - id: on-error-continue
+    mule_ns: ""
+    mule_name: on-error-continue
+    camel_component: onException
+    notes: "Mule on-error-continue maps to Camel onException(handled=true)"
+
+  - id: try-scope
+    mule_ns: ""
+    mule_name: try
+    camel_component: doTry
+    notes: "Mule try scope maps to Camel doTry/doCatch/doFinally"

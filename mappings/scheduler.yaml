@@ -1,0 +1,24 @@
+# Scheduler mappings: Mule Scheduler -> Camel Timer/Quartz
+component: scheduler
+version: "1.0"
+
+mappings:
+  - id: scheduler-fixed
+    mule_ns: ""
+    mule_name: scheduler
+    camel_uri: "timer:scheduler?period={frequency}"
+    camel_component: timer
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-timer
+    notes: "Fixed-frequency scheduler maps to Camel timer"
+
+  - id: scheduler-cron
+    mule_ns: scheduling-strategy
+    mule_name: cron-scheduler
+    camel_uri: "quartz:scheduler?cron={expression}"
+    camel_component: quartz
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-quartz
+    notes: "Cron scheduler maps to Camel Quartz component"

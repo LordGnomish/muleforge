@@ -1,0 +1,64 @@
+# Salesforce connector mappings
+component: salesforce
+version: "1.0"
+
+mappings:
+  - id: sfdc-query
+    mule_ns: salesforce
+    mule_name: query
+    camel_uri: "salesforce:query?sObjectQuery={query}"
+    camel_component: salesforce
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-salesforce
+    notes: "Salesforce SOQL query maps to Camel Salesforce component"
+
+  - id: sfdc-create
+    mule_ns: salesforce
+    mule_name: create
+    camel_uri: "salesforce:createSObject?sObjectName={type}"
+    camel_component: salesforce
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-salesforce
+    notes: "Salesforce create maps to Camel Salesforce createSObject"
+
+  - id: sfdc-update
+    mule_ns: salesforce
+    mule_name: update
+    camel_uri: "salesforce:updateSObject?sObjectName={type}"
+    camel_component: salesforce
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-salesforce
+    notes: "Salesforce update maps to Camel Salesforce updateSObject"
+
+  - id: sfdc-delete
+    mule_ns: salesforce
+    mule_name: delete
+    camel_uri: "salesforce:deleteSObject?sObjectName={type}"
+    camel_component: salesforce
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-salesforce
+    notes: "Salesforce delete maps to Camel Salesforce deleteSObject"
+
+  - id: sfdc-upsert
+    mule_ns: salesforce
+    mule_name: upsert
+    camel_uri: "salesforce:upsertSObject?sObjectName={type}&sObjectIdName={externalIdFieldName}"
+    camel_component: salesforce
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-salesforce
+    notes: "Salesforce upsert maps to Camel Salesforce upsertSObject"
+
+  - id: sfdc-subscribe-topic
+    mule_ns: salesforce
+    mule_name: subscribe-topic
+    camel_uri: "salesforce:subscribe?topicName={topic}"
+    camel_component: salesforce
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-salesforce
+    notes: "Salesforce topic subscription maps to Camel Salesforce subscribe"

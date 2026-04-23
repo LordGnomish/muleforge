@@ -1,0 +1,24 @@
+# SOAP / Web Service connector mappings
+component: soap
+version: "1.0"
+
+mappings:
+  - id: wsc-consume
+    mule_ns: wsc
+    mule_name: consume
+    camel_uri: "cxf://{address}?serviceClass={serviceClass}&wsdlURL={wsdlLocation}"
+    camel_component: cxf
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-cxf-soap
+    notes: "SOAP Web Service Consumer maps to Camel CXF endpoint"
+
+  - id: ws-consumer
+    mule_ns: ws
+    mule_name: consumer
+    camel_uri: "cxf://{address}?wsdlURL={wsdlLocation}"
+    camel_component: cxf
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-cxf-soap
+    notes: "Legacy WS consumer maps to Camel CXF"

@@ -1,0 +1,37 @@
+name: Mapping rule proposal
+description: Propose a new Mule→Camel mapping rule
+labels: [mapping-rule]
+body:
+  - type: input
+    id: mule-element
+    attributes:
+      label: Mule element
+      placeholder: "e.g., <file:read>"
+    validations:
+      required: true
+  - type: input
+    id: target-component
+    attributes:
+      label: Proposed Camel Quarkus equivalent
+      placeholder: "e.g., camel-quarkus-file"
+    validations:
+      required: true
+  - type: textarea
+    id: example-input
+    attributes:
+      label: Example Mule XML
+      render: xml
+    validations:
+      required: true
+  - type: textarea
+    id: example-output
+    attributes:
+      label: Expected Camel RouteBuilder
+      render: java
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Semantic gaps or edge cases
+      description: Anything about this mapping that is not 1:1.

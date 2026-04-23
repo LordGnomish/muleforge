@@ -1,0 +1,54 @@
+# Database connector mappings: Mule DB -> Camel SQL
+component: database
+version: "1.0"
+
+mappings:
+  - id: db-select
+    mule_ns: db
+    mule_name: select
+    camel_uri: "sql:{query}?dataSource=default"
+    camel_component: sql
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-sql
+    notes: "DB select maps to Camel SQL component"
+
+  - id: db-insert
+    mule_ns: db
+    mule_name: insert
+    camel_uri: "sql:{query}?dataSource=default"
+    camel_component: sql
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-sql
+    notes: "DB insert maps to Camel SQL component"
+
+  - id: db-update
+    mule_ns: db
+    mule_name: update
+    camel_uri: "sql:{query}?dataSource=default"
+    camel_component: sql
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-sql
+    notes: "DB update maps to Camel SQL component"
+
+  - id: db-delete
+    mule_ns: db
+    mule_name: delete
+    camel_uri: "sql:{query}?dataSource=default"
+    camel_component: sql
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-sql
+    notes: "DB delete maps to Camel SQL component"
+
+  - id: db-stored-procedure
+    mule_ns: db
+    mule_name: stored-procedure
+    camel_uri: "sql-stored:{procedureName}?dataSource=default"
+    camel_component: sql-stored
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-sql
+    notes: "DB stored procedure maps to Camel SQL Stored component"

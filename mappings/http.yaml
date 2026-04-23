@@ -1,0 +1,24 @@
+# HTTP connector mappings: Mule HTTP -> Camel platform-http / http
+component: http
+version: "1.0"
+
+mappings:
+  - id: http-listener
+    mule_ns: http
+    mule_name: listener
+    camel_uri: "platform-http:{path}?httpMethodRestrict={allowedMethods}"
+    camel_component: platform-http
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-platform-http
+    notes: "HTTP listener maps to Quarkus platform-http endpoint"
+
+  - id: http-request
+    mule_ns: http
+    mule_name: request
+    camel_uri: "http:{url}{path}?httpMethod={method}"
+    camel_component: http
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-http
+    notes: "HTTP request maps to Camel HTTP producer"

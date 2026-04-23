@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust:
+    name: Rust core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cd core && cargo fmt -- --check
+      - name: Clippy
+        run: cd core && cargo clippy -- -D warnings
+      - name: Build
+        run: cd core && cargo build
+      - name: Test
+        run: cd core && cargo test
+
+  cli:
+    name: TypeScript CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: cd cli && npm ci
+      - name: Build
+        run: cd cli && npm run build
