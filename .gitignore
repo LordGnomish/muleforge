@@ -1,22 +1,30 @@
-# Rust build artifacts
-target/
-**/*.o
-**/*.d
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
 
-# Node / npm
+# TypeScript / Node
 node_modules/
 dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Claude Code worktrees
-.claude/
-
-# macOS
+# IDE
+.vscode/
+.idea/
+*.iml
 .DS_Store
 
-# Env files
+# MuleForge test artifacts
+/tests/tmp/
+/examples/*/output/
+
+# Environment
 .env
 .env.local
+muleforge.config.local.yaml
 
-# Editor
-.idea/
-.vscode/
+# OS
+Thumbs.db

@@ -1,154 +1,134 @@
 metadata:
   version: 1
   daily_commits: {}
-
 items:
 - id: mf-001
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-core/src/main/java/org/mule/runtime/core/api/processor/Processor.java
   upstream_fn: transformMessage
-  file_path: core/src/dataweave/converter.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: cargo test -p muleforge-core exited Some(101)'
   priority: 1
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T07:02:16.260961Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-002
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-core/src/main/java/org/mule/runtime/core/api/el/ExpressionManager.java
   upstream_fn: evaluate
-  file_path: core/src/dataweave/patterns.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 2
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:48:24.975672Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-003
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-extensions-api/src/main/java/org/mule/runtime/extension/api/runtime/source/Source.java
   upstream_fn: onStart
-  file_path: core/src/emitter/routes_emitter.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 3
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:49:20.635313Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-004
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: modules/deployment-model/src/main/java/org/mule/runtime/deployment/model/api/application/Application.java
   upstream_fn: init
-  file_path: core/src/emitter/ci_emitter.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 4
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:50:56.613422Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-005
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-core/src/main/java/org/mule/runtime/core/api/routing/Router.java
   upstream_fn: route
-  file_path: core/src/mapper/mod.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 5
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:51:52.087170Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-006
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-core/src/main/java/org/mule/runtime/core/api/exception/FlowExceptionHandler.java
   upstream_fn: handleException
-  file_path: core/src/parser/mod.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 6
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:53:27.864906Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-007
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: modules/extensions/mule-extensions-spring/src/main/java/org/mule/runtime/module/extension/spring/api/loader/ExtensionModelLoader.java
   upstream_fn: load
-  file_path: core/src/emitter/dataweave_emitter.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 7
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:54:23.335126Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-008
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-core/src/main/java/org/mule/runtime/core/api/transformer/Transformer.java
   upstream_fn: transform
-  file_path: core/src/emitter/k8s_emitter.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 8
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:55:59.149479Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-009
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-core/src/main/java/org/mule/runtime/core/api/lifecycle/Lifecycle.java
   upstream_fn: start
-  file_path: core/src/emitter/tests_emitter.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 9
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:56:54.595953Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
-
+  branch: qwen/auto-2026-W17
 - id: mf-010
   crate_name: muleforge-core
   upstream_repo: mulesoft/mule
   upstream_file: mule-core/src/main/java/org/mule/runtime/core/internal/message/DefaultMessageBuilder.java
   upstream_fn: build
-  file_path: core/src/mel/mod.rs
+  status: stuck
+  attempts: 3
+  last_error: 'compile_fail: ollama: HTTP error: error sending request for url (http://localhost:11434/api/generate)'
   priority: 10
-  status: pending
-  attempts: 0
-  last_error: null
-  created_at: 2026-04-23 06:41:00+00:00
-  updated_at: 2026-04-23 06:41:00+00:00
-  branch: qwen/auto-2026-W17
+  created_at: 2026-04-23T06:41:00Z
+  updated_at: 2026-04-23T11:58:30.394081Z
   repo_path: /Users/gnomish/Documents/claude/platform/muleforge
+  branch: qwen/auto-2026-W17

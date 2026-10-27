@@ -9,13 +9,11 @@
 //! See `ARCHITECTURE.md` for the full design.
 
 pub mod ast;
-pub mod dataweave;
 pub mod docgen;
 pub mod emitter;
 pub mod git;
 pub mod llm;
 pub mod mapper;
-pub mod mel;
 pub mod parser;
 pub mod report;
 
@@ -99,48 +97,8 @@ pub async fn migrate(cfg: &MigrationConfig) -> Result<report::MigrationReport> {
     let (camel_ir, decisions) =
         mapper::map_project(&normalized, &rules, llm_provider.as_deref()).await?;
 
-    // 4b. Extract and convert DataWeave expressions.
-    let dw_expressions = dataweave::converter::extract_dataweave_expressions(&normalized.flows);
-    let mut camel_ir = camel_ir; // make mutable for bean injection
-    if !dw_expressions.is_empty() {
-        tracing::info!(
-            "found {} DataWeave expression(s) to convert",
-            dw_expressions.len()
-        );
-        let beans = if let Some(ref llm) = llm_provider {
-            dataweave::converter::convert_with_llm(&dw_expressions, llm.as_ref()).await
-        } else {
-            tracing::warn!("no LLM configured — generating stub beans for DataWeave");
-            dataweave::converter::convert_without_llm(&dw_expressions)
-        };
-        camel_ir.beans.extend(beans);
-    }
-
     // 5. Emit code, config, and K8s/Kong artifacts.
     emitter::emit_project(&camel_ir, &cfg.output_dir)?;
-    // 5b. Copy custom Java classes from Mule project
-    let copied_java =
-        emitter::java_copier::copy_custom_java(&acquired.working_dir, &cfg.output_dir)?;
-    if !copied_java.is_empty() {
-        tracing::info!(
-            "copied {} custom Java class(es) from Mule project",
-            copied_java.len()
-        );
-    }
-
-    // 5c. Copy API specifications (RAML, OpenAPI)
-    let copied_specs = emitter::api_copier::copy_api_specs(&acquired.working_dir, &cfg.output_dir)?;
-    if !copied_specs.is_empty() {
-        tracing::info!("copied {} API spec file(s)", copied_specs.len());
-    }
-
-    // 5d. Scaffold JUnit tests from MUnit
-    let munit_tests =
-        emitter::munit_scaffold::scaffold_tests(&acquired.working_dir, &cfg.output_dir)?;
-    if !munit_tests.is_empty() {
-        tracing::info!("scaffolded {} JUnit test(s) from MUnit", munit_tests.len());
-    }
-
     if cfg.emit_k8s {
         emitter::emit_k8s_manifests(&camel_ir, &cfg.output_dir)?;
     }
@@ -161,16 +119,6 @@ pub async fn migrate(cfg: &MigrationConfig) -> Result<report::MigrationReport> {
         llm_provider.as_deref(),
     )
     .await?;
-
-    // 7b. Generate developer-friendly files.
-    emitter::checklist::generate(&camel_ir, &report, &cfg.output_dir)?;
-    emitter::env_generator::generate(&camel_ir, &cfg.output_dir)?;
-    emitter::makefile_generator::generate(&camel_ir, &cfg.output_dir)?;
-    emitter::docker_compose::generate(&camel_ir, &cfg.output_dir)?;
-    emitter::route_diagram::generate(&camel_ir, &cfg.output_dir)?;
-    tracing::info!(
-        "generated CHECKLIST.md, .env.example, Makefile, docker-compose.yml, route-diagram.md"
-    );
 
     // 8. Git emit — init the output repo and commit.
     git::emit::emit(&cfg.output_dir, &cfg.git)?;

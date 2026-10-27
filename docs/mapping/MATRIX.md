@@ -1,110 +1,132 @@
-# Mapping Coverage Matrix
+# Mule → Camel Quarkus Mapping Matrix
 
-This document shows the full mapping coverage between Mule 4 elements and Apache Camel Quarkus components.
+This document is the authoritative reference for how Mule elements map to Camel Quarkus. Each row corresponds to a mapping rule in `mappings/`.
 
-## Sources (Flow Entry Points)
+**Legend:**
+- ✅ Rule-based (deterministic)
+- 🤖 LLM-assisted
+- ⚠️ Manual review
+- ❌ Not supported
 
-| Mule Element | Camel Equivalent | Status | Notes |
+## Flow and routing
+
+| Mule element | Camel Quarkus equivalent | Status | Rule file |
 |---|---|---|---|
-| `http:listener` | `platform-http:` | ✅ Auto | Path + method extracted |
-| `kafka:consumer` / `kafka:listener` | `kafka:` | ✅ Auto | Topic from config |
-| `jms:listener` | `jms:queue:` | ✅ Auto | Destination from config |
-| `amqp:listener` | `amqp:queue:` | ✅ Auto | Via mapping YAML |
-| `file:listener` / `file:read` | `file:` | ✅ Auto | Directory from config |
-| `sftp:listener` | `sftp:` | ✅ Auto | Host/port from config |
-| `ftp:listener` | `ftp:` | ✅ Auto | Host/port from config |
-| `scheduler` (fixed) | `timer:` | ✅ Auto | Frequency preserved |
-| `scheduler` (cron) | `quartz:` | ✅ Auto | Cron expression preserved |
-| `email:listener-imap` | `imap:` | ✅ Auto | Via mapping YAML |
-| `email:listener-pop3` | `pop3:` | ✅ Auto | Via mapping YAML |
+| `<flow name="X">` | `RouteBuilder` with `.routeId("X")` | ✅ | `mappings/core/flow.yaml` |
+| `<sub-flow name="X">` | `direct:X` route | ✅ | `mappings/core/subflow.yaml` |
+| `<flow-ref name="X">` | `.to("direct:X")` | ✅ | `mappings/core/flow-ref.yaml` |
+| `<choice>` / `<when>` / `<otherwise>` | `.choice().when().otherwise()` | ✅ | `mappings/core/choice.yaml` |
+| `<scatter-gather>` | `.multicast().aggregationStrategy(...)` | ✅ | `mappings/core/scatter-gather.yaml` |
+| `<foreach>` | `.split().body()` or `.loop()` | ✅ | `mappings/core/foreach.yaml` |
+| `<parallel-foreach>` | `.split().parallelProcessing()` | ✅ | `mappings/core/parallel-foreach.yaml` |
+| `<until-successful>` | `errorHandler(deadLetterChannel(...).maximumRedeliveries(...))` | ⚠️ | partial |
+| `<async>` | `.wireTap(...)` or SEDA endpoint | ✅ | `mappings/core/async.yaml` |
+| `<try>` / `<error-handler>` | `.doTry().doCatch().doFinally()` or `onException()` | ✅ | `mappings/core/try.yaml` |
 
-## Processors (Mid-Flow)
+## Transformers
 
-| Mule Element | Camel Equivalent | Status | Notes |
-|---|---|---|---|
-| `set-payload` | `setBody()` | ✅ Auto | MEL expressions auto-converted |
-| `set-variable` | `setProperty()` | ✅ Auto | MEL expressions auto-converted |
-| `set-attribute` | `setHeader()` | ✅ Auto | |
-| `remove-variable` | `removeProperty()` | ✅ Auto | |
-| `remove-attribute` | `removeHeader()` | ✅ Auto | |
-| `logger` | `log()` | ✅ Auto | Level preserved |
-| `flow-ref` | `to("direct:name")` | ✅ Auto | Sub-flows → direct endpoints |
-| `http:request` | `to("http:...")` | ✅ Auto | URL + method from config-ref |
-| `db:select/insert/update/delete` | `to("sql:...")` | ✅ Auto | SQL from element text |
-| `db:stored-procedure` | `to("sql-stored:...")` | ✅ Auto | Via mapping YAML |
-| `kafka:publish` | `to("kafka:topic")` | ✅ Auto | |
-| `jms:publish` | `to("jms:queue:dest")` | ✅ Auto | |
-| `amqp:publish` | `to("amqp:queue:dest")` | ✅ Auto | Via mapping YAML |
-| `file:write` / `sftp:write` | `to("file/sftp:path")` | ✅ Auto | |
-| `email:send` | `to("smtp:...")` | ✅ Auto | Via mapping YAML |
-| `salesforce:query/create/update/delete` | `to("salesforce:...")` | ✅ Auto | Via mapping YAML |
-| `wsc:consume` (SOAP) | `to("cxf:...")` | ✅ Auto | Via mapping YAML |
-
-## Routing / EIP
-
-| Mule Element | Camel Equivalent | Status | Notes |
-|---|---|---|---|
-| `choice` | `choice()` | ✅ Auto | When + otherwise preserved |
-| `scatter-gather` | `multicast()` | ✅ Auto | |
-| `split` | `split()` | ✅ Auto | Parallel flag preserved |
-| `foreach` | `split()` | ✅ Auto | Sequential split |
-| `first-successful` | Failover LB | ✅ Auto | Via mapping YAML |
-| `round-robin` | Round-robin LB | ✅ Auto | Via mapping YAML |
-| `until-successful` | Error handler retry | ✅ Auto | maxRetries + delay |
-| `async` | `wireTap()` | ✅ Auto | Fire-and-forget |
-| `idempotent-message-validator` | `idempotentConsumer()` | ✅ Auto | |
-
-## Transforms
-
-| Mule Element | Camel Equivalent | Status | Notes |
-|---|---|---|---|
-| Simple DataWeave (field mapping) | Java bean | ✅ Pattern | No LLM needed |
-| Simple DataWeave (filter/map) | Java bean | ✅ Pattern | No LLM needed |
-| Simple DataWeave (type coercion) | Java bean | ✅ Pattern | No LLM needed |
-| Simple DataWeave (string concat) | Java bean | ✅ Pattern | No LLM needed |
-| Simple DataWeave (null coalescing) | Java bean | ✅ Pattern | No LLM needed |
-| Complex DataWeave | Java bean | 🤖 LLM | Claude/OpenAI/Ollama |
-| DataWeave (no LLM) | TODO stub | 📝 Stub | Original DW in Javadoc |
-| MEL `#[payload.field]` | Simple `${body.field}` | ✅ Auto | |
-| MEL `#[flowVars.x]` | Simple `${exchangeProperty.x}` | ✅ Auto | |
-| `parse-template` | Freemarker | ✅ Auto | |
-
-## Error Handling
-
-| Mule Element | Camel Equivalent | Status | Notes |
-|---|---|---|---|
-| `on-error-propagate` | `onException(handled=false)` | ✅ Auto | |
-| `on-error-continue` | `onException(handled=true)` | ✅ Auto | |
-| `try` scope | `doTry/doCatch/doFinally` | ✅ Auto | |
-| `raise-error` | `throwException()` | ✅ Auto | Error type in message |
-| `validation:is-true` | `validate()` | ✅ Auto | |
-
-## Infrastructure Output
-
-| Output | Generated | Notes |
+| Mule element | Camel Quarkus equivalent | Status |
 |---|---|---|
-| Java RouteBuilder classes | ✅ | One per flow |
-| `pom.xml` with dependencies | ✅ | Auto-detected from connectors |
-| `application.properties` | ✅ | Kafka/JMS/DB auto-detected |
-| `Dockerfile` (JVM + native) | ✅ | Multi-stage build |
-| Kubernetes manifests | ✅ | Deployment, Service, ConfigMap, HPA |
-| Kustomize overlays (dev/prod) | ✅ | |
-| Kong Gateway config | ✅ | Optional, decK format |
-| GitHub Actions CI/CD | ✅ | Build + native release |
-| Smoke tests (JUnit 5) | ✅ | Per route |
-| Migration report | ✅ | Every element classified |
-| Project documentation | ✅ | Architecture, per-flow, runbook, etc. |
+| `<set-payload>` (literal) | `.setBody(constant(...))` | ✅ |
+| `<set-payload>` (DW expression) | `.transform(...)` with generated bean | ✅ / 🤖 |
+| `<set-variable>` | `.setProperty(...)` or `.setHeader(...)` | ✅ |
+| `<remove-variable>` | `.removeProperty(...)` | ✅ |
+| `<ee:transform>` with DW | Generated Java bean or Jolt spec | ✅ / 🤖 |
+| `<json-to-object>` | `.unmarshal().json(JsonLibrary.Jackson, ...)` | ✅ |
+| `<object-to-json>` | `.marshal().json(JsonLibrary.Jackson)` | ✅ |
+| `<xml-to-object>` | `.unmarshal().jacksonXml(...)` | ✅ |
+| `<logger>` | `.log(...)` | ✅ |
 
-## Not Yet Supported
+## HTTP
 
-| Mule Element | Workaround | Planned |
+| Mule element | Camel Quarkus equivalent | Camel component |
 |---|---|---|
-| Custom Java components | Auto-copied with TODO markers | ✅ Auto-copy |
-| Anypoint MQ | Use Kafka or AMQP | - |
-| MUnit tests | Scaffolded to JUnit 5 with TODO | ✅ Scaffold |
-| API specs (RAML/OAS) | Auto-copied to output | ✅ Auto-copy |
-| Mule domain projects | Flatten configs manually | - |
-| Batch processing (complex) | Split + aggregate manually | MVP-2 |
-| CloudHub features | Use K8s equivalents | - |
-| Object Store (persistent) | Use Redis/Infinispan | Via mapping |
-| VM queues | SEDA (in-memory) | ✅ Auto |
+| `<http:listener>` | `from("platform-http:/path")` | `camel-quarkus-platform-http` |
+| `<http:request>` | `.to("https://...")` | `camel-quarkus-http` |
+| `<http:listener-config>` (TLS) | `quarkus.http.ssl.*` properties | native Quarkus |
+| `<http:basic-security-filter>` | Basic auth filter / Quarkus security | `quarkus-security` |
+
+## Database
+
+| Mule element | Camel Quarkus equivalent | Camel component |
+|---|---|---|
+| `<db:select>` | `.to("sql:SELECT ...")` | `camel-quarkus-sql` |
+| `<db:insert>` | `.to("sql:INSERT ...")` | `camel-quarkus-sql` |
+| `<db:update>` | `.to("sql:UPDATE ...")` | `camel-quarkus-sql` |
+| `<db:stored-procedure>` | `.to("sql-stored:...")` | `camel-quarkus-sql` |
+| `<db:bulk-insert>` | `.split().to("sql:...")` or JDBC batch | `camel-quarkus-sql` |
+
+## Messaging
+
+| Mule element | Camel Quarkus equivalent | Camel component |
+|---|---|---|
+| `<jms:publish>` | `.to("jms:queue:...")` | `camel-quarkus-jms` |
+| `<jms:listener>` | `from("jms:queue:...")` | `camel-quarkus-jms` |
+| `<kafka:publish>` / `<kafka:message-publisher>` | `.to("kafka:topic")` | `camel-quarkus-kafka` |
+| `<kafka:consumer>` | `from("kafka:topic")` | `camel-quarkus-kafka` |
+| `<anypoint-mq:publish>` | Depends on target broker; Kafka by default | `camel-quarkus-kafka` |
+| `<anypoint-mq:subscriber>` | Depends on target broker | `camel-quarkus-kafka` |
+| `<amqp:publish>` | `.to("amqp:exchange:...")` | `camel-quarkus-amqp` |
+
+**Note on Anypoint MQ:** there is no direct open-source equivalent. MuleForge defaults to Kafka with a note in the migration report. If the user prefers RabbitMQ or ActiveMQ, it is a configuration choice.
+
+## Scheduling
+
+| Mule element | Camel Quarkus equivalent | Camel component |
+|---|---|---|
+| `<scheduler>` (fixed frequency) | `from("timer:...")` | `camel-quarkus-timer` |
+| `<scheduler>` (cron) | `from("quartz:...?cron=...")` | `camel-quarkus-quartz` |
+
+## File and stream
+
+| Mule element | Camel Quarkus equivalent | Camel component |
+|---|---|---|
+| `<file:read>` | `.to("file:...?fileName=...&noop=true")` | `camel-quarkus-file` |
+| `<file:write>` | `.to("file:...")` | `camel-quarkus-file` |
+| `<file:listener>` | `from("file:...")` | `camel-quarkus-file` |
+| `<sftp:*>` | `camel-quarkus-sftp` endpoints | `camel-quarkus-sftp` |
+| `<ftp:*>` | `camel-quarkus-ftp` endpoints | `camel-quarkus-ftp` |
+| `<email:send>` | `.to("smtp:...")` | `camel-quarkus-mail` |
+
+## SaaS / Enterprise connectors
+
+| Mule connector | Status | Notes |
+|---|---|---|
+| Salesforce | 🤖 | `camel-quarkus-salesforce` covers most operations; complex flows get LLM assistance. |
+| SAP | ⚠️ | No drop-in Camel component. MuleForge emits an adapter service skeleton using SAP JCo; requires manual JCo library installation. |
+| ServiceNow | 🤖 | HTTP-based; falls back to `camel-quarkus-http` with `MANUAL_REVIEW`. |
+| Workday | ⚠️ | Emits stub. |
+| NetSuite | ⚠️ | Emits stub. |
+
+## Security
+
+| Mule element | Camel Quarkus equivalent |
+|---|---|
+| `<oauth2-provider>` | Quarkus OIDC (`quarkus-oidc`) — emitted as configuration, not code. |
+| `<crypto:encrypt>` / `<crypto:decrypt>` | `camel-quarkus-crypto` |
+| Secure property placeholder | Quarkus config + MicroProfile Config, or Vault extension. |
+
+## Error handling
+
+| Mule element | Camel Quarkus equivalent |
+|---|---|
+| `<on-error-continue>` | `.doCatch(Exception.class).continued(true)` |
+| `<on-error-propagate>` | `onException(...).handled(false)` |
+| `<raise-error>` | `.throwException(...)` |
+
+## Observability
+
+Mule's built-in logging, CloudHub analytics, and Anypoint Monitoring are replaced by:
+
+- **Logging:** Quarkus logging (JSON to stdout), already configured by default.
+- **Metrics:** `quarkus-micrometer-registry-prometheus` (emitted automatically).
+- **Tracing:** `quarkus-opentelemetry` (emitted automatically, configurable endpoint).
+
+These are added to `pom.xml` whenever a flow uses `<logger>` or any HTTP/DB/messaging element.
+
+## Gaps and known limitations
+
+- DataWeave modules with complex recursion or user-defined functions may emit `MANUAL_REVIEW`.
+- Mule's object store (`<os:*>`) has no direct Camel equivalent; MuleForge emits an abstraction over Redis or Caffeine depending on config.
+- Mule's batch jobs (`<batch:job>`) map imperfectly to Camel's split/aggregate pattern; complex batch with persistent queues require review.
+- Custom Java components referenced via `<java:invoke>` are preserved as-is and bridged via Camel's `bean:` endpoint.

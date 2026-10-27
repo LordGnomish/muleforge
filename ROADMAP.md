@@ -15,11 +15,7 @@
 - [x] application.properties with component auto-detection
 - [x] Smoke test generation (JUnit 5 / REST Assured)
 - [x] Migration report (Markdown)
-- [x] 19 mapping rule YAML files (40+ unique element mappings)
-- [x] LLM provider integration (Claude, OpenAI, Ollama)
-- [x] Pattern-based DataWeave converter (8 common patterns, no LLM needed)
-- [x] LLM-assisted DataWeave → Java bean conversion
-- [x] Structured TODO stub fallback (no LLM mode)
+- [x] 10 mapping rule YAML files
 - [x] TypeScript CLI shell
 - [x] Apache 2.0 license, CONTRIBUTING, SECURITY
 
@@ -35,18 +31,6 @@
 - [ ] Secret scrubbing (`--scrub-secrets`)
 - [ ] YAML properties file support
 - [ ] Sub-flow inlining toggle
-
-## MVP-1.5 (Server Mode)
-
-- [ ] HTTP server mode (`muleforge serve --port 8080`)
-- [ ] `POST /api/migrate` — submit migration job (Mule repo URL → Camel repo)
-- [ ] `POST /api/analyze` — dry-run analysis
-- [ ] `GET /api/jobs/{id}` — job status and progress
-- [ ] `GET /api/health` — health check
-- [ ] Job queue for async migration (large projects)
-- [ ] Dockerfile + Helm chart for Kubernetes deployment
-- [ ] Web UI for migration status and report viewing
-- [ ] Multi-tenant support (team-shared instance)
 
 ## MVP-2
 

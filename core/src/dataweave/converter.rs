@@ -96,23 +96,6 @@ pub async fn convert_with_llm(
 
     for (i, dw) in expressions.iter().enumerate() {
         let class_name = sanitize_class_name(&dw.flow_name, i);
-
-        // Try pattern-based conversion first (no LLM call needed)
-        if let Some(bean) = crate::dataweave::patterns::try_pattern_convert(
-            &dw.expression,
-            &class_name,
-            &dw.flow_name,
-        ) {
-            tracing::info!(
-                "Pattern-matched DataWeave in {} (line {:?}) -> {} (no LLM needed)",
-                dw.flow_name,
-                dw.line,
-                class_name
-            );
-            beans.push(bean);
-            continue;
-        }
-
         let user = llm::dataweave_user_prompt(&dw.expression, &dw.context_hint);
 
         let req = TransformRequest {

@@ -5,4 +5,3 @@
 //! when no LLM is configured.
 
 pub mod converter;
-pub mod patterns;

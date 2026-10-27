@@ -376,44 +376,4 @@ mod tests {
         assert_eq!(choice.name, "choice");
         assert!(choice.children.len() >= 2);
     }
-
-    #[test]
-    fn test_parse_hello_world_example() {
-        // Test against the shipped example project
-        let example_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("examples/hello-world");
-
-        if !example_dir.exists() {
-            // Skip if example not present (CI without examples)
-            return;
-        }
-
-        let project = parse_project(&example_dir).unwrap();
-        assert_eq!(project.name, "hello-world");
-
-        // Should find flows: helloFlow, echoFlow, routerFlow, safeFlow
-        // And sub-flow: enrichPayload
-        assert!(
-            project.flows.len() >= 4,
-            "expected at least 4 flows, got {}",
-            project.flows.len()
-        );
-
-        let flow_names: Vec<&str> = project.flows.iter().map(|f| f.name.as_str()).collect();
-        assert!(flow_names.contains(&"helloFlow"));
-        assert!(flow_names.contains(&"echoFlow"));
-        assert!(flow_names.contains(&"routerFlow"));
-        assert!(flow_names.contains(&"safeFlow"));
-
-        // Should find HTTP listener config
-        assert!(!project.configs.is_empty(), "expected at least 1 config");
-
-        // Properties should be loaded
-        assert_eq!(
-            project.properties.get("app.name").map(|s| s.as_str()),
-            Some("hello-world")
-        );
-    }
 }

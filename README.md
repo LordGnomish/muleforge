@@ -119,49 +119,6 @@ my-quarkus-repo/
         └── gotchas.md                 # Things to watch out for
 ```
 
-## Migration Scope
-
-MuleForge is a migration **assistant**, not a magic converter. Here is what to expect:
-
-### Fully Automated (~60-65% of typical Mule apps)
-
-| Category | Mule Elements | Camel Equivalent |
-|----------|--------------|------------------|
-| HTTP | listener, request | platform-http, http |
-| Messaging | Kafka consumer/publish, JMS listener/publish, AMQP | kafka, jms, amqp |
-| Database | DB select/insert/update/delete, stored procedures | sql, sql-stored |
-| File I/O | File/SFTP/FTP listener, read, write | file, sftp, ftp |
-| Scheduling | Fixed frequency, cron | timer, quartz |
-| Email | IMAP, POP3, SMTP | mail |
-| Salesforce | Query, CRUD, upsert, subscribe | salesforce |
-| SOAP | Web Service Consumer | cxf-soap |
-| Routing | Choice, scatter-gather, round-robin, first-successful | choice, multicast, loadBalance |
-| Flow control | Split, foreach, flow-ref, until-successful, try/catch | split, direct, doTry |
-| Transforms | Set-payload, set-variable, set-attribute, logger | setBody, setProperty, setHeader, log |
-| Error handling | on-error-propagate, on-error-continue, raise-error | onException, throwException |
-| Async | Async scope, VM queues | wireTap, seda |
-
-### LLM-Assisted (~15-20% additional)
-
-DataWeave expressions are converted using a three-tier approach:
-
-1. **Pattern matching** (no LLM needed) — identity passthrough, field mapping, type coercion, string concatenation, filter, map, null coalescing
-2. **LLM conversion** (Claude, OpenAI, or Ollama) — complex transforms are sent to an LLM which produces Java Processor beans
-3. **Structured stubs** (fallback) — if no LLM is configured, generates TODO stubs with the original DataWeave preserved in Javadoc
-
-### Requires Manual Review (~15-25%)
-
-- Custom Java components (Mule-specific Java classes)
-- SAP connectors (mapping exists but complex configuration needs manual validation)
-- Anypoint MQ (no direct Camel equivalent — consider Kafka or AMQP)
-- MUnit tests (test framework is completely different — generated smoke tests replace them)
-- API autodiscovery / API Manager integration (platform-specific)
-- Complex MEL expressions (legacy Mule 3 artifact)
-- Mule domain projects (shared connector configs)
-- CloudHub-specific features (persistent queues, worker management)
-
-Every element is classified in `MIGRATION_REPORT.md` as `DONE`, `MANUAL_REVIEW`, or `SKIPPED` with a rationale and link to the source XML.
-
 ## Features
 
 - **Git-native I/O.** Input can be a local path or a remote Git URL. Output can be a fresh local directory or pushed to a new remote.
