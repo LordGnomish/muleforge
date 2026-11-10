@@ -113,6 +113,39 @@ pub fn mel_to_simple(mel: &str) -> Option<String> {
     None // Unrecognized — needs manual mapping
 }
 
+/// Replace every `#[...]` expression embedded in a string (e.g. a logger
+/// message) with its Camel Simple equivalent. Returns None if any embedded
+/// expression cannot be converted, so the caller can flag it for review.
+pub fn interpolate_mel(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("#[") {
+        out.push_str(&rest[..start]);
+        let expr = &rest[start..];
+        // Find the matching `]`, allowing nested brackets such as payload['a'].
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in expr.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        out.push_str(&mel_to_simple(&expr[..=end])?);
+        rest = &expr[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// Check if a string contains a MEL expression.
 pub fn contains_mel(s: &str) -> bool {
     s.contains("#[") && s.contains(']')
@@ -126,4 +159,38 @@ pub fn extract_mel(s: &str) -> &str {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolate_replaces_embedded_payload() {
+        assert_eq!(
+            interpolate_mel("Served /hello: #[payload]").as_deref(),
+            Some("Served /hello: ${body}")
+        );
+    }
+
+    #[test]
+    fn interpolate_handles_several_expressions() {
+        assert_eq!(
+            interpolate_mel("#[payload] and #[message.payload]").as_deref(),
+            Some("${body} and ${body}")
+        );
+    }
+
+    #[test]
+    fn interpolate_leaves_plain_text_alone() {
+        assert_eq!(
+            interpolate_mel("Received request").as_deref(),
+            Some("Received request")
+        );
+    }
+
+    #[test]
+    fn interpolate_rejects_unconvertible_expression() {
+        assert_eq!(interpolate_mel("count: #[sizeOf(payload)]"), None);
+    }
 }
