@@ -12,7 +12,9 @@ import ora from "ora";
 import { loadConfig } from "../config.js";
 import { runCore } from "../core/runner.js";
 
-interface MigrateOptions {
+// A type alias (not an interface) so it is assignable to runCore's
+// `Record<string, unknown>` flags parameter.
+type MigrateOptions = {
   from?: string;
   to?: string;
   initGit: boolean;
@@ -29,7 +31,7 @@ interface MigrateOptions {
   interactive: boolean;
   dryRun: boolean;
   verbose: boolean;
-}
+};
 
 export async function migrateCommand(
   fromArg: string | undefined,
