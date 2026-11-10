@@ -68,10 +68,8 @@ pub fn mel_to_simple(mel: &str) -> Option<String> {
             let p = part.trim().trim_matches('"').trim_matches('\'');
             if part.trim().starts_with('"') || part.trim().starts_with('\'') {
                 simple_parts.push(p.to_string());
-            } else if let Some(converted) = mel_to_simple(part.trim()) {
-                simple_parts.push(converted);
             } else {
-                return None;
+                simple_parts.push(mel_to_simple(part.trim())?);
             }
         }
         return Some(simple_parts.join(""));
