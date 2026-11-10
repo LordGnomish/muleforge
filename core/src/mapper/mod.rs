@@ -371,7 +371,7 @@ fn map_processor(
             }]
         }
         ("", "logger") | ("", "log") => {
-            let msg = elem.attr("message").unwrap_or("").to_string();
+            let raw = elem.attr("message").unwrap_or("");
             let level = match elem.attr("level").unwrap_or("INFO") {
                 "DEBUG" => LogLevel::Debug,
                 "WARN" | "WARNING" => LogLevel::Warn,
@@ -379,7 +379,21 @@ fn map_processor(
                 "TRACE" => LogLevel::Trace,
                 _ => LogLevel::Info,
             };
-            record_decision(decisions, elem, DecisionStatus::Done, None, "logger -> log");
+            // Embedded #[...] expressions become Camel Simple ${...}; if any
+            // cannot be converted, keep the original text and flag it.
+            let msg = if let Some(converted) = crate::mel::interpolate_mel(raw) {
+                record_decision(decisions, elem, DecisionStatus::Done, None, "logger -> log");
+                converted
+            } else {
+                record_decision(
+                    decisions,
+                    elem,
+                    DecisionStatus::ManualReview,
+                    None,
+                    "logger -> log (message has an unconverted MEL expression)",
+                );
+                raw.to_string()
+            };
             vec![RouteStep::Log {
                 level,
                 message: msg,
