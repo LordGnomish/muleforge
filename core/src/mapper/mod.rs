@@ -281,6 +281,23 @@ fn map_source(
             });
             RouteEndpoint::Uri(format!("timer:scheduler?period={}", freq))
         }
+        // Kafka connector 4.x has no topic on <kafka:message-listener>: the
+        // subscription (topic patterns, group ID, bootstrap servers) sits on
+        // the connection inside its consumer-config, which is not read here.
+        // Without a topic there is no endpoint to emit, so flag the listener
+        // instead of inventing a topic.
+        ("kafka", "message-listener") if !has_attr_value(elem, "topic") => {
+            record_decision(
+                decisions,
+                elem,
+                DecisionStatus::ManualReview,
+                None,
+                "kafka:message-listener has no topic attribute - take the topic, group ID \
+                 and brokers from the connection of its consumer-config and set the kafka: \
+                 source manually",
+            );
+            RouteEndpoint::Uri(format!("direct:{}", qname.replace(':', "-")))
+        }
         ("kafka", "consumer") | ("kafka", "listener") | ("kafka", "message-listener") => {
             let topic = elem.attr("topic").unwrap_or("default-topic");
             record_decision(
@@ -715,6 +732,11 @@ fn find_rule<'a>(rules: &'a [Rule], ns: &str, name: &str) -> Option<&'a Rule> {
         .find(|r| r.mule_ns == ns && r.mule_name == name)
 }
 
+/// Whether `elem` sets attribute `key` to something other than blank.
+fn has_attr_value(elem: &MuleElement, key: &str) -> bool {
+    elem.attr(key).is_some_and(|v| !v.trim().is_empty())
+}
+
 fn expand_uri_template(template: &str, elem: &MuleElement) -> String {
     let mut result = template.to_string();
     for (k, v) in &elem.attributes {
@@ -1017,6 +1039,83 @@ mappings:
             assert_eq!(decisions[0].status, DecisionStatus::Done);
             assert!(deps.iter().any(|d| d.artifact_id == "camel-quarkus-kafka"));
         }
+    }
+
+    /// `<kafka:consumer-config>` the way Kafka connector 4.x writes it: topic
+    /// patterns, group ID and bootstrap servers all on the connection child.
+    fn kafka_4x_consumer_config(name: &str) -> MuleElement {
+        let mut bootstrap_servers = elem("kafka", "bootstrap-servers", &[]);
+        bootstrap_servers.children = vec![elem(
+            "kafka",
+            "bootstrap-server",
+            &[("value", "${kafka.brokers}")],
+        )];
+        let mut topic_patterns = elem("kafka", "topic-patterns", &[]);
+        topic_patterns.children = vec![elem("kafka", "topic-pattern", &[("value", "orders.raw")])];
+        let mut connection = elem(
+            "kafka",
+            "consumer-plaintext-connection",
+            &[("groupId", "order-ingest-group")],
+        );
+        connection.children = vec![bootstrap_servers, topic_patterns];
+        let mut config = elem("kafka", "consumer-config", &[("name", name)]);
+        config.children = vec![connection];
+        config
+    }
+
+    /// A message-listener the mapper cannot name a topic for: no `kafka:`
+    /// source and no `Done`, whether or not the shipped rules are loaded.
+    fn assert_message_listener_needs_manual_review(listener: &MuleElement) {
+        for rules in shipped_and_builtin_rules() {
+            let mut decisions = Vec::new();
+            let mut deps = Vec::new();
+            let source = map_source(listener, &rules, &mut decisions, &mut deps);
+
+            match source {
+                RouteEndpoint::Uri(uri) => assert_eq!(uri, "direct:kafka-message-listener"),
+                other => panic!("expected a Uri source, got {:?}", other),
+            }
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].mule_element, "kafka:message-listener");
+            assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+            assert_eq!(decisions[0].rule_id, None);
+            assert!(
+                decisions[0].rationale.contains("no topic attribute"),
+                "rationale should say what is missing: {}",
+                decisions[0].rationale
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_4x_message_listener_without_topic_needs_manual_review() {
+        // The real connector shape: the listener only has config-ref; the
+        // subscription lives on the consumer-config's connection.
+        let listener = with_config(
+            elem(
+                "kafka",
+                "message-listener",
+                &[("config-ref", "Kafka_Consumer_config")],
+            ),
+            kafka_4x_consumer_config("Kafka_Consumer_config"),
+        );
+        assert_message_listener_needs_manual_review(&listener);
+    }
+
+    #[test]
+    fn kafka_message_listener_with_blank_topic_or_no_config_needs_manual_review() {
+        let blank_topic = with_config(
+            elem(
+                "kafka",
+                "message-listener",
+                &[("config-ref", "c"), ("topic", " "), ("groupId", "g")],
+            ),
+            kafka_config("consumer-config", "c", "broker-1:9092"),
+        );
+        assert_message_listener_needs_manual_review(&blank_topic);
+
+        let bare = elem("kafka", "message-listener", &[]);
+        assert_message_listener_needs_manual_review(&bare);
     }
 
     #[test]
