@@ -251,7 +251,7 @@ mappings:
 
 Custom rules take priority over built-in mappings.
 
-`{attr}` in `camel_uri` is replaced with the Mule element's attribute of that name. Optional endpoint options go in `camel_params`; they are appended to the URI as a query string in the order written:
+`{attr}` in `camel_uri` is replaced with the Mule element's attribute of that name. If the element does not have that attribute, `{attr}` stays in the URI as written and the element is still reported as done, so only use attributes the element always carries. Optional endpoint options go in `camel_params`; they are appended to the URI as a query string in the order written:
 
 ```yaml
     camel_uri: "kafka:{topic}"
