@@ -25,6 +25,15 @@ pub struct Rule {
     pub notes: String,
 }
 
+/// Endpoint options of the built-in Kafka mappings (same as the
+/// `camel_params` of the rules in `mappings/kafka.yaml`): brokers from the
+/// `config-ref` target, consumer group from the listener itself.
+const KAFKA_CONSUMER_PARAMS: &[(&str, &str)] = &[
+    ("brokers", "{config.bootstrapServers}"),
+    ("groupId", "{groupId}"),
+];
+const KAFKA_PRODUCER_PARAMS: &[(&str, &str)] = &[("brokers", "{config.bootstrapServers}")];
+
 pub fn load_rules(mappings_dir: &Path) -> Result<Vec<Rule>> {
     let mut rules = Vec::new();
     if !mappings_dir.is_dir() {
@@ -272,7 +281,7 @@ fn map_source(
             });
             RouteEndpoint::Uri(format!("timer:scheduler?period={}", freq))
         }
-        ("kafka", "consumer") | ("kafka", "listener") => {
+        ("kafka", "consumer") | ("kafka", "listener") | ("kafka", "message-listener") => {
             let topic = elem.attr("topic").unwrap_or("default-topic");
             record_decision(
                 decisions,
@@ -286,7 +295,11 @@ fn map_source(
                 artifact_id: "camel-quarkus-kafka".into(),
                 version: None,
             });
-            RouteEndpoint::Uri(format!("kafka:{}", topic))
+            RouteEndpoint::Uri(append_uri_params(
+                format!("kafka:{}", topic),
+                KAFKA_CONSUMER_PARAMS.iter().copied(),
+                elem,
+            ))
         }
         ("jms", "listener") => {
             let dest = elem.attr("destination").unwrap_or("default-queue");
@@ -587,7 +600,11 @@ fn map_processor(
                 artifact_id: "camel-quarkus-kafka".into(),
                 version: None,
             });
-            vec![RouteStep::ToUri(format!("kafka:{}", topic))]
+            vec![RouteStep::ToUri(append_uri_params(
+                format!("kafka:{}", topic),
+                KAFKA_PRODUCER_PARAMS.iter().copied(),
+                elem,
+            ))]
         }
         ("jms", "publish") | ("jms", "producer") => {
             let dest = elem.attr("destination").unwrap_or("default-queue");
@@ -944,5 +961,119 @@ mappings:
             mule_placeholders_to_camel("${unterminated"),
             "${unterminated"
         );
+    }
+
+    // ── Kafka ───────────────────────────────────────────────────────────
+
+    /// The rules shipped in `mappings/`, and no rules at all (built-in
+    /// fallback): Kafka endpoints must come out the same either way.
+    fn shipped_and_builtin_rules() -> [Vec<Rule>; 2] {
+        let shipped = load_rules(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../mappings"))
+            .expect("load mappings/");
+        assert!(shipped.iter().any(|r| r.mule_ns == "kafka"));
+        [shipped, Vec::new()]
+    }
+
+    fn kafka_config(element: &str, name: &str, bootstrap_servers: &str) -> MuleElement {
+        elem(
+            "kafka",
+            element,
+            &[("name", name), ("bootstrapServers", bootstrap_servers)],
+        )
+    }
+
+    #[test]
+    fn kafka_message_listener_is_a_consumer_with_brokers_and_group_id() {
+        let listener = with_config(
+            elem(
+                "kafka",
+                "message-listener",
+                &[
+                    ("config-ref", "Kafka_Consumer_config"),
+                    ("topic", "orders.raw"),
+                    ("groupId", "order-ingest-group"),
+                ],
+            ),
+            kafka_config(
+                "consumer-config",
+                "Kafka_Consumer_config",
+                "${kafka.brokers}",
+            ),
+        );
+
+        for rules in shipped_and_builtin_rules() {
+            let mut decisions = Vec::new();
+            let mut deps = Vec::new();
+            let source = map_source(&listener, &rules, &mut decisions, &mut deps);
+
+            match source {
+                RouteEndpoint::Uri(uri) => assert_eq!(
+                    uri,
+                    "kafka:orders.raw?brokers={{kafka.brokers}}&groupId=order-ingest-group"
+                ),
+                other => panic!("expected a Uri source, got {:?}", other),
+            }
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].status, DecisionStatus::Done);
+            assert!(deps.iter().any(|d| d.artifact_id == "camel-quarkus-kafka"));
+        }
+    }
+
+    #[test]
+    fn kafka_publish_takes_brokers_from_its_config() {
+        let publish = with_config(
+            elem(
+                "kafka",
+                "publish",
+                &[
+                    ("config-ref", "Kafka_Producer_config"),
+                    ("topic", "orders.validated"),
+                ],
+            ),
+            kafka_config(
+                "producer-config",
+                "Kafka_Producer_config",
+                "${kafka.brokers}",
+            ),
+        );
+
+        for rules in shipped_and_builtin_rules() {
+            assert_eq!(
+                to_uris(&publish, &rules),
+                ["kafka:orders.validated?brokers={{kafka.brokers}}"]
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_brokers_resolved_by_the_normalizer_are_emitted_literally() {
+        let consumer = with_config(
+            elem(
+                "kafka",
+                "consumer",
+                &[("topic", "orders"), ("groupId", "g")],
+            ),
+            kafka_config("consumer-config", "c", "broker-1:9092,broker-2:9092"),
+        );
+
+        for rules in shipped_and_builtin_rules() {
+            assert_eq!(
+                source_uri(&consumer, &rules),
+                "kafka:orders?brokers=broker-1:9092,broker-2:9092&groupId=g"
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_endpoints_without_config_or_group_stay_bare() {
+        // Brokers and group then come from camel.component.kafka.* in
+        // application.properties.
+        let consumer = elem("kafka", "consumer", &[("topic", "orders-topic")]);
+        let publish = elem("kafka", "publish", &[("topic", "orders-out")]);
+
+        for rules in shipped_and_builtin_rules() {
+            assert_eq!(source_uri(&consumer, &rules), "kafka:orders-topic");
+            assert_eq!(to_uris(&publish, &rules), ["kafka:orders-out"]);
+        }
     }
 }

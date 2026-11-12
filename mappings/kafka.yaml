@@ -1,4 +1,8 @@
 # Kafka connector mappings: Mule Kafka -> Camel Kafka
+#
+# brokers comes from the bootstrapServers of the element's config-ref target,
+# groupId from the listener itself. Either is left out of the URI when the
+# Mule XML does not set it; camel.component.kafka.* then applies.
 component: kafka
 version: "1.0"
 
@@ -7,6 +11,9 @@ mappings:
     mule_ns: kafka
     mule_name: consumer
     camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"
+      groupId: "{groupId}"
     camel_component: kafka
     maven_deps:
       - group_id: org.apache.camel.quarkus
@@ -17,16 +24,34 @@ mappings:
     mule_ns: kafka
     mule_name: listener
     camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"
+      groupId: "{groupId}"
     camel_component: kafka
     maven_deps:
       - group_id: org.apache.camel.quarkus
         artifact_id: camel-quarkus-kafka
     notes: "Kafka listener (alias for consumer)"
 
+  - id: kafka-message-listener
+    mule_ns: kafka
+    mule_name: message-listener
+    camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"
+      groupId: "{groupId}"
+    camel_component: kafka
+    maven_deps:
+      - group_id: org.apache.camel.quarkus
+        artifact_id: camel-quarkus-kafka
+    notes: "Kafka message-listener maps to Camel kafka consumer endpoint"
+
   - id: kafka-publish
     mule_ns: kafka
     mule_name: publish
     camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"
     camel_component: kafka
     maven_deps:
       - group_id: org.apache.camel.quarkus

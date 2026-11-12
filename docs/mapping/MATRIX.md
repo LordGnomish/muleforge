@@ -7,7 +7,7 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 | Mule Element | Camel Equivalent | Status | Notes |
 |---|---|---|---|
 | `http:listener` | `platform-http:` | ✅ Auto | Path + method extracted |
-| `kafka:consumer` / `kafka:listener` | `kafka:` | ✅ Auto | Topic from config |
+| `kafka:message-listener` / `kafka:consumer` / `kafka:listener` | `kafka:` | ✅ Auto | Topic and group ID from the listener, brokers from its config |
 | `jms:listener` | `jms:queue:` | ✅ Auto | Destination from config |
 | `amqp:listener` | `amqp:queue:` | ✅ Auto | Via mapping YAML |
 | `file:listener` / `file:read` | `file:` | ✅ Auto | Directory from config |
@@ -32,7 +32,7 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 | `http:request` | `to("http:...")` | ✅ Auto | URL + method from config-ref |
 | `db:select/insert/update/delete` | `to("sql:...")` | ✅ Auto | SQL from element text |
 | `db:stored-procedure` | `to("sql-stored:...")` | ✅ Auto | Via mapping YAML |
-| `kafka:publish` | `to("kafka:topic")` | ✅ Auto | |
+| `kafka:publish` | `to("kafka:topic")` | ✅ Auto | Brokers from its config |
 | `jms:publish` | `to("jms:queue:dest")` | ✅ Auto | |
 | `amqp:publish` | `to("amqp:queue:dest")` | ✅ Auto | Via mapping YAML |
 | `file:write` / `sftp:write` | `to("file/sftp:path")` | ✅ Auto | |
