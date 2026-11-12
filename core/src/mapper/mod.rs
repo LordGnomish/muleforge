@@ -14,10 +14,25 @@ pub struct Rule {
     pub mule_ns: String,
     pub mule_name: String,
     pub camel_uri_template: Option<String>,
+    /// Camel endpoint options appended to the URI as a query string, in
+    /// declaration order: `(option name, value template)`. A template may
+    /// reference `{attr}` (an attribute of the Mule element) and
+    /// `{config.attr}` (an attribute of the element's `config-ref` target).
+    /// An option whose template cannot be fully resolved is left out.
+    pub camel_params: Vec<(String, String)>,
     pub camel_component: Option<String>,
     pub maven_deps: Vec<MavenDependency>,
     pub notes: String,
 }
+
+/// Endpoint options of the built-in Kafka mappings (same as the
+/// `camel_params` of the rules in `mappings/kafka.yaml`): brokers from the
+/// `config-ref` target, consumer group from the listener itself.
+const KAFKA_CONSUMER_PARAMS: &[(&str, &str)] = &[
+    ("brokers", "{config.bootstrapServers}"),
+    ("groupId", "{groupId}"),
+];
+const KAFKA_PRODUCER_PARAMS: &[(&str, &str)] = &[("brokers", "{config.bootstrapServers}")];
 
 pub fn load_rules(mappings_dir: &Path) -> Result<Vec<Rule>> {
     let mut rules = Vec::new();
@@ -54,6 +69,7 @@ pub fn load_rules(mappings_dir: &Path) -> Result<Vec<Rule>> {
                                 .get("camel_uri")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            camel_params: parse_camel_params(m.get("camel_params")),
                             camel_component: m
                                 .get("camel_component")
                                 .and_then(|v| v.as_str())
@@ -72,6 +88,15 @@ pub fn load_rules(mappings_dir: &Path) -> Result<Vec<Rule>> {
         }
     }
     Ok(rules)
+}
+
+fn parse_camel_params(val: Option<&serde_yaml::Value>) -> Vec<(String, String)> {
+    let Some(map) = val.and_then(|v| v.as_mapping()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+        .collect()
 }
 
 fn parse_maven_deps(val: Option<&serde_yaml::Value>) -> Vec<MavenDependency> {
@@ -219,7 +244,7 @@ fn map_source(
         );
         deps.extend(rule.maven_deps.iter().cloned());
         if let Some(ref tmpl) = rule.camel_uri_template {
-            return RouteEndpoint::Uri(expand_uri_template(tmpl, elem));
+            return RouteEndpoint::Uri(rule_endpoint_uri(rule, tmpl, elem));
         }
     }
 
@@ -256,7 +281,24 @@ fn map_source(
             });
             RouteEndpoint::Uri(format!("timer:scheduler?period={}", freq))
         }
-        ("kafka", "consumer") | ("kafka", "listener") => {
+        // Kafka connector 4.x has no topic on <kafka:message-listener>: the
+        // subscription (topic patterns, group ID, bootstrap servers) sits on
+        // the connection inside its consumer-config, which is not read here.
+        // Without a topic there is no endpoint to emit, so flag the listener
+        // instead of inventing a topic.
+        ("kafka", "message-listener") if !has_attr_value(elem, "topic") => {
+            record_decision(
+                decisions,
+                elem,
+                DecisionStatus::ManualReview,
+                None,
+                "kafka:message-listener has no topic attribute - take the topic, group ID \
+                 and brokers from the connection of its consumer-config and set the kafka: \
+                 source manually",
+            );
+            RouteEndpoint::Uri(format!("direct:{}", qname.replace(':', "-")))
+        }
+        ("kafka", "consumer") | ("kafka", "listener") | ("kafka", "message-listener") => {
             let topic = elem.attr("topic").unwrap_or("default-topic");
             record_decision(
                 decisions,
@@ -270,7 +312,11 @@ fn map_source(
                 artifact_id: "camel-quarkus-kafka".into(),
                 version: None,
             });
-            RouteEndpoint::Uri(format!("kafka:{}", topic))
+            RouteEndpoint::Uri(append_uri_params(
+                format!("kafka:{}", topic),
+                KAFKA_CONSUMER_PARAMS.iter().copied(),
+                elem,
+            ))
         }
         ("jms", "listener") => {
             let dest = elem.attr("destination").unwrap_or("default-queue");
@@ -336,7 +382,7 @@ fn map_processor(
         );
         deps.extend(rule.maven_deps.iter().cloned());
         if let Some(ref uri) = rule.camel_uri_template {
-            return vec![RouteStep::ToUri(expand_uri_template(uri, elem))];
+            return vec![RouteStep::ToUri(rule_endpoint_uri(rule, uri, elem))];
         }
     }
 
@@ -571,7 +617,11 @@ fn map_processor(
                 artifact_id: "camel-quarkus-kafka".into(),
                 version: None,
             });
-            vec![RouteStep::ToUri(format!("kafka:{}", topic))]
+            vec![RouteStep::ToUri(append_uri_params(
+                format!("kafka:{}", topic),
+                KAFKA_PRODUCER_PARAMS.iter().copied(),
+                elem,
+            ))]
         }
         ("jms", "publish") | ("jms", "producer") => {
             let dest = elem.attr("destination").unwrap_or("default-queue");
@@ -682,12 +732,99 @@ fn find_rule<'a>(rules: &'a [Rule], ns: &str, name: &str) -> Option<&'a Rule> {
         .find(|r| r.mule_ns == ns && r.mule_name == name)
 }
 
+/// Whether `elem` sets attribute `key` to something other than blank.
+fn has_attr_value(elem: &MuleElement, key: &str) -> bool {
+    elem.attr(key).is_some_and(|v| !v.trim().is_empty())
+}
+
 fn expand_uri_template(template: &str, elem: &MuleElement) -> String {
     let mut result = template.to_string();
     for (k, v) in &elem.attributes {
         result = result.replace(&format!("{{{}}}", k), v);
     }
     result
+}
+
+/// The endpoint URI a rule produces for `elem`: its URI template plus the
+/// rule's `camel_params`.
+fn rule_endpoint_uri(rule: &Rule, template: &str, elem: &MuleElement) -> String {
+    append_uri_params(
+        expand_uri_template(template, elem),
+        rule.camel_params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        elem,
+    )
+}
+
+/// Append endpoint options to `uri` as a query string, skipping every option
+/// whose value template cannot be resolved against `elem`.
+fn append_uri_params<'a>(
+    mut uri: String,
+    params: impl IntoIterator<Item = (&'a str, &'a str)>,
+    elem: &MuleElement,
+) -> String {
+    for (name, template) in params {
+        if let Some(value) = expand_param_template(template, elem) {
+            uri.push(if uri.contains('?') { '&' } else { '?' });
+            uri.push_str(name);
+            uri.push('=');
+            uri.push_str(&value);
+        }
+    }
+    uri
+}
+
+/// Expand `{attr}` and `{config.attr}` placeholders in an endpoint option
+/// template. Returns `None` when a referenced attribute is missing (or the
+/// value comes out empty), so optional options simply drop out of the URI.
+/// Text in double braces (`{{key}}`) is a Camel property placeholder and is
+/// kept as written.
+fn expand_param_template(template: &str, elem: &MuleElement) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        if rest.starts_with("{{") {
+            let end = rest.find("}}")? + 2;
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        let end = rest.find('}')?;
+        let key = &rest[1..end];
+        let value = match key.strip_prefix("config.") {
+            Some(config_key) => elem.resolved_config.as_ref()?.attr(config_key)?,
+            None => elem.attr(key)?,
+        };
+        out.push_str(&mule_placeholders_to_camel(value));
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    (!out.is_empty()).then_some(out)
+}
+
+/// Rewrite Mule `${key}` property placeholders (the ones the normalizer could
+/// not resolve at build time) as Camel `{{key}}` placeholders, which Camel
+/// Quarkus resolves from `application.properties` / MicroProfile Config.
+/// Camel does not interpret `${...}` in an endpoint URI.
+fn mule_placeholders_to_camel(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start..].find('}') else {
+            break;
+        };
+        let key = &rest[start + 2..start + len];
+        out.push_str(&rest[..start]);
+        out.push_str("{{");
+        out.push_str(key.strip_prefix("secure::").unwrap_or(key));
+        out.push_str("}}");
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn record_decision(
@@ -706,4 +843,336 @@ fn record_decision(
         rule_id: rule_id.map(|s| s.to_string()),
         rationale: rationale.to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(ns: &str, name: &str, attrs: &[(&str, &str)]) -> MuleElement {
+        MuleElement {
+            namespace: ns.into(),
+            name: name.into(),
+            attributes: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            children: vec![],
+            text: None,
+            line: None,
+            resolved_config: None,
+        }
+    }
+
+    fn with_config(mut e: MuleElement, config: MuleElement) -> MuleElement {
+        e.resolved_config = Some(Box::new(config));
+        e
+    }
+
+    fn rules_from_yaml(yaml: &str) -> Vec<Rule> {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("rules.yaml"), yaml).unwrap();
+        load_rules(dir.path()).unwrap()
+    }
+
+    fn source_uri(e: &MuleElement, rules: &[Rule]) -> String {
+        match map_source(e, rules, &mut Vec::new(), &mut Vec::new()) {
+            RouteEndpoint::Uri(uri) => uri,
+            other => panic!("expected a Uri source, got {:?}", other),
+        }
+    }
+
+    fn to_uris(e: &MuleElement, rules: &[Rule]) -> Vec<String> {
+        map_processor(e, rules, &mut Vec::new(), &mut Vec::new())
+            .into_iter()
+            .map(|step| match step {
+                RouteStep::ToUri(uri) => uri,
+                other => panic!("expected a ToUri step, got {:?}", other),
+            })
+            .collect()
+    }
+
+    const PARAM_RULES: &str = r#"
+mappings:
+  - id: x-listener
+    mule_ns: x
+    mule_name: listener
+    camel_uri: "x:{name}"
+    camel_params:
+      zeta: "{z}"
+      alpha: "{config.a}"
+  - id: x-send
+    mule_ns: x
+    mule_name: send
+    camel_uri: "x:{name}?fixed=1"
+    camel_params:
+      zeta: "{z}"
+"#;
+
+    #[test]
+    fn rule_camel_params_are_appended_in_declaration_order() {
+        let rules = rules_from_yaml(PARAM_RULES);
+        let e = with_config(
+            elem("x", "listener", &[("name", "n"), ("z", "1")]),
+            elem("x", "config", &[("a", "2")]),
+        );
+        assert_eq!(source_uri(&e, &rules), "x:n?zeta=1&alpha=2");
+    }
+
+    #[test]
+    fn rule_camel_param_is_omitted_when_its_attribute_is_missing() {
+        let rules = rules_from_yaml(PARAM_RULES);
+
+        let bare = elem("x", "listener", &[("name", "n")]);
+        assert_eq!(source_uri(&bare, &rules), "x:n");
+
+        let only_config = with_config(bare, elem("x", "config", &[("a", "2")]));
+        assert_eq!(source_uri(&only_config, &rules), "x:n?alpha=2");
+    }
+
+    #[test]
+    fn rule_camel_params_extend_an_existing_query_string() {
+        let rules = rules_from_yaml(PARAM_RULES);
+        let e = elem("x", "send", &[("name", "n"), ("z", "1")]);
+        assert_eq!(to_uris(&e, &rules), ["x:n?fixed=1&zeta=1"]);
+    }
+
+    #[test]
+    fn rule_camel_param_turns_mule_placeholders_into_camel_placeholders() {
+        let rules = rules_from_yaml(PARAM_RULES);
+        let e = elem("x", "listener", &[("name", "n"), ("z", "${my.prop}")]);
+        assert_eq!(source_uri(&e, &rules), "x:n?zeta={{my.prop}}");
+    }
+
+    #[test]
+    fn rule_camel_param_keeps_a_literal_camel_placeholder() {
+        let rules = rules_from_yaml(
+            r#"
+mappings:
+  - id: y-send
+    mule_ns: y
+    mule_name: send
+    camel_uri: "y:{name}"
+    camel_params:
+      brokers: "{{y.brokers}}"
+"#,
+        );
+        let e = elem("y", "send", &[("name", "n")]);
+        assert_eq!(to_uris(&e, &rules), ["y:n?brokers={{y.brokers}}"]);
+    }
+
+    #[test]
+    fn mule_placeholders_become_camel_placeholders() {
+        assert_eq!(
+            mule_placeholders_to_camel("localhost:9092"),
+            "localhost:9092"
+        );
+        assert_eq!(
+            mule_placeholders_to_camel("${kafka.brokers}"),
+            "{{kafka.brokers}}"
+        );
+        assert_eq!(
+            mule_placeholders_to_camel("${host}:${port}/x"),
+            "{{host}}:{{port}}/x"
+        );
+        // Mule's secure:: prefix has no Camel counterpart, and Camel would read
+        // "{{secure::key}}" as key "secure" with default ":key".
+        assert_eq!(mule_placeholders_to_camel("${secure::db.pw}"), "{{db.pw}}");
+        // Not a placeholder: left alone.
+        assert_eq!(
+            mule_placeholders_to_camel("${unterminated"),
+            "${unterminated"
+        );
+    }
+
+    // ── Kafka ───────────────────────────────────────────────────────────
+
+    /// The rules shipped in `mappings/`, and no rules at all (built-in
+    /// fallback): Kafka endpoints must come out the same either way.
+    fn shipped_and_builtin_rules() -> [Vec<Rule>; 2] {
+        let shipped = load_rules(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../mappings"))
+            .expect("load mappings/");
+        assert!(shipped.iter().any(|r| r.mule_ns == "kafka"));
+        [shipped, Vec::new()]
+    }
+
+    fn kafka_config(element: &str, name: &str, bootstrap_servers: &str) -> MuleElement {
+        elem(
+            "kafka",
+            element,
+            &[("name", name), ("bootstrapServers", bootstrap_servers)],
+        )
+    }
+
+    #[test]
+    fn kafka_message_listener_is_a_consumer_with_brokers_and_group_id() {
+        let listener = with_config(
+            elem(
+                "kafka",
+                "message-listener",
+                &[
+                    ("config-ref", "Kafka_Consumer_config"),
+                    ("topic", "orders.raw"),
+                    ("groupId", "order-ingest-group"),
+                ],
+            ),
+            kafka_config(
+                "consumer-config",
+                "Kafka_Consumer_config",
+                "${kafka.brokers}",
+            ),
+        );
+
+        for rules in shipped_and_builtin_rules() {
+            let mut decisions = Vec::new();
+            let mut deps = Vec::new();
+            let source = map_source(&listener, &rules, &mut decisions, &mut deps);
+
+            match source {
+                RouteEndpoint::Uri(uri) => assert_eq!(
+                    uri,
+                    "kafka:orders.raw?brokers={{kafka.brokers}}&groupId=order-ingest-group"
+                ),
+                other => panic!("expected a Uri source, got {:?}", other),
+            }
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].status, DecisionStatus::Done);
+            assert!(deps.iter().any(|d| d.artifact_id == "camel-quarkus-kafka"));
+        }
+    }
+
+    /// `<kafka:consumer-config>` the way Kafka connector 4.x writes it: topic
+    /// patterns, group ID and bootstrap servers all on the connection child.
+    fn kafka_4x_consumer_config(name: &str) -> MuleElement {
+        let mut bootstrap_servers = elem("kafka", "bootstrap-servers", &[]);
+        bootstrap_servers.children = vec![elem(
+            "kafka",
+            "bootstrap-server",
+            &[("value", "${kafka.brokers}")],
+        )];
+        let mut topic_patterns = elem("kafka", "topic-patterns", &[]);
+        topic_patterns.children = vec![elem("kafka", "topic-pattern", &[("value", "orders.raw")])];
+        let mut connection = elem(
+            "kafka",
+            "consumer-plaintext-connection",
+            &[("groupId", "order-ingest-group")],
+        );
+        connection.children = vec![bootstrap_servers, topic_patterns];
+        let mut config = elem("kafka", "consumer-config", &[("name", name)]);
+        config.children = vec![connection];
+        config
+    }
+
+    /// A message-listener the mapper cannot name a topic for: no `kafka:`
+    /// source and no `Done`, whether or not the shipped rules are loaded.
+    fn assert_message_listener_needs_manual_review(listener: &MuleElement) {
+        for rules in shipped_and_builtin_rules() {
+            let mut decisions = Vec::new();
+            let mut deps = Vec::new();
+            let source = map_source(listener, &rules, &mut decisions, &mut deps);
+
+            match source {
+                RouteEndpoint::Uri(uri) => assert_eq!(uri, "direct:kafka-message-listener"),
+                other => panic!("expected a Uri source, got {:?}", other),
+            }
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].mule_element, "kafka:message-listener");
+            assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+            assert_eq!(decisions[0].rule_id, None);
+            assert!(
+                decisions[0].rationale.contains("no topic attribute"),
+                "rationale should say what is missing: {}",
+                decisions[0].rationale
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_4x_message_listener_without_topic_needs_manual_review() {
+        // The real connector shape: the listener only has config-ref; the
+        // subscription lives on the consumer-config's connection.
+        let listener = with_config(
+            elem(
+                "kafka",
+                "message-listener",
+                &[("config-ref", "Kafka_Consumer_config")],
+            ),
+            kafka_4x_consumer_config("Kafka_Consumer_config"),
+        );
+        assert_message_listener_needs_manual_review(&listener);
+    }
+
+    #[test]
+    fn kafka_message_listener_with_blank_topic_or_no_config_needs_manual_review() {
+        let blank_topic = with_config(
+            elem(
+                "kafka",
+                "message-listener",
+                &[("config-ref", "c"), ("topic", " "), ("groupId", "g")],
+            ),
+            kafka_config("consumer-config", "c", "broker-1:9092"),
+        );
+        assert_message_listener_needs_manual_review(&blank_topic);
+
+        let bare = elem("kafka", "message-listener", &[]);
+        assert_message_listener_needs_manual_review(&bare);
+    }
+
+    #[test]
+    fn kafka_publish_takes_brokers_from_its_config() {
+        let publish = with_config(
+            elem(
+                "kafka",
+                "publish",
+                &[
+                    ("config-ref", "Kafka_Producer_config"),
+                    ("topic", "orders.validated"),
+                ],
+            ),
+            kafka_config(
+                "producer-config",
+                "Kafka_Producer_config",
+                "${kafka.brokers}",
+            ),
+        );
+
+        for rules in shipped_and_builtin_rules() {
+            assert_eq!(
+                to_uris(&publish, &rules),
+                ["kafka:orders.validated?brokers={{kafka.brokers}}"]
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_brokers_resolved_by_the_normalizer_are_emitted_literally() {
+        let consumer = with_config(
+            elem(
+                "kafka",
+                "consumer",
+                &[("topic", "orders"), ("groupId", "g")],
+            ),
+            kafka_config("consumer-config", "c", "broker-1:9092,broker-2:9092"),
+        );
+
+        for rules in shipped_and_builtin_rules() {
+            assert_eq!(
+                source_uri(&consumer, &rules),
+                "kafka:orders?brokers=broker-1:9092,broker-2:9092&groupId=g"
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_endpoints_without_config_or_group_stay_bare() {
+        // Brokers and group then come from camel.component.kafka.* in
+        // application.properties.
+        let consumer = elem("kafka", "consumer", &[("topic", "orders-topic")]);
+        let publish = elem("kafka", "publish", &[("topic", "orders-out")]);
+
+        for rules in shipped_and_builtin_rules() {
+            assert_eq!(source_uri(&consumer, &rules), "kafka:orders-topic");
+            assert_eq!(to_uris(&publish, &rules), ["kafka:orders-out"]);
+        }
+    }
 }

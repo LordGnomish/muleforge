@@ -7,7 +7,8 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 | Mule Element | Camel Equivalent | Status | Notes |
 |---|---|---|---|
 | `http:listener` | `platform-http:` | ✅ Auto | Path + method extracted |
-| `kafka:consumer` / `kafka:listener` | `kafka:` | ✅ Auto | Topic from config |
+| `kafka:consumer` / `kafka:listener` | `kafka:` | ✅ Auto | Topic and group ID from the listener, brokers from its config |
+| `kafka:message-listener` | `kafka:` | ⚠️ Partial | Auto (like `kafka:consumer`) only when the listener itself has a `topic` attribute. Kafka connector 4.x keeps topic patterns, group ID and bootstrap servers on the `consumer-config` connection, which is not read: such a listener is flagged for manual review |
 | `jms:listener` | `jms:queue:` | ✅ Auto | Destination from config |
 | `amqp:listener` | `amqp:queue:` | ✅ Auto | Via mapping YAML |
 | `file:listener` / `file:read` | `file:` | ✅ Auto | Directory from config |
@@ -32,7 +33,7 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 | `http:request` | `to("http:...")` | ✅ Auto | URL + method from config-ref |
 | `db:select/insert/update/delete` | `to("sql:...")` | ✅ Auto | SQL from element text |
 | `db:stored-procedure` | `to("sql-stored:...")` | ✅ Auto | Via mapping YAML |
-| `kafka:publish` | `to("kafka:topic")` | ✅ Auto | |
+| `kafka:publish` | `to("kafka:topic")` | ✅ Auto | Brokers from its config |
 | `jms:publish` | `to("jms:queue:dest")` | ✅ Auto | |
 | `amqp:publish` | `to("amqp:queue:dest")` | ✅ Auto | Via mapping YAML |
 | `file:write` / `sftp:write` | `to("file/sftp:path")` | ✅ Auto | |
@@ -101,6 +102,7 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 |---|---|---|
 | Custom Java components | Auto-copied with TODO markers | ✅ Auto-copy |
 | Anypoint MQ | Use Kafka or AMQP | - |
+| Kafka connector 4.x subscription on the `consumer-config` connection (topic patterns, group ID, bootstrap servers) | `kafka:message-listener` is flagged for manual review; set the `kafka:` source by hand | - |
 | MUnit tests | Scaffolded to JUnit 5 with TODO | ✅ Scaffold |
 | API specs (RAML/OAS) | Auto-copied to output | ✅ Auto-copy |
 | Mule domain projects | Flatten configs manually | - |

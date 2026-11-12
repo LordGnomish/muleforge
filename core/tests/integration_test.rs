@@ -585,3 +585,106 @@ async fn simple_http_flow_full_pipeline() {
     assert!(java.contains(".setBody(constant(\"Hello, Camel!\"))"));
     assert!(java.contains(".log(LoggingLevel.INFO"));
 }
+
+// ── Kafka connector 4.x: subscription on the consumer connection ──────────
+
+/// What Kafka connector 4.x actually writes: `<kafka:message-listener>` has
+/// only `config-ref`; topic patterns, group ID and bootstrap servers are on
+/// the connection inside `<kafka:consumer-config>`.
+const KAFKA_4X_XML: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:kafka="http://www.mulesoft.org/schema/mule/kafka"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+
+    <kafka:consumer-config name="Kafka_Consumer_config">
+        <kafka:consumer-plaintext-connection groupId="order-ingest-group">
+            <kafka:bootstrap-servers>
+                <kafka:bootstrap-server value="${kafka.brokers}" />
+            </kafka:bootstrap-servers>
+            <kafka:topic-patterns>
+                <kafka:topic-pattern value="orders.raw" />
+            </kafka:topic-patterns>
+        </kafka:consumer-plaintext-connection>
+    </kafka:consumer-config>
+
+    <kafka:producer-config name="Kafka_Producer_config">
+        <kafka:producer-plaintext-connection>
+            <kafka:bootstrap-servers>
+                <kafka:bootstrap-server value="${kafka.brokers}" />
+            </kafka:bootstrap-servers>
+        </kafka:producer-plaintext-connection>
+    </kafka:producer-config>
+
+    <flow name="orderIngest">
+        <kafka:message-listener config-ref="Kafka_Consumer_config" />
+        <logger level="INFO" message="Received order: #[payload]" />
+        <kafka:publish config-ref="Kafka_Producer_config" topic="orders.validated" />
+    </flow>
+</mule>"##;
+
+/// The mapper does not read the connection, so it has no topic for this
+/// listener. It must say so (manual review) rather than report the listener
+/// as done on a made-up topic — with the shipped rules and without any.
+#[tokio::test]
+async fn kafka_4x_listener_without_topic_is_flagged_for_manual_review() {
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mappings");
+    let no_rules = std::path::Path::new("/nonexistent");
+
+    for mappings_dir in [shipped.as_path(), no_rules] {
+        let input_dir = make_project(KAFKA_4X_XML);
+        let output_dir = TempDir::new().unwrap();
+
+        let project = parser::parse_project(input_dir.path()).unwrap();
+        let normalized = parser::normalize(project).unwrap();
+        let rules = mapper::load_rules(mappings_dir).unwrap();
+        assert_eq!(
+            rules.iter().any(|r| r.mule_ns == "kafka"),
+            mappings_dir == shipped,
+            "shipped mappings should be the only source of kafka rules"
+        );
+        let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+            .await
+            .unwrap();
+
+        assert_eq!(camel_ir.routes.len(), 1);
+        match &camel_ir.routes[0].source {
+            muleforge_core::ast::camel_ir::RouteEndpoint::Uri(u) => {
+                assert_eq!(u, "direct:kafka-message-listener")
+            }
+            other => panic!("expected Uri source, got {:?}", other),
+        }
+
+        let listener: Vec<_> = decisions
+            .iter()
+            .filter(|d| d.mule_element == "kafka:message-listener")
+            .collect();
+        assert_eq!(listener.len(), 1);
+        assert_eq!(listener[0].status, report::DecisionStatus::ManualReview);
+        assert_eq!(listener[0].rule_id, None);
+
+        let acquired = muleforge_core::git::AcquiredInput {
+            working_dir: input_dir.path().to_path_buf(),
+            source_description: "test project".to_string(),
+            source_commit: None,
+            is_temporary: false,
+        };
+        let r = report::build(&decisions, &acquired);
+        assert_eq!(r.summary.total_elements, 3);
+        assert_eq!(r.summary.manual_review, 1);
+        assert_eq!(r.summary.done, 2);
+
+        emitter::emit_project(&camel_ir, output_dir.path()).unwrap();
+        let java = std::fs::read_to_string(
+            output_dir
+                .path()
+                .join("src/main/java/generated/routes/OrderIngestRoute.java"),
+        )
+        .unwrap();
+        assert!(java.contains("from(\"direct:kafka-message-listener\")"));
+        assert!(
+            !java.contains("from(\"kafka:"),
+            "no kafka: source may be emitted without a topic:\n{java}"
+        );
+        // The publish names its topic itself and is still mapped.
+        assert!(java.contains(".to(\"kafka:orders.validated"));
+    }
+}

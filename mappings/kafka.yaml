@@ -1,4 +1,16 @@
 # Kafka connector mappings: Mule Kafka -> Camel Kafka
+#
+# brokers comes from the bootstrapServers of the element's config-ref target,
+# groupId from the listener itself. Either is left out of the URI when the
+# Mule XML does not set it; camel.component.kafka.* then applies.
+#
+# There is deliberately no rule for kafka:message-listener. Kafka connector
+# 4.x keeps the topic patterns (and group ID, bootstrap servers) on the
+# connection inside <kafka:consumer-config>, so the listener usually has no
+# topic attribute, and a camel_uri template cannot tell: it would emit
+# "kafka:{topic}" and report the element as done. The built-in mapping maps a
+# message-listener that names its topic exactly like the consumer rule below
+# and flags one that does not for manual review.
 component: kafka
 version: "1.0"
 
@@ -7,6 +19,9 @@ mappings:
     mule_ns: kafka
     mule_name: consumer
     camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"
+      groupId: "{groupId}"
     camel_component: kafka
     maven_deps:
       - group_id: org.apache.camel.quarkus
@@ -17,6 +32,9 @@ mappings:
     mule_ns: kafka
     mule_name: listener
     camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"
+      groupId: "{groupId}"
     camel_component: kafka
     maven_deps:
       - group_id: org.apache.camel.quarkus
@@ -27,6 +45,8 @@ mappings:
     mule_ns: kafka
     mule_name: publish
     camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"
     camel_component: kafka
     maven_deps:
       - group_id: org.apache.camel.quarkus
