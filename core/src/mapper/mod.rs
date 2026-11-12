@@ -14,6 +14,12 @@ pub struct Rule {
     pub mule_ns: String,
     pub mule_name: String,
     pub camel_uri_template: Option<String>,
+    /// Camel endpoint options appended to the URI as a query string, in
+    /// declaration order: `(option name, value template)`. A template may
+    /// reference `{attr}` (an attribute of the Mule element) and
+    /// `{config.attr}` (an attribute of the element's `config-ref` target).
+    /// An option whose template cannot be fully resolved is left out.
+    pub camel_params: Vec<(String, String)>,
     pub camel_component: Option<String>,
     pub maven_deps: Vec<MavenDependency>,
     pub notes: String,
@@ -54,6 +60,7 @@ pub fn load_rules(mappings_dir: &Path) -> Result<Vec<Rule>> {
                                 .get("camel_uri")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            camel_params: parse_camel_params(m.get("camel_params")),
                             camel_component: m
                                 .get("camel_component")
                                 .and_then(|v| v.as_str())
@@ -72,6 +79,15 @@ pub fn load_rules(mappings_dir: &Path) -> Result<Vec<Rule>> {
         }
     }
     Ok(rules)
+}
+
+fn parse_camel_params(val: Option<&serde_yaml::Value>) -> Vec<(String, String)> {
+    let Some(map) = val.and_then(|v| v.as_mapping()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+        .collect()
 }
 
 fn parse_maven_deps(val: Option<&serde_yaml::Value>) -> Vec<MavenDependency> {
@@ -219,7 +235,7 @@ fn map_source(
         );
         deps.extend(rule.maven_deps.iter().cloned());
         if let Some(ref tmpl) = rule.camel_uri_template {
-            return RouteEndpoint::Uri(expand_uri_template(tmpl, elem));
+            return RouteEndpoint::Uri(rule_endpoint_uri(rule, tmpl, elem));
         }
     }
 
@@ -336,7 +352,7 @@ fn map_processor(
         );
         deps.extend(rule.maven_deps.iter().cloned());
         if let Some(ref uri) = rule.camel_uri_template {
-            return vec![RouteStep::ToUri(expand_uri_template(uri, elem))];
+            return vec![RouteStep::ToUri(rule_endpoint_uri(rule, uri, elem))];
         }
     }
 
@@ -690,6 +706,88 @@ fn expand_uri_template(template: &str, elem: &MuleElement) -> String {
     result
 }
 
+/// The endpoint URI a rule produces for `elem`: its URI template plus the
+/// rule's `camel_params`.
+fn rule_endpoint_uri(rule: &Rule, template: &str, elem: &MuleElement) -> String {
+    append_uri_params(
+        expand_uri_template(template, elem),
+        rule.camel_params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        elem,
+    )
+}
+
+/// Append endpoint options to `uri` as a query string, skipping every option
+/// whose value template cannot be resolved against `elem`.
+fn append_uri_params<'a>(
+    mut uri: String,
+    params: impl IntoIterator<Item = (&'a str, &'a str)>,
+    elem: &MuleElement,
+) -> String {
+    for (name, template) in params {
+        if let Some(value) = expand_param_template(template, elem) {
+            uri.push(if uri.contains('?') { '&' } else { '?' });
+            uri.push_str(name);
+            uri.push('=');
+            uri.push_str(&value);
+        }
+    }
+    uri
+}
+
+/// Expand `{attr}` and `{config.attr}` placeholders in an endpoint option
+/// template. Returns `None` when a referenced attribute is missing (or the
+/// value comes out empty), so optional options simply drop out of the URI.
+/// Text in double braces (`{{key}}`) is a Camel property placeholder and is
+/// kept as written.
+fn expand_param_template(template: &str, elem: &MuleElement) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        if rest.starts_with("{{") {
+            let end = rest.find("}}")? + 2;
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        let end = rest.find('}')?;
+        let key = &rest[1..end];
+        let value = match key.strip_prefix("config.") {
+            Some(config_key) => elem.resolved_config.as_ref()?.attr(config_key)?,
+            None => elem.attr(key)?,
+        };
+        out.push_str(&mule_placeholders_to_camel(value));
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    (!out.is_empty()).then_some(out)
+}
+
+/// Rewrite Mule `${key}` property placeholders (the ones the normalizer could
+/// not resolve at build time) as Camel `{{key}}` placeholders, which Camel
+/// Quarkus resolves from `application.properties` / MicroProfile Config.
+/// Camel does not interpret `${...}` in an endpoint URI.
+fn mule_placeholders_to_camel(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start..].find('}') else {
+            break;
+        };
+        let key = &rest[start + 2..start + len];
+        out.push_str(&rest[..start]);
+        out.push_str("{{");
+        out.push_str(key.strip_prefix("secure::").unwrap_or(key));
+        out.push_str("}}");
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn record_decision(
     decisions: &mut Vec<MappingDecision>,
     elem: &MuleElement,
@@ -706,4 +804,145 @@ fn record_decision(
         rule_id: rule_id.map(|s| s.to_string()),
         rationale: rationale.to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(ns: &str, name: &str, attrs: &[(&str, &str)]) -> MuleElement {
+        MuleElement {
+            namespace: ns.into(),
+            name: name.into(),
+            attributes: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            children: vec![],
+            text: None,
+            line: None,
+            resolved_config: None,
+        }
+    }
+
+    fn with_config(mut e: MuleElement, config: MuleElement) -> MuleElement {
+        e.resolved_config = Some(Box::new(config));
+        e
+    }
+
+    fn rules_from_yaml(yaml: &str) -> Vec<Rule> {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("rules.yaml"), yaml).unwrap();
+        load_rules(dir.path()).unwrap()
+    }
+
+    fn source_uri(e: &MuleElement, rules: &[Rule]) -> String {
+        match map_source(e, rules, &mut Vec::new(), &mut Vec::new()) {
+            RouteEndpoint::Uri(uri) => uri,
+            other => panic!("expected a Uri source, got {:?}", other),
+        }
+    }
+
+    fn to_uris(e: &MuleElement, rules: &[Rule]) -> Vec<String> {
+        map_processor(e, rules, &mut Vec::new(), &mut Vec::new())
+            .into_iter()
+            .map(|step| match step {
+                RouteStep::ToUri(uri) => uri,
+                other => panic!("expected a ToUri step, got {:?}", other),
+            })
+            .collect()
+    }
+
+    const PARAM_RULES: &str = r#"
+mappings:
+  - id: x-listener
+    mule_ns: x
+    mule_name: listener
+    camel_uri: "x:{name}"
+    camel_params:
+      zeta: "{z}"
+      alpha: "{config.a}"
+  - id: x-send
+    mule_ns: x
+    mule_name: send
+    camel_uri: "x:{name}?fixed=1"
+    camel_params:
+      zeta: "{z}"
+"#;
+
+    #[test]
+    fn rule_camel_params_are_appended_in_declaration_order() {
+        let rules = rules_from_yaml(PARAM_RULES);
+        let e = with_config(
+            elem("x", "listener", &[("name", "n"), ("z", "1")]),
+            elem("x", "config", &[("a", "2")]),
+        );
+        assert_eq!(source_uri(&e, &rules), "x:n?zeta=1&alpha=2");
+    }
+
+    #[test]
+    fn rule_camel_param_is_omitted_when_its_attribute_is_missing() {
+        let rules = rules_from_yaml(PARAM_RULES);
+
+        let bare = elem("x", "listener", &[("name", "n")]);
+        assert_eq!(source_uri(&bare, &rules), "x:n");
+
+        let only_config = with_config(bare, elem("x", "config", &[("a", "2")]));
+        assert_eq!(source_uri(&only_config, &rules), "x:n?alpha=2");
+    }
+
+    #[test]
+    fn rule_camel_params_extend_an_existing_query_string() {
+        let rules = rules_from_yaml(PARAM_RULES);
+        let e = elem("x", "send", &[("name", "n"), ("z", "1")]);
+        assert_eq!(to_uris(&e, &rules), ["x:n?fixed=1&zeta=1"]);
+    }
+
+    #[test]
+    fn rule_camel_param_turns_mule_placeholders_into_camel_placeholders() {
+        let rules = rules_from_yaml(PARAM_RULES);
+        let e = elem("x", "listener", &[("name", "n"), ("z", "${my.prop}")]);
+        assert_eq!(source_uri(&e, &rules), "x:n?zeta={{my.prop}}");
+    }
+
+    #[test]
+    fn rule_camel_param_keeps_a_literal_camel_placeholder() {
+        let rules = rules_from_yaml(
+            r#"
+mappings:
+  - id: y-send
+    mule_ns: y
+    mule_name: send
+    camel_uri: "y:{name}"
+    camel_params:
+      brokers: "{{y.brokers}}"
+"#,
+        );
+        let e = elem("y", "send", &[("name", "n")]);
+        assert_eq!(to_uris(&e, &rules), ["y:n?brokers={{y.brokers}}"]);
+    }
+
+    #[test]
+    fn mule_placeholders_become_camel_placeholders() {
+        assert_eq!(
+            mule_placeholders_to_camel("localhost:9092"),
+            "localhost:9092"
+        );
+        assert_eq!(
+            mule_placeholders_to_camel("${kafka.brokers}"),
+            "{{kafka.brokers}}"
+        );
+        assert_eq!(
+            mule_placeholders_to_camel("${host}:${port}/x"),
+            "{{host}}:{{port}}/x"
+        );
+        // Mule's secure:: prefix has no Camel counterpart, and Camel would read
+        // "{{secure::key}}" as key "secure" with default ":key".
+        assert_eq!(mule_placeholders_to_camel("${secure::db.pw}"), "{{db.pw}}");
+        // Not a placeholder: left alone.
+        assert_eq!(
+            mule_placeholders_to_camel("${unterminated"),
+            "${unterminated"
+        );
+    }
 }

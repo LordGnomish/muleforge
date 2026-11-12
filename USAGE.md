@@ -251,6 +251,17 @@ mappings:
 
 Custom rules take priority over built-in mappings.
 
+`{attr}` in `camel_uri` is replaced with the Mule element's attribute of that name. Optional endpoint options go in `camel_params`; they are appended to the URI as a query string in the order written:
+
+```yaml
+    camel_uri: "kafka:{topic}"
+    camel_params:
+      brokers: "{config.bootstrapServers}"   # attribute of the config-ref target
+      groupId: "{groupId}"                   # attribute of the element itself
+```
+
+An option is left out when the attribute it refers to is absent. A Mule property placeholder in the value (`${kafka.brokers}`) is emitted as a Camel one (`{{kafka.brokers}}`).
+
 ## Troubleshooting
 
 ### "muleforge-core binary not found"
