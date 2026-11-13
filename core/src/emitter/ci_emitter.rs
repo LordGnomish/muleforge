@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::ast::camel_ir::CamelProject;
+use crate::emitter::JAVA_RELEASE;
 use crate::Result;
 
 pub fn emit(ir: &CamelProject, output_dir: &Path) -> Result<()> {
@@ -23,10 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up JDK 17
+      - name: Set up JDK {java}
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '{java}'
           distribution: 'temurin'
           cache: maven
       - name: Build
@@ -49,10 +50,12 @@ jobs:
           docker build -t {name}:${{{{ github.sha }}}} .
           docker tag {name}:${{{{ github.sha }}}} {name}:latest
 "#,
-        name = ir.name
+        name = ir.name,
+        java = JAVA_RELEASE
     );
 
-    let release = r#"name: Release
+    let release = format!(
+        r#"name: Release
 
 on:
   push:
@@ -63,10 +66,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up JDK 17
+      - name: Set up JDK {java}
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '{java}'
           distribution: 'temurin'
           cache: maven
       - name: Build native
@@ -75,8 +78,9 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: target/*-runner
-"#
-    .to_string();
+"#,
+        java = JAVA_RELEASE
+    );
 
     std::fs::write(workflows_dir.join("ci.yaml"), ci)?;
     std::fs::write(workflows_dir.join("release.yaml"), release)?;

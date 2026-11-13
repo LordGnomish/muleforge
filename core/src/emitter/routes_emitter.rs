@@ -403,9 +403,13 @@ fn generate_pom(ir: &CamelProject) -> String {
     pom
 }
 
+/// Multi-stage Dockerfile. The JDK of every build and runtime image is the
+/// Java release the pom compiles for ([`JAVA_RELEASE`]): an older JDK cannot
+/// build it ("release version N not supported").
 fn generate_dockerfile(_name: &str) -> String {
-    r#"# --- JVM build ---
-FROM maven:3.9-eclipse-temurin-17 AS build
+    format!(
+        r#"# --- JVM build ---
+FROM maven:3.9-eclipse-temurin-{java} AS build
 WORKDIR /app
 COPY pom.xml .
 RUN mvn dependency:go-offline -B
@@ -413,14 +417,14 @@ COPY src ./src
 RUN mvn package -DskipTests -B
 
 # --- JVM runtime ---
-FROM eclipse-temurin:17-jre-alpine AS jvm
+FROM eclipse-temurin:{java}-jre-alpine AS jvm
 WORKDIR /app
 COPY --from=build /app/target/quarkus-app /app
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "quarkus-run.jar"]
 
 # --- Native build (optional) ---
-FROM quay.io/quarkus/ubi-quarkus-mandrel-builder-image:23.1-java17 AS native-build
+FROM quay.io/quarkus/ubi-quarkus-mandrel-builder-image:jdk-{java} AS native-build
 WORKDIR /app
 COPY pom.xml .
 COPY src ./src
@@ -432,8 +436,9 @@ WORKDIR /app
 COPY --from=native-build /app/target/*-runner /app/application
 EXPOSE 8080
 ENTRYPOINT ["./application", "-Dquarkus.http.host=0.0.0.0"]
-"#
-    .to_string()
+"#,
+        java = JAVA_RELEASE
+    )
 }
 
 const GITIGNORE: &str = r#"target/
