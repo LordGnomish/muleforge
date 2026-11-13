@@ -269,6 +269,28 @@ fn push_dependency(
     pom.push_str("        </dependency>\n");
 }
 
+/// The project name as a Maven `artifactId`.
+///
+/// The name is the Mule project's directory name and may contain anything
+/// (spaces, for a start), while Maven only reads a pom whose ids match
+/// `[A-Za-z0-9_.-]+`. Each run of other characters becomes one `-`.
+fn maven_artifact_id(name: &str) -> String {
+    let mut id = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+            id.push(c);
+        } else if !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    let id = id.trim_matches('-');
+    if id.is_empty() {
+        "migrated-project".to_string()
+    } else {
+        id.to_string()
+    }
+}
+
 /// The `pom.xml` of the emitted project.
 ///
 /// `quarkus-bom`, `quarkus-camel-bom` and `quarkus-maven-plugin` all take
@@ -292,7 +314,10 @@ fn generate_pom(ir: &CamelProject) -> String {
     <groupId>generated</groupId>
 "#,
     );
-    pom.push_str(&format!("    <artifactId>{}</artifactId>\n", ir.name));
+    pom.push_str(&format!(
+        "    <artifactId>{}</artifactId>\n",
+        maven_artifact_id(&ir.name)
+    ));
     pom.push_str(
         r#"    <version>1.0.0-SNAPSHOT</version>
     <packaging>jar</packaging>
@@ -652,6 +677,30 @@ mod tests {
         assert_eq!(element(&pom, "groupId"), Some("generated"));
         assert_eq!(element(&pom, "artifactId"), Some("orders"));
         assert_eq!(element(&pom, "packaging"), Some("jar"));
+    }
+
+    #[test]
+    fn pom_artifact_id_is_a_valid_maven_id_for_any_project_name() {
+        // The project name is the Mule project's directory name. Maven
+        // rejects the whole pom unless the artifactId is `[A-Za-z0-9_.-]+`.
+        for (name, artifact_id) in [
+            ("orders", "orders"),
+            ("hello-world_mule.v2", "hello-world_mule.v2"),
+            ("My Mule App", "My-Mule-App"),
+            ("orders (copy) & co", "orders-copy-co"),
+            ("  bestellungen-für-köln ", "bestellungen-f-r-k-ln"),
+            ("???", "migrated-project"),
+            ("", "migrated-project"),
+        ] {
+            let mut ir = project(vec![]);
+            ir.name = name.into();
+            let pom = generate_pom(&ir);
+            assert_eq!(
+                element(&pom, "artifactId"),
+                Some(artifact_id),
+                "artifactId for project name {name:?}"
+            );
+        }
     }
 
     #[test]
