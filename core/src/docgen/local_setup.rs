@@ -1,6 +1,7 @@
 //! Local development setup guide.
 
 use crate::ast::camel_ir::CamelProject;
+use crate::emitter::JAVA_RELEASE;
 use crate::Result;
 use std::path::Path;
 
@@ -13,7 +14,7 @@ pub fn generate(ir: &CamelProject, docs_dir: &Path) -> Result<()> {
 
 ## Prerequisites
 
-- JDK 17+ (Temurin recommended)
+- JDK {java}+ (Temurin recommended)
 - Maven 3.9+
 - Docker (for container builds)
 
@@ -22,7 +23,7 @@ pub fn generate(ir: &CamelProject, docs_dir: &Path) -> Result<()> {
 ```bash
 # Clone the repository
 git clone <repo-url>
-cd {}
+cd {name}
 
 # Run in dev mode (hot reload)
 mvn quarkus:dev
@@ -50,7 +51,8 @@ Configure these before running:
 2. Install Quarkus extension
 3. Use the Quarkus dev command from command palette
 "#,
-        ir.name
+        java = JAVA_RELEASE,
+        name = ir.name
     );
 
     std::fs::write(dev_dir.join("local-setup.md"), md)?;

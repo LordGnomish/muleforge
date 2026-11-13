@@ -25,6 +25,24 @@ pub mod route_diagram;
 pub mod routes_emitter;
 pub mod tests_emitter;
 
+/// Quarkus platform release the emitted project is built on.
+///
+/// The emitted `pom.xml` imports `io.quarkus.platform:quarkus-bom` and
+/// `io.quarkus.platform:quarkus-camel-bom` and runs
+/// `io.quarkus.platform:quarkus-maven-plugin`, all three at this one
+/// version, so it has to be a version that Maven Central has for each of
+/// them (not every Quarkus version is a platform release: there is no
+/// platform 3.8.0, for example). The platform's Camel BOM decides the Camel
+/// Quarkus version; nothing else pins it.
+///
+/// When changing it, rebuild an emitted project (`mvn package`) before
+/// updating `examples/*/expected-output/pom.xml`.
+pub const QUARKUS_PLATFORM_VERSION: &str = "3.33.1";
+
+/// Java release the emitted project is compiled for (`maven.compiler.release`).
+/// The platform above needs Java 17 or newer.
+pub const JAVA_RELEASE: &str = "21";
+
 /// Emit the core Quarkus project (routes, beans, pom.xml, application.properties,
 /// Dockerfile, tests, CI workflows).
 pub fn emit_project(ir: &CamelProject, output_dir: &Path) -> Result<()> {

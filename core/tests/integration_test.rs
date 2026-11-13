@@ -1,4 +1,4 @@
-use muleforge_core::{emitter, mapper, parser, report};
+use muleforge_core::{docgen, emitter, mapper, parser, report};
 use std::io::Write;
 use tempfile::TempDir;
 
@@ -687,4 +687,80 @@ async fn kafka_4x_listener_without_topic_is_flagged_for_manual_review() {
         // The publish names its topic itself and is still mapped.
         assert!(java.contains(".to(\"kafka:orders.validated"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The emitted project compiles for one Java release (`maven.compiler.release`
+// in pom.xml). Every JDK the emitted build files pick must be that release:
+// an older JDK stops at "release version N not supported".
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn emitted_build_files_use_the_java_release_of_the_pom() {
+    let input_dir = make_project(COMPLEX_XML);
+    let output_dir = TempDir::new().unwrap();
+    let out = output_dir.path();
+
+    let project = parser::parse_project(input_dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let rules = mapper::load_rules(std::path::Path::new("/nonexistent")).unwrap();
+    let (camel_ir, _) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+
+    emitter::emit_project(&camel_ir, out).unwrap();
+    docgen::local_setup::generate(&camel_ir, &out.join("docs")).unwrap();
+
+    let pom = std::fs::read_to_string(out.join("pom.xml")).unwrap();
+    let release = pom
+        .split("<maven.compiler.release>")
+        .nth(1)
+        .and_then(|rest| rest.split("</maven.compiler.release>").next())
+        .expect("pom sets maven.compiler.release");
+    assert!(
+        release.parse::<u32>().is_ok(),
+        "maven.compiler.release should be a Java release number, got {release:?}"
+    );
+
+    let dockerfile = std::fs::read_to_string(out.join("Dockerfile")).unwrap();
+    let from_lines: Vec<&str> = dockerfile
+        .lines()
+        .filter(|l| l.starts_with("FROM "))
+        .collect();
+    for expected in [
+        format!("FROM maven:3.9-eclipse-temurin-{release} AS build"),
+        format!("FROM eclipse-temurin:{release}-jre-alpine AS jvm"),
+        format!(
+            "FROM quay.io/quarkus/ubi-quarkus-mandrel-builder-image:jdk-{release} AS native-build"
+        ),
+    ] {
+        assert!(
+            from_lines.contains(&expected.as_str()),
+            "Dockerfile should contain `{expected}`, has {from_lines:?}"
+        );
+    }
+
+    for workflow in ["ci.yaml", "release.yaml"] {
+        let yaml = std::fs::read_to_string(out.join(".github/workflows").join(workflow)).unwrap();
+        let java_versions: Vec<&str> = yaml
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("java-version:"))
+            .collect();
+        assert_eq!(
+            java_versions,
+            [format!("java-version: '{release}'")],
+            "{workflow} should set up JDK {release}"
+        );
+        assert!(
+            yaml.contains(&format!("- name: Set up JDK {release}\n")),
+            "{workflow} should name the JDK it sets up"
+        );
+    }
+
+    let local_setup = std::fs::read_to_string(out.join("docs/development/local-setup.md")).unwrap();
+    assert!(
+        local_setup.contains(&format!("- JDK {release}+ ")),
+        "local-setup.md should ask for JDK {release}+:\n{local_setup}"
+    );
 }
