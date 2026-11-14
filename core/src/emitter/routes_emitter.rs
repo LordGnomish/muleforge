@@ -66,15 +66,8 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
 
     // Exception handlers
     for eh in &route.on_exceptions {
-        let classes = eh.exception_classes.join(", ");
-        java.push_str(&format!("        onException({})\n", classes));
-        if eh.handled {
-            java.push_str("            .handled(true)\n");
-        }
-        for step in &eh.steps {
-            emit_step_dsl(&mut java, step, 3);
-        }
-        java.push_str("            .end();\n\n");
+        java.push_str(&on_exception_clause(eh));
+        java.push('\n');
     }
 
     // Route definition
@@ -93,6 +86,64 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
     java.push_str("    }\n");
     java.push_str("}\n");
     java
+}
+
+/// One `onException(...)` clause, the Camel form of a Mule on-error scope.
+///
+/// The clause is declared on the RouteBuilder ahead of `from(...)`. Camel
+/// scopes such a clause to the routes of that RouteBuilder instance, and an
+/// emitted RouteBuilder holds exactly one route, so it handles the errors of
+/// that flow only, like the flow's `<error-handler>` in Mule.
+///
+/// * `onException(Class<? extends Throwable>...)` takes class literals:
+///   every exception class is written fully qualified with `.class`.
+/// * `handled(true)` is Mule's on-error-continue: the failed route stops,
+///   the clause's steps run and their result is the reply, as if the route
+///   had succeeded. (Not `continued(true)`: that resumes the route after the
+///   failed step, which on-error-continue does not do.)
+/// * `handled(false)` is Mule's on-error-propagate: the steps run and the
+///   caller still gets the failure. It is Camel's default and written out
+///   so the generated route says which of the two it is.
+///
+/// A handler without exception class (the mapper found none for the Mule
+/// error type) is emitted commented out: `onException()` compiles but Camel
+/// rejects it at startup, and `Exception.class` would handle more errors
+/// than the Mule scope did.
+fn on_exception_clause(eh: &ExceptionHandler) -> String {
+    let classes: Vec<String> = eh
+        .exception_classes
+        .iter()
+        .map(|class| java_class_literal(class))
+        .collect();
+
+    let mut clause = String::new();
+    if classes.is_empty() {
+        clause.push_str("        onException(/* TODO: exception class */)\n");
+    } else {
+        clause.push_str(&format!("        onException({})\n", classes.join(", ")));
+    }
+    clause.push_str(&format!("            .handled({})\n", eh.handled));
+    for step in &eh.steps {
+        emit_step_dsl(&mut clause, step, 3);
+    }
+    clause.push_str("            .end();\n");
+
+    if classes.is_empty() {
+        clause = clause
+            .lines()
+            .map(|line| match line.strip_prefix("        ") {
+                Some(code) => format!("        // {code}\n"),
+                None => format!("        // {line}\n"),
+            })
+            .collect();
+    }
+    clause
+}
+
+/// `java.net.ConnectException` -> `java.net.ConnectException.class`.
+fn java_class_literal(class_name: &str) -> String {
+    let name = class_name.trim();
+    format!("{}.class", name.strip_suffix(".class").unwrap_or(name))
 }
 
 fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
@@ -543,6 +594,186 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    // ── onException ─────────────────────────────────────────────────────
+
+    fn handler(classes: &[&str], handled: bool, steps: Vec<RouteStep>) -> ExceptionHandler {
+        ExceptionHandler {
+            exception_classes: classes.iter().map(|c| c.to_string()).collect(),
+            handled,
+            steps,
+        }
+    }
+
+    /// Java source of the RouteBuilder for a flow `safeFlow` that has the
+    /// given exception handlers and no steps.
+    fn route_java(on_exceptions: Vec<ExceptionHandler>) -> String {
+        generate_route_builder(
+            "SafeFlowRoute",
+            &CamelRoute {
+                id: "safeFlow".into(),
+                source: RouteEndpoint::Uri("platform-http:/safe?httpMethodRestrict=GET".into()),
+                steps: vec![],
+                on_exceptions,
+            },
+        )
+    }
+
+    /// The lines of `java` that are code: trimmed, without blank lines and
+    /// `//` comment lines.
+    fn code_lines(java: &str) -> Vec<&str> {
+        java.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect()
+    }
+
+    #[test]
+    fn on_exception_names_a_single_exception_type_as_a_class_literal() {
+        // examples/hello-world, safeFlow: on-error-continue type="HTTP:CONNECTIVITY".
+        let java = route_java(vec![handler(
+            &["java.net.ConnectException"],
+            true,
+            vec![
+                RouteStep::SetBody {
+                    expression: Expression::Constant("Service temporarily unavailable".into()),
+                },
+                RouteStep::Log {
+                    level: LogLevel::Warn,
+                    message: "Upstream service unreachable".into(),
+                },
+            ],
+        )]);
+
+        // `onException(Class<? extends Throwable>...)` takes class literals:
+        // a bare type name is not a Java expression and does not compile.
+        let clause = r#"
+        onException(java.net.ConnectException.class)
+            .handled(true)
+            .setBody(constant("Service temporarily unavailable"))
+            .log(LoggingLevel.WARN, "Upstream service unreachable")
+            .end();
+
+        from("platform-http:/safe?httpMethodRestrict=GET")
+            .routeId("safeFlow")
+"#;
+        assert!(
+            java.contains(clause),
+            "expected clause:{clause}\nin:\n{java}"
+        );
+    }
+
+    #[test]
+    fn on_exception_lists_several_exception_types_as_class_literals() {
+        let java = route_java(vec![handler(
+            &[
+                "java.net.ConnectException",
+                "java.net.SocketTimeoutException",
+            ],
+            true,
+            vec![],
+        )]);
+
+        assert!(
+            code_lines(&java).contains(
+                &"onException(java.net.ConnectException.class, java.net.SocketTimeoutException.class)"
+            ),
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn on_exception_keeps_fully_qualified_class_names() {
+        // Nothing is imported for exception classes, so the package has to
+        // stay on the name; a name that already is a class literal is not
+        // suffixed a second time.
+        let java = route_java(vec![
+            handler(
+                &["org.apache.camel.http.base.HttpOperationFailedException"],
+                false,
+                vec![],
+            ),
+            handler(&["java.sql.SQLException.class"], false, vec![]),
+        ]);
+
+        let code = code_lines(&java);
+        assert!(
+            code.contains(
+                &"onException(org.apache.camel.http.base.HttpOperationFailedException.class)"
+            ),
+            "{java}"
+        );
+        assert!(
+            code.contains(&"onException(java.sql.SQLException.class)"),
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn on_exception_always_states_whether_the_exception_is_handled() {
+        // on-error-continue: the handler's result is the route's reply.
+        let continued = route_java(vec![handler(&["java.lang.Exception"], true, vec![])]);
+        assert!(
+            continued.contains(
+                "        onException(java.lang.Exception.class)\n            .handled(true)\n            .end();\n"
+            ),
+            "{continued}"
+        );
+        // on-error-propagate: the handler runs and the caller still gets
+        // the failure. That is Camel's default, spelled out.
+        let propagated = route_java(vec![handler(&["java.lang.Exception"], false, vec![])]);
+        assert!(
+            propagated.contains(
+                "        onException(java.lang.Exception.class)\n            .handled(false)\n            .end();\n"
+            ),
+            "{propagated}"
+        );
+        // Mule's on-error-continue ends the flow with the handler's result;
+        // Camel's continued(true) would resume the route after the failed step.
+        assert!(!continued.contains("continued("), "{continued}");
+        assert!(!propagated.contains("continued("), "{propagated}");
+    }
+
+    #[test]
+    fn on_exception_without_an_exception_class_is_emitted_commented_out() {
+        // The mapper found no exception class for the handler's Mule error
+        // type. `onException()` would compile and then fail at startup, and
+        // `Exception.class` would catch far more than the Mule handler did.
+        let java = route_java(vec![handler(
+            &[],
+            true,
+            vec![
+                RouteStep::RawDsl("TODO: no exception class for FILE:NOT_FOUND".into()),
+                RouteStep::SetBody {
+                    expression: Expression::Constant("fallback".into()),
+                },
+            ],
+        )]);
+
+        let code = code_lines(&java);
+        assert!(
+            !code
+                .iter()
+                .any(|l| l.contains("onException") || l.contains("fallback")),
+            "a handler without exception class must not be active code:\n{java}"
+        );
+        // Still there for whoever completes it by hand.
+        let commented = r#"
+        // onException(/* TODO: exception class */)
+        //     .handled(true)
+        //     // TODO: no exception class for FILE:NOT_FOUND
+        //     .setBody(constant("fallback"))
+        //     .end();
+
+        from("platform-http:/safe?httpMethodRestrict=GET")
+"#;
+        assert!(
+            java.contains(commented),
+            "expected:{commented}\nin:\n{java}"
+        );
+        // The route itself is unaffected.
+        assert!(code.contains(&r#".routeId("safeFlow")"#), "{java}");
     }
 
     #[test]

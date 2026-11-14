@@ -681,49 +681,261 @@ fn map_processor(
     }
 }
 
+/// Exception class of a handler for every error: Mule's `ANY`, or an
+/// on-error scope without `type`.
+const ANY_EXCEPTION: &str = "java.lang.Exception";
+
+/// Map a flow's `<error-handler>` to Camel exception clauses, one per
+/// on-error scope.
+///
+/// * `on-error-continue` -> `onException(...).handled(true)`: the flow stops
+///   at the failed processor, the scope's processors run and their result is
+///   the flow's result, as if it had succeeded.
+/// * `on-error-propagate` -> `onException(...).handled(false)`: the scope's
+///   processors run and the error still reaches the caller.
+/// * `type` is a comma-separated list of Mule error types. `ANY`, or no
+///   `type`, is every error: `java.lang.Exception`, an exact mapping. Any
+///   other known type becomes its nearest exception class (see
+///   [`map_mule_error_type`]), which is an approximation and therefore
+///   flagged. A type without known class contributes none: it is never
+///   widened to `java.lang.Exception`, which would make the handler take
+///   every error of the route.
+/// * Mule takes the first scope that matches, in document order; Camel keeps
+///   one clause per exception class and prefers the closest class. So a
+///   class goes to the first scope that names it, and nothing goes to a
+///   scope behind one that takes every error.
+/// * `when` conditions are not converted; such a scope loses its classes,
+///   because without the condition it would handle more than it did.
+///
+/// A handler left without exception class is emitted commented out. Only an
+/// exact mapping is reported as done; everything else is flagged for manual
+/// review, in the report and with a TODO in the generated clause.
 fn map_error_handler(
     eh: &MuleElement,
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
 ) -> Vec<ExceptionHandler> {
+    if let Some(reference) = eh.attr("ref") {
+        record_decision(
+            decisions,
+            eh,
+            DecisionStatus::ManualReview,
+            None,
+            &format!(
+                "error-handler ref=\"{reference}\" points to a global error handler, which is \
+                 not migrated - add its on-error scopes to this route as onException clauses"
+            ),
+        );
+    }
+
     let mut handlers = Vec::new();
+    // Exception classes that already went to an earlier scope.
+    let mut claimed: Vec<String> = Vec::new();
     for child in &eh.children {
-        if child.name == "on-error-propagate" || child.name == "on-error-continue" {
-            let handled = child.name == "on-error-continue";
-            let exception_type = child.attr("type").unwrap_or("java.lang.Exception");
-            let steps: Vec<RouteStep> = child
+        if child.name != "on-error-propagate" && child.name != "on-error-continue" {
+            continue;
+        }
+        let handled = child.name == "on-error-continue";
+        let mut classes: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+
+        let types: Vec<&str> = child
+            .attr("type")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if types.is_empty() || types.iter().any(|t| matches!(*t, "ANY" | "MULE:ANY")) {
+            classes.push(ANY_EXCEPTION.to_string());
+        } else {
+            for mule_type in &types {
+                let Some(mapping) = map_mule_error_type(mule_type) else {
+                    notes.push(format!(
+                        "{mule_type} has no known Camel exception class: add the exception \
+                         the migrated route throws for it"
+                    ));
+                    continue;
+                };
+                notes.push(format!(
+                    "{mule_type} is approximated by {}: {}",
+                    mapping.class, mapping.caveat
+                ));
+                if !classes.iter().any(|c| c == mapping.class) {
+                    classes.push(mapping.class.to_string());
+                }
+                if let Some(artifact_id) = mapping.extension {
+                    deps.push(MavenDependency {
+                        group_id: "org.apache.camel.quarkus".into(),
+                        artifact_id: artifact_id.into(),
+                        version: None,
+                    });
+                }
+            }
+        }
+
+        if claimed.iter().any(|c| c == ANY_EXCEPTION) {
+            if !classes.is_empty() {
+                notes.push(
+                    "an earlier on-error scope of this error handler takes every error, so \
+                     Mule never runs this one"
+                        .to_string(),
+                );
+            }
+            classes.clear();
+        } else {
+            classes.retain(|class| {
+                let free = !claimed.contains(class);
+                if !free {
+                    notes.push(format!(
+                        "{class} already goes to an earlier on-error scope of this error \
+                         handler: Mule takes the first scope that matches, Camel keeps one \
+                         clause per exception class"
+                    ));
+                }
+                free
+            });
+        }
+
+        match child.attr("when").filter(|w| !w.trim().is_empty()) {
+            Some(when) => {
+                notes.push(format!(
+                    "when=\"{}\" is not converted: the clause stays disabled until the \
+                     condition is added as .onWhen(...) to {}",
+                    when.trim(),
+                    on_exception_signature(&classes)
+                ));
+                classes.clear();
+            }
+            None => claimed.extend(classes.iter().cloned()),
+        }
+
+        let mut steps: Vec<RouteStep> = Vec::new();
+        if !notes.is_empty() {
+            let mut todo = format!("TODO: review this handler ({})", describe_scope(child));
+            for note in &notes {
+                todo.push_str("\n- ");
+                todo.push_str(note);
+            }
+            steps.push(RouteStep::RawDsl(todo));
+        }
+        steps.extend(
+            child
                 .children
                 .iter()
-                .flat_map(|c| map_processor(c, rules, decisions, deps))
-                .collect();
+                .flat_map(|c| map_processor(c, rules, decisions, deps)),
+        );
+
+        let clause = if classes.is_empty() {
+            "onException clause emitted commented out".to_string()
+        } else {
+            format!("{}.handled({handled})", on_exception_signature(&classes))
+        };
+        if notes.is_empty() {
             record_decision(
                 decisions,
                 child,
                 DecisionStatus::Done,
                 None,
-                &format!("{} -> onException(handled={})", child.name, handled),
+                &format!("{} -> {clause}", child.name),
             );
-            handlers.push(ExceptionHandler {
-                exception_classes: vec![map_mule_error_type(exception_type)],
-                handled,
-                steps,
-            });
+        } else {
+            record_decision(
+                decisions,
+                child,
+                DecisionStatus::ManualReview,
+                None,
+                &format!("{} -> {clause}; review: {}", child.name, notes.join("; ")),
+            );
         }
+        handlers.push(ExceptionHandler {
+            exception_classes: classes,
+            handled,
+            steps,
+        });
     }
     handlers
 }
 
-fn map_mule_error_type(mule_type: &str) -> String {
-    match mule_type {
-        "HTTP:CONNECTIVITY" | "HTTP:TIMEOUT" => "java.net.ConnectException".into(),
-        "HTTP:UNAUTHORIZED" | "HTTP:FORBIDDEN" => {
-            "org.apache.camel.http.base.HttpOperationFailedException".into()
+/// `onException(a.B.class, c.D.class)` for the given exception classes.
+fn on_exception_signature(classes: &[String]) -> String {
+    let literals: Vec<String> = classes.iter().map(|c| format!("{c}.class")).collect();
+    format!("onException({})", literals.join(", "))
+}
+
+/// An on-error scope as written in the Mule XML, without its processors:
+/// `on-error-continue type="HTTP:CONNECTIVITY"`.
+fn describe_scope(scope: &MuleElement) -> String {
+    let mut out = scope.name.clone();
+    for key in ["type", "when"] {
+        if let Some(value) = scope.attr(key) {
+            out.push_str(&format!(" {key}=\"{}\"", value.trim()));
         }
-        "DB:CONNECTIVITY" | "DB:BAD_SQL_SYNTAX" => "java.sql.SQLException".into(),
-        "VALIDATION:INVALID_PAYLOAD" => "org.apache.camel.ValidationException".into(),
-        _ => "java.lang.Exception".into(),
     }
+    out
+}
+
+/// The Java exception class nearest to a Mule error type.
+struct ErrorTypeMapping {
+    /// Fully qualified class name.
+    class: &'static str,
+    /// How the class differs from the Mule error type. There always is a
+    /// difference: an exception class is not tied to one connector, and
+    /// none of these classes covers exactly the failures of its error type.
+    caveat: &'static str,
+    /// The Camel Quarkus extension that brings the class, unless it is part
+    /// of the JDK or of Camel's core API.
+    extension: Option<&'static str>,
+}
+
+/// Nearest exception class for a namespaced Mule error type, as raised by
+/// the Camel component its connector is mapped to. `None` for a type
+/// without known counterpart (`ANY` is handled by the caller).
+fn map_mule_error_type(mule_type: &str) -> Option<ErrorTypeMapping> {
+    let (class, caveat, extension) = match mule_type {
+        "HTTP:CONNECTIVITY" => (
+            "java.net.ConnectException",
+            "it covers a refused connection only; other connection failures (unknown host, \
+             TLS, reset) are other java.io.IOException types",
+            None,
+        ),
+        // Connect and response timeouts of Camel's HTTP producer.
+        "HTTP:TIMEOUT" => (
+            "java.net.SocketTimeoutException",
+            "it also matches a socket timeout of any other endpoint of the route",
+            None,
+        ),
+        "HTTP:UNAUTHORIZED" => (
+            "org.apache.camel.http.base.HttpOperationFailedException",
+            "it matches every failed HTTP status: narrow it with .onWhen(...) on \
+             getStatusCode() == 401",
+            Some("camel-quarkus-http"),
+        ),
+        "HTTP:FORBIDDEN" => (
+            "org.apache.camel.http.base.HttpOperationFailedException",
+            "it matches every failed HTTP status: narrow it with .onWhen(...) on \
+             getStatusCode() == 403",
+            Some("camel-quarkus-http"),
+        ),
+        "DB:CONNECTIVITY" | "DB:BAD_SQL_SYNTAX" => (
+            "java.sql.SQLException",
+            "it matches every SQL failure, not only this error type",
+            None,
+        ),
+        "VALIDATION:INVALID_PAYLOAD" => (
+            "org.apache.camel.ValidationException",
+            "it is what Camel's validate() and validator endpoints throw: check how the \
+             migrated route validates the payload",
+            None,
+        ),
+        _ => return None,
+    };
+    Some(ErrorTypeMapping {
+        class,
+        caveat,
+        extension,
+    })
 }
 
 fn find_rule<'a>(rules: &'a [Rule], ns: &str, name: &str) -> Option<&'a Rule> {
@@ -982,6 +1194,359 @@ mappings:
         assert_eq!(
             mule_placeholders_to_camel("${unterminated"),
             "${unterminated"
+        );
+    }
+
+    // ── Error handlers ──────────────────────────────────────────────────
+
+    /// `<error-handler>` holding the given on-error scopes.
+    fn error_handler(scopes: Vec<MuleElement>) -> MuleElement {
+        let mut eh = elem("", "error-handler", &[]);
+        eh.children = scopes;
+        eh
+    }
+
+    /// An on-error scope whose only processor sets the payload to `"fallback"`.
+    fn on_error(name: &str, attrs: &[(&str, &str)]) -> MuleElement {
+        let mut scope = elem("", name, attrs);
+        scope.children = vec![elem("", "set-payload", &[("value", "fallback")])];
+        scope
+    }
+
+    /// Map an error handler without rules: the handlers and the decisions
+    /// recorded for the on-error scopes themselves (not for their processors).
+    fn map_scopes(scopes: Vec<MuleElement>) -> (Vec<ExceptionHandler>, Vec<MappingDecision>) {
+        let mut decisions = Vec::new();
+        let handlers =
+            map_error_handler(&error_handler(scopes), &[], &mut decisions, &mut Vec::new());
+        decisions.retain(|d| d.mule_element.starts_with("on-error-"));
+        (handlers, decisions)
+    }
+
+    /// The review notes the mapper left in the handler for the generated code.
+    fn review_notes(handler: &ExceptionHandler) -> String {
+        handler
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                RouteStep::RawDsl(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn on_error_continue_is_handled_and_on_error_propagate_is_not() {
+        let (handlers, decisions) = map_scopes(vec![
+            on_error("on-error-continue", &[("type", "HTTP:TIMEOUT")]),
+            on_error("on-error-propagate", &[]),
+        ]);
+
+        assert_eq!(handlers.len(), 2);
+        assert!(handlers[0].handled, "on-error-continue -> handled(true)");
+        assert!(!handlers[1].handled, "on-error-propagate -> handled(false)");
+        assert_eq!(decisions.len(), 2);
+    }
+
+    #[test]
+    fn handler_for_any_error_catches_every_exception_and_is_done() {
+        // No type, ANY, or a list that contains ANY: every Mule error.
+        for attrs in [
+            &[][..],
+            &[("type", "ANY")],
+            &[("type", "MULE:ANY")],
+            &[("type", " ")],
+            &[("type", "HTTP:TIMEOUT, ANY")],
+        ] {
+            let (handlers, decisions) = map_scopes(vec![on_error("on-error-propagate", attrs)]);
+
+            assert_eq!(
+                handlers[0].exception_classes,
+                ["java.lang.Exception"],
+                "{attrs:?}"
+            );
+            assert_eq!(decisions[0].status, DecisionStatus::Done, "{attrs:?}");
+            assert_eq!(review_notes(&handlers[0]), "", "{attrs:?}");
+            assert!(
+                matches!(handlers[0].steps[..], [RouteStep::SetBody { .. }]),
+                "{attrs:?}: {:?}",
+                handlers[0].steps
+            );
+        }
+    }
+
+    #[test]
+    fn http_timeout_is_a_socket_timeout_not_a_refused_connection() {
+        // A response timeout of Camel's HTTP producer is a
+        // java.net.SocketTimeoutException; it is not a ConnectException.
+        let (handlers, _) = map_scopes(vec![on_error(
+            "on-error-continue",
+            &[("type", "HTTP:TIMEOUT")],
+        )]);
+
+        assert_eq!(
+            handlers[0].exception_classes,
+            ["java.net.SocketTimeoutException"]
+        );
+    }
+
+    #[test]
+    fn error_type_list_becomes_one_exception_class_per_type() {
+        let (handlers, decisions) = map_scopes(vec![on_error(
+            "on-error-continue",
+            &[("type", "HTTP:CONNECTIVITY, HTTP:TIMEOUT ,HTTP:UNAUTHORIZED")],
+        )]);
+
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(
+            handlers[0].exception_classes,
+            [
+                "java.net.ConnectException",
+                "java.net.SocketTimeoutException",
+                "org.apache.camel.http.base.HttpOperationFailedException",
+            ]
+        );
+        assert!(handlers[0].handled);
+        assert_eq!(decisions.len(), 1);
+    }
+
+    #[test]
+    fn error_types_with_the_same_exception_class_name_it_once() {
+        let (handlers, _) = map_scopes(vec![on_error(
+            "on-error-propagate",
+            &[("type", "DB:CONNECTIVITY, DB:BAD_SQL_SYNTAX")],
+        )]);
+
+        assert_eq!(handlers[0].exception_classes, ["java.sql.SQLException"]);
+    }
+
+    #[test]
+    fn connector_error_type_is_an_approximation_and_flagged_for_review() {
+        // A Java exception class is never exactly a Mule error type: it is
+        // not scoped to one connector and covers other failures as well, or
+        // fewer. The clause is emitted, and flagged in report and code.
+        for (mule_type, class) in [
+            ("HTTP:CONNECTIVITY", "java.net.ConnectException"),
+            ("HTTP:TIMEOUT", "java.net.SocketTimeoutException"),
+            (
+                "HTTP:UNAUTHORIZED",
+                "org.apache.camel.http.base.HttpOperationFailedException",
+            ),
+            (
+                "HTTP:FORBIDDEN",
+                "org.apache.camel.http.base.HttpOperationFailedException",
+            ),
+            ("DB:CONNECTIVITY", "java.sql.SQLException"),
+            ("DB:BAD_SQL_SYNTAX", "java.sql.SQLException"),
+            (
+                "VALIDATION:INVALID_PAYLOAD",
+                "org.apache.camel.ValidationException",
+            ),
+        ] {
+            let (handlers, decisions) =
+                map_scopes(vec![on_error("on-error-continue", &[("type", mule_type)])]);
+
+            assert_eq!(handlers[0].exception_classes, [class], "{mule_type}");
+            assert_eq!(
+                decisions[0].status,
+                DecisionStatus::ManualReview,
+                "{mule_type}"
+            );
+            assert!(
+                decisions[0].rationale.contains(mule_type)
+                    && decisions[0].rationale.contains(class),
+                "{mule_type}: {}",
+                decisions[0].rationale
+            );
+            let notes = review_notes(&handlers[0]);
+            assert!(
+                notes.contains("TODO") && notes.contains(mule_type),
+                "{mule_type}: {notes:?}"
+            );
+            // The note comes first, the handler's processors follow.
+            assert!(
+                matches!(
+                    handlers[0].steps[..],
+                    [RouteStep::RawDsl(_), RouteStep::SetBody { .. }]
+                ),
+                "{mule_type}: {:?}",
+                handlers[0].steps
+            );
+        }
+    }
+
+    #[test]
+    fn http_status_error_type_brings_the_dependency_of_its_exception_class() {
+        // HttpOperationFailedException is not on the classpath of a project
+        // without camel-quarkus-http; the generated route would not compile.
+        let mut deps = Vec::new();
+        map_error_handler(
+            &error_handler(vec![on_error(
+                "on-error-continue",
+                &[("type", "HTTP:FORBIDDEN")],
+            )]),
+            &[],
+            &mut Vec::new(),
+            &mut deps,
+        );
+
+        assert!(
+            deps.iter().any(|d| d.artifact_id == "camel-quarkus-http"),
+            "{deps:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_error_type_is_never_widened_to_every_exception() {
+        // Falling back to java.lang.Exception would turn a handler for one
+        // error type into one that swallows every failure of the route.
+        let (handlers, decisions) = map_scopes(vec![on_error(
+            "on-error-continue",
+            &[("type", "FILE:FILE_NOT_FOUND")],
+        )]);
+
+        assert_eq!(handlers.len(), 1);
+        assert!(
+            handlers[0].exception_classes.is_empty(),
+            "{:?}",
+            handlers[0].exception_classes
+        );
+        assert!(handlers[0].handled);
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+        assert!(
+            decisions[0].rationale.contains("FILE:FILE_NOT_FOUND"),
+            "{}",
+            decisions[0].rationale
+        );
+        let notes = review_notes(&handlers[0]);
+        assert!(
+            notes.contains("TODO") && notes.contains("FILE:FILE_NOT_FOUND"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_error_type_next_to_known_ones_keeps_the_known_classes() {
+        let (handlers, decisions) = map_scopes(vec![on_error(
+            "on-error-propagate",
+            &[("type", "HTTP:TIMEOUT, APP:ORDER_REJECTED")],
+        )]);
+
+        assert_eq!(
+            handlers[0].exception_classes,
+            ["java.net.SocketTimeoutException"]
+        );
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+        assert!(
+            decisions[0].rationale.contains("APP:ORDER_REJECTED"),
+            "{}",
+            decisions[0].rationale
+        );
+        assert!(review_notes(&handlers[0]).contains("APP:ORDER_REJECTED"));
+    }
+
+    #[test]
+    fn when_condition_disables_the_handler_instead_of_being_dropped() {
+        // Without its condition the clause would fire for every error.
+        let condition = "#[error.description contains 'quota']";
+        let (handlers, decisions) = map_scopes(vec![
+            on_error("on-error-continue", &[("when", condition)]),
+            on_error("on-error-propagate", &[]),
+        ]);
+
+        assert!(
+            handlers[0].exception_classes.is_empty(),
+            "{:?}",
+            handlers[0].exception_classes
+        );
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+        assert!(
+            decisions[0].rationale.contains("when"),
+            "{}",
+            decisions[0].rationale
+        );
+        assert!(review_notes(&handlers[0]).contains(condition));
+        // A conditional handler does not take anything away from the
+        // handlers after it.
+        assert_eq!(handlers[1].exception_classes, ["java.lang.Exception"]);
+        assert_eq!(decisions[1].status, DecisionStatus::Done);
+    }
+
+    #[test]
+    fn first_matching_handler_wins_like_in_mule() {
+        // Mule takes the first on-error scope that matches, in document
+        // order. Camel keeps a single clause per exception class, so the
+        // class goes to the first scope only.
+        let (handlers, decisions) = map_scopes(vec![
+            on_error("on-error-continue", &[("type", "HTTP:UNAUTHORIZED")]),
+            on_error(
+                "on-error-propagate",
+                &[("type", "HTTP:FORBIDDEN, HTTP:TIMEOUT")],
+            ),
+            on_error("on-error-propagate", &[("type", "HTTP:FORBIDDEN")]),
+        ]);
+
+        assert_eq!(
+            handlers[0].exception_classes,
+            ["org.apache.camel.http.base.HttpOperationFailedException"]
+        );
+        assert_eq!(
+            handlers[1].exception_classes,
+            ["java.net.SocketTimeoutException"]
+        );
+        assert!(
+            handlers[2].exception_classes.is_empty(),
+            "{:?}",
+            handlers[2].exception_classes
+        );
+        for (i, decision) in decisions.iter().enumerate().skip(1) {
+            assert_eq!(decision.status, DecisionStatus::ManualReview, "scope {i}");
+            assert!(
+                decision
+                    .rationale
+                    .contains("org.apache.camel.http.base.HttpOperationFailedException"),
+                "scope {i}: {}",
+                decision.rationale
+            );
+        }
+    }
+
+    #[test]
+    fn handler_after_a_catch_all_is_unreachable_and_not_emitted_as_active() {
+        // In Mule the ANY scope takes every error; in Camel the more
+        // specific clause would win. Keep Mule's outcome.
+        let (handlers, decisions) = map_scopes(vec![
+            on_error("on-error-propagate", &[("type", "ANY")]),
+            on_error("on-error-continue", &[("type", "HTTP:TIMEOUT")]),
+        ]);
+
+        assert_eq!(handlers[0].exception_classes, ["java.lang.Exception"]);
+        assert_eq!(decisions[0].status, DecisionStatus::Done);
+        assert!(
+            handlers[1].exception_classes.is_empty(),
+            "{:?}",
+            handlers[1].exception_classes
+        );
+        assert_eq!(decisions[1].status, DecisionStatus::ManualReview);
+    }
+
+    #[test]
+    fn referenced_error_handler_is_flagged_not_dropped() {
+        // <error-handler ref="..."/> points at a global handler that is not
+        // migrated; the flow must not look as if it had no error handling.
+        let reference = elem("", "error-handler", &[("ref", "globalErrorHandler")]);
+        let mut decisions = Vec::new();
+        let handlers = map_error_handler(&reference, &[], &mut decisions, &mut Vec::new());
+
+        assert!(handlers.is_empty());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].mule_element, "error-handler");
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+        assert!(
+            decisions[0].rationale.contains("globalErrorHandler"),
+            "{}",
+            decisions[0].rationale
         );
     }
 

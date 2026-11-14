@@ -764,3 +764,67 @@ async fn emitted_build_files_use_the_java_release_of_the_pom() {
         "local-setup.md should ask for JDK {release}+:\n{local_setup}"
     );
 }
+
+// ── Error handlers: examples/hello-world ──────────────────────────────────
+
+/// `safeFlow` of `examples/hello-world` has
+/// `<on-error-continue type="HTTP:CONNECTIVITY">`. The emitted clause used to
+/// be `onException(java.net.ConnectException)`, which is not Java. It has to
+/// name the class as a literal, state `handled(true)` (on-error-continue),
+/// and stay flagged: `ConnectException` is only the nearest class to
+/// `HTTP:CONNECTIVITY`.
+///
+/// The whole `SafeFlowRoute.java` is not a golden file yet, because its
+/// `http:` endpoint URI is still wrong; this pins the error handler in it.
+#[tokio::test]
+async fn hello_world_example_error_handler_is_a_handled_on_exception_clause() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rules = mapper::load_rules(&manifest_dir.join("../mappings")).unwrap();
+    let project = parser::parse_project(&manifest_dir.join("../examples/hello-world")).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+
+    let java = std::fs::read_to_string(
+        out.path()
+            .join("src/main/java/generated/routes/SafeFlowRoute.java"),
+    )
+    .unwrap();
+    let code: Vec<&str> = java
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .collect();
+    let clause_start = code
+        .iter()
+        .position(|l| l.starts_with("onException("))
+        .unwrap_or_else(|| panic!("no onException clause in:\n{java}"));
+    assert_eq!(
+        code[clause_start..clause_start + 6],
+        [
+            "onException(java.net.ConnectException.class)",
+            ".handled(true)",
+            r#".setBody(constant("Service temporarily unavailable"))"#,
+            r#".log(LoggingLevel.WARN, "Upstream service unreachable")"#,
+            ".end();",
+            r#"from("platform-http:/safe?httpMethodRestrict=GET")"#,
+        ],
+        "{java}"
+    );
+    assert!(
+        java.contains(
+            "// TODO: review this handler (on-error-continue type=\"HTTP:CONNECTIVITY\")"
+        ),
+        "{java}"
+    );
+
+    let scope: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element == "on-error-continue")
+        .collect();
+    assert_eq!(scope.len(), 1);
+    assert_eq!(scope[0].status, report::DecisionStatus::ManualReview);
+}

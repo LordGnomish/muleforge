@@ -74,11 +74,26 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 
 | Mule Element | Camel Equivalent | Status | Notes |
 |---|---|---|---|
-| `on-error-propagate` | `onException(handled=false)` | ✅ Auto | |
-| `on-error-continue` | `onException(handled=true)` | ✅ Auto | |
+| `on-error-propagate` | `onException(X.class).handled(false)` | ✅ Auto | Handler steps run, the caller still gets the error |
+| `on-error-continue` | `onException(X.class).handled(true)` | ✅ Auto | Handler result is the reply (not `continued(true)`, which would resume the route) |
 | `try` scope | `doTry/doCatch/doFinally` | ✅ Auto | |
 | `raise-error` | `throwException()` | ✅ Auto | Error type in message |
 | `validation:is-true` | `validate()` | ✅ Auto | |
+
+Error types of an on-error scope (`type="A, B"`):
+
+- `ANY`, or no `type`: `java.lang.Exception.class` — exact, reported as `DONE`.
+- Any other known type (`HTTP:CONNECTIVITY`, `HTTP:TIMEOUT`, `HTTP:UNAUTHORIZED`,
+  `HTTP:FORBIDDEN`, `DB:CONNECTIVITY`, `DB:BAD_SQL_SYNTAX`,
+  `VALIDATION:INVALID_PAYLOAD`): the nearest Java exception class. A class is
+  never exactly a Mule error type, so the clause is emitted and flagged
+  `MANUAL_REVIEW`, with a `TODO` in the generated code that says how it differs.
+- A type without known class is never widened to `Exception`. A scope left
+  without class, a scope with a `when` condition (not converted) and a scope
+  shadowed by an earlier one (Mule takes the first match) are emitted commented
+  out and flagged `MANUAL_REVIEW`.
+- `<error-handler ref="...">` (global error handler) is not migrated and flagged
+  `MANUAL_REVIEW`.
 
 ## Infrastructure Output
 
