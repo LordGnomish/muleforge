@@ -159,6 +159,17 @@ pub async fn map_project(
         }
     }
 
+    // Sub-flows are `from("direct:...")` routes and flow-refs call them with
+    // `.to("direct:...")`. Without the direct component the application does
+    // not start ("No endpoint could be found for: direct://...").
+    if camel.routes.iter().any(route_uses_direct) {
+        all_deps.push(MavenDependency {
+            group_id: "org.apache.camel.quarkus".into(),
+            artifact_id: "camel-quarkus-direct".into(),
+            version: None,
+        });
+    }
+
     // Deduplicate deps
     let mut seen = std::collections::HashSet::new();
     all_deps.retain(|d| seen.insert(format!("{}:{}", d.group_id, d.artifact_id)));
@@ -170,6 +181,32 @@ pub async fn map_project(
     }
 
     Ok((camel, decisions))
+}
+
+/// Whether the route consumes from or sends to a `direct:` endpoint.
+fn route_uses_direct(route: &CamelRoute) -> bool {
+    let from_direct = match &route.source {
+        RouteEndpoint::Direct(_) => true,
+        RouteEndpoint::Uri(uri) => uri.starts_with("direct:"),
+    };
+    from_direct
+        || steps_use_direct(&route.steps)
+        || route
+            .on_exceptions
+            .iter()
+            .any(|handler| steps_use_direct(&handler.steps))
+}
+
+fn steps_use_direct(steps: &[RouteStep]) -> bool {
+    steps.iter().any(|step| match step {
+        RouteStep::ToUri(uri) => uri.starts_with("direct:"),
+        RouteStep::Choice { whens, otherwise } => {
+            whens.iter().any(|(_, steps)| steps_use_direct(steps))
+                || otherwise.as_deref().is_some_and(steps_use_direct)
+        }
+        RouteStep::Split { steps, .. } => steps_use_direct(steps),
+        _ => false,
+    })
 }
 
 fn map_flow(
@@ -1060,6 +1097,7 @@ fn record_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::mule_ast::MuleFlow;
 
     fn elem(ns: &str, name: &str, attrs: &[(&str, &str)]) -> MuleElement {
         MuleElement {
@@ -1194,6 +1232,91 @@ mappings:
         assert_eq!(
             mule_placeholders_to_camel("${unterminated"),
             "${unterminated"
+        );
+    }
+
+    // ── direct: endpoints ───────────────────────────────────────────────
+
+    fn flow(name: &str, is_sub_flow: bool, processors: Vec<MuleElement>) -> MuleFlow {
+        MuleFlow {
+            name: name.into(),
+            is_sub_flow,
+            source_file: "flows.xml".into(),
+            processors,
+            error_handlers: vec![],
+        }
+    }
+
+    async fn dependencies_of(flows: Vec<MuleFlow>) -> Vec<String> {
+        let project = MuleProject {
+            name: "orders".into(),
+            flows,
+            configs: vec![],
+            properties: Default::default(),
+        };
+        let (camel, _) = map_project(&project, &[], None).await.unwrap();
+        camel
+            .maven_dependencies
+            .into_iter()
+            .map(|d| d.artifact_id)
+            .collect()
+    }
+
+    fn http_listener() -> MuleElement {
+        elem(
+            "http",
+            "listener",
+            &[("path", "/orders"), ("allowedMethods", "GET")],
+        )
+    }
+
+    #[tokio::test]
+    async fn sub_flow_route_brings_the_direct_component() {
+        // A sub-flow becomes from("direct:<name>"). Without the extension
+        // the application fails to start: "No endpoint could be found for:
+        // direct://<name>".
+        let deps = dependencies_of(vec![flow(
+            "enrichPayload",
+            true,
+            vec![elem("", "logger", &[("message", "enriched")])],
+        )])
+        .await;
+
+        assert!(deps.iter().any(|d| d == "camel-quarkus-direct"), "{deps:?}");
+    }
+
+    #[tokio::test]
+    async fn flow_ref_brings_the_direct_component() {
+        // Also when it is nested in a scope or in an error handler.
+        let mut choice = elem("", "choice", &[]);
+        let mut when = elem("", "when", &[("expression", "#[true]")]);
+        when.children = vec![elem("", "flow-ref", &[("name", "audit")])];
+        choice.children = vec![when];
+        let nested = flow("ordersFlow", false, vec![http_listener(), choice]);
+
+        let mut handled = flow("pricesFlow", false, vec![http_listener()]);
+        let mut scope = elem("", "on-error-propagate", &[]);
+        scope.children = vec![elem("", "flow-ref", &[("name", "audit")])];
+        handled.error_handlers = vec![error_handler(vec![scope])];
+
+        for flows in [vec![nested], vec![handled]] {
+            let deps = dependencies_of(flows).await;
+            assert!(deps.iter().any(|d| d == "camel-quarkus-direct"), "{deps:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn project_without_direct_endpoint_does_not_get_the_direct_component() {
+        let deps = dependencies_of(vec![flow(
+            "ordersFlow",
+            false,
+            vec![http_listener(), elem("", "set-payload", &[("value", "ok")])],
+        )])
+        .await;
+
+        assert!(
+            !deps.iter().any(|d| d == "camel-quarkus-direct"),
+            "{deps:?}"
         );
     }
 
