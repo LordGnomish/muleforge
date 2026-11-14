@@ -1,8 +1,16 @@
-//! Golden-file tests: every `examples/<name>/` that ships both an `input/`
-//! Mule project and an `expected-output/` Camel project is migrated end to
-//! end (parse -> normalize -> map -> emit), and **every** file checked in
-//! under `expected-output/` is compared with the emitted file at the same
-//! relative path: the Java routes and the project files (`pom.xml`, ...).
+//! Golden-file tests: every `examples/<name>/` that ships both a Mule
+//! project and an `expected-output/` Camel project is migrated end to end
+//! (parse -> normalize -> map -> emit), and **every** file checked in under
+//! `expected-output/` is compared with the emitted file at the same relative
+//! path: the Java routes and the project files (`pom.xml`, ...).
+//!
+//! An example ships its Mule project either as flat `input/*.xml` files or
+//! as a real Mule project layout (`src/main/mule/*.xml` in the example
+//! directory itself, like `examples/hello-world`).
+//!
+//! `expected-output/` only holds files whose every line has been checked to
+//! be what the migration should produce. A file the emitter still gets wrong
+//! is left out (and so not compared) rather than pinned with its defects.
 //!
 //! Normalisation — the only differences the comparison ignores:
 //!
@@ -25,13 +33,23 @@ fn examples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples")
 }
 
-/// Example directories that have both `input/` and `expected-output/`.
+/// Whether the example directory is itself a Mule project
+/// (`src/main/mule/*.xml`) instead of holding flat `input/*.xml` files.
+fn is_mule_project_layout(case: &Path) -> bool {
+    case.join("src/main/mule").is_dir()
+}
+
+/// Example directories that have a Mule project (`input/` or a Mule project
+/// layout) and `expected-output/`.
 fn golden_cases() -> Vec<PathBuf> {
     let mut cases: Vec<PathBuf> = std::fs::read_dir(examples_dir())
         .expect("examples/ exists")
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.join("input").is_dir() && p.join("expected-output").is_dir())
+        .filter(|p| {
+            (p.join("input").is_dir() || is_mule_project_layout(p))
+                && p.join("expected-output").is_dir()
+        })
         .collect();
     cases.sort();
     cases
@@ -42,13 +60,17 @@ fn case_name(case: &Path) -> String {
 }
 
 /// The parser expects a Mule project layout (`src/main/mule/*.xml`), so copy
-/// the example's flat `input/*.xml` files into one.
+/// the example's flat `input/*.xml` files into one. An example that already
+/// is a Mule project is parsed where it is.
 ///
 /// The Mule project directory is named after the example, because the parser
 /// infers the project name from it and that name ends up in emitted files
-/// (the `artifactId` of `pom.xml`). Returns the temp dir guard and the
-/// project directory inside it.
-fn stage_input(case: &Path) -> (TempDir, PathBuf) {
+/// (the `artifactId` of `pom.xml`). Returns the temp dir guard, if a staging
+/// directory was needed, and the project directory.
+fn stage_input(case: &Path) -> (Option<TempDir>, PathBuf) {
+    if is_mule_project_layout(case) {
+        return (None, case.to_path_buf());
+    }
     let dir = TempDir::new().unwrap();
     let project_dir = dir.path().join(case_name(case));
     let mule_dir = project_dir.join("src/main/mule");
@@ -59,7 +81,7 @@ fn stage_input(case: &Path) -> (TempDir, PathBuf) {
             std::fs::copy(&path, mule_dir.join(path.file_name().unwrap())).unwrap();
         }
     }
-    (dir, project_dir)
+    (Some(dir), project_dir)
 }
 
 /// Migrate one example into a fresh temp dir and return it.
@@ -154,6 +176,30 @@ fn golden_cases_exist() {
     assert!(
         !golden_cases().is_empty(),
         "expected at least one examples/<name>/{{input,expected-output}} pair"
+    );
+}
+
+/// Both ways an example can ship its Mule project stay covered; a case that
+/// is no longer picked up would otherwise just stop being compared.
+#[test]
+fn golden_cases_cover_flat_inputs_and_mule_project_layouts() {
+    let cases = golden_cases();
+    let names = |mule_layout: bool| -> Vec<String> {
+        cases
+            .iter()
+            .filter(|c| is_mule_project_layout(c) == mule_layout)
+            .map(|c| case_name(c))
+            .collect()
+    };
+
+    assert!(
+        !names(false).is_empty(),
+        "no example with flat input/*.xml files is compared"
+    );
+    assert!(
+        names(true).contains(&"hello-world".to_string()),
+        "examples/hello-world (a Mule project layout) is not compared; got {:?}",
+        names(true)
     );
 }
 
