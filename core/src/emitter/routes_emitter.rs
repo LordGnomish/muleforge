@@ -66,15 +66,8 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
 
     // Exception handlers
     for eh in &route.on_exceptions {
-        let classes = eh.exception_classes.join(", ");
-        java.push_str(&format!("        onException({})\n", classes));
-        if eh.handled {
-            java.push_str("            .handled(true)\n");
-        }
-        for step in &eh.steps {
-            emit_step_dsl(&mut java, step, 3);
-        }
-        java.push_str("            .end();\n\n");
+        java.push_str(&on_exception_clause(eh));
+        java.push('\n');
     }
 
     // Route definition
@@ -84,6 +77,9 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
     };
     java.push_str(&format!("        from({})\n", from_uri));
     java.push_str(&format!("            .routeId(\"{}\")\n", route.id));
+    if leaves_failures_to_caller(route) {
+        java.push_str("            .errorHandler(noErrorHandler())\n");
+    }
 
     for step in &route.steps {
         emit_step_dsl(&mut java, step, 3);
@@ -93,6 +89,87 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
     java.push_str("    }\n");
     java.push_str("}\n");
     java
+}
+
+/// Whether the route is written with `.errorHandler(noErrorHandler())`.
+///
+/// It is for the route of a Mule sub-flow: `RouteEndpoint::Direct` without
+/// exception handlers. A sub-flow has no error handling of its own; what
+/// fails in it is handled by the error handler of the flow that references
+/// it. A Camel route, however, gets the default error handler, and a failure
+/// that one has dealt with comes back to the calling route as final: the
+/// caller's `onException` clauses do not run for it. Without error handler
+/// the failure comes back unhandled and the caller's clauses take it.
+/// (`noErrorHandler()` is a method of `RouteBuilder`; no import is needed.)
+///
+/// Every other route keeps its error handler: a route with exception
+/// handlers needs it (`onException` clauses do nothing without one), and a
+/// route with a source of its own has no caller to leave a failure to.
+fn leaves_failures_to_caller(route: &CamelRoute) -> bool {
+    matches!(route.source, RouteEndpoint::Direct(_)) && route.on_exceptions.is_empty()
+}
+
+/// One `onException(...)` clause, the Camel form of a Mule on-error scope.
+///
+/// The clause is declared on the RouteBuilder ahead of `from(...)`. Camel
+/// scopes such a clause to the routes of that RouteBuilder instance, and an
+/// emitted RouteBuilder holds exactly one route, so no other flow's route
+/// uses it. It runs for what fails in that route, and for what fails in a
+/// route called from it through `direct:` only if that route has no error
+/// handler: the route of a sub-flow (see [`leaves_failures_to_caller`]).
+/// That matches the flow's `<error-handler>` in Mule for the flow and the
+/// sub-flows it references. It does not for a `<flow>` it references, whose
+/// route keeps its own error handler; the mapper flags such a flow-ref.
+///
+/// * `onException(Class<? extends Throwable>...)` takes class literals:
+///   every exception class is written fully qualified with `.class`.
+/// * `handled(true)` is Mule's on-error-continue: the failed route stops,
+///   the clause's steps run and their result is the reply, as if the route
+///   had succeeded. (Not `continued(true)`: that resumes the route after the
+///   failed step, which on-error-continue does not do.)
+/// * `handled(false)` is Mule's on-error-propagate: the steps run and the
+///   caller still gets the failure. It is Camel's default and written out
+///   so the generated route says which of the two it is.
+///
+/// A handler without exception class (the mapper found none for the Mule
+/// error type) is emitted commented out: `onException()` compiles but Camel
+/// rejects it at startup, and `Exception.class` would handle more errors
+/// than the Mule scope did.
+fn on_exception_clause(eh: &ExceptionHandler) -> String {
+    let classes: Vec<String> = eh
+        .exception_classes
+        .iter()
+        .map(|class| java_class_literal(class))
+        .collect();
+
+    let mut clause = String::new();
+    if classes.is_empty() {
+        clause.push_str("        onException(/* TODO: exception class */)\n");
+    } else {
+        clause.push_str(&format!("        onException({})\n", classes.join(", ")));
+    }
+    clause.push_str(&format!("            .handled({})\n", eh.handled));
+    for step in &eh.steps {
+        emit_step_dsl(&mut clause, step, 3);
+    }
+    clause.push_str("            .end();\n");
+
+    if classes.is_empty() {
+        clause = clause
+            .lines()
+            .map(|line| match line.strip_prefix("        ") {
+                Some(code) => format!("        // {code}\n"),
+                None => format!("        // {line}\n"),
+            })
+            .collect();
+    }
+    clause
+}
+
+/// `java.net.ConnectException` -> `java.net.ConnectException.class`.
+fn java_class_literal(class_name: &str) -> String {
+    let name = class_name.trim();
+    format!("{}.class", name.strip_suffix(".class").unwrap_or(name))
 }
 
 fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
@@ -195,11 +272,48 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
             ));
         }
         RouteStep::RawDsl(dsl) => {
-            for line in dsl.lines() {
+            for line in comment_lines(dsl) {
                 java.push_str(&format!("{}// {}\n", pad, line));
             }
         }
     }
+}
+
+/// `text` as the lines of a `//` comment, one comment line per text line.
+///
+/// The text comes from the Mule XML (attribute values quoted in review
+/// notes, for example) and must not be able to leave the comment:
+///
+/// * javac ends a line, and a `//` comment with it, at LF, CR LF and at a
+///   lone CR (JLS 3.4). Each of them starts a new comment line.
+/// * javac translates Unicode escapes before it recognises comments (JLS
+///   3.3): `C:\users` in a comment is an "illegal unicode escape", and
+///   `\u000a` would end the comment. A `u` starts an escape when an odd
+///   number of backslashes stands before it; such a run gets one more
+///   backslash, which makes it a row of plain backslashes for javac.
+///
+/// Any other text is written as it is.
+fn comment_lines(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(|line| {
+            let mut out = String::with_capacity(line.len());
+            let mut backslashes = 0;
+            for c in line.chars() {
+                if c == '\\' {
+                    backslashes += 1;
+                } else {
+                    if c == 'u' && backslashes % 2 == 1 {
+                        out.push('\\');
+                    }
+                    backslashes = 0;
+                }
+                out.push(c);
+            }
+            out
+        })
+        .collect()
 }
 
 fn expr_to_java(expr: &Expression) -> String {
@@ -543,6 +657,411 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    // ── onException ─────────────────────────────────────────────────────
+
+    fn handler(classes: &[&str], handled: bool, steps: Vec<RouteStep>) -> ExceptionHandler {
+        ExceptionHandler {
+            exception_classes: classes.iter().map(|c| c.to_string()).collect(),
+            handled,
+            steps,
+        }
+    }
+
+    /// Java source of the RouteBuilder for a flow `safeFlow` that has the
+    /// given exception handlers and no steps.
+    fn route_java(on_exceptions: Vec<ExceptionHandler>) -> String {
+        generate_route_builder(
+            "SafeFlowRoute",
+            &CamelRoute {
+                id: "safeFlow".into(),
+                source: RouteEndpoint::Uri("platform-http:/safe?httpMethodRestrict=GET".into()),
+                steps: vec![],
+                on_exceptions,
+            },
+        )
+    }
+
+    /// The lines of `java` that are code: trimmed, without blank lines and
+    /// `//` comment lines.
+    fn code_lines(java: &str) -> Vec<&str> {
+        java.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect()
+    }
+
+    #[test]
+    fn on_exception_names_a_single_exception_type_as_a_class_literal() {
+        // examples/hello-world, safeFlow: on-error-continue type="HTTP:CONNECTIVITY".
+        let java = route_java(vec![handler(
+            &["java.net.ConnectException"],
+            true,
+            vec![
+                RouteStep::SetBody {
+                    expression: Expression::Constant("Service temporarily unavailable".into()),
+                },
+                RouteStep::Log {
+                    level: LogLevel::Warn,
+                    message: "Upstream service unreachable".into(),
+                },
+            ],
+        )]);
+
+        // `onException(Class<? extends Throwable>...)` takes class literals:
+        // a bare type name is not a Java expression and does not compile.
+        let clause = r#"
+        onException(java.net.ConnectException.class)
+            .handled(true)
+            .setBody(constant("Service temporarily unavailable"))
+            .log(LoggingLevel.WARN, "Upstream service unreachable")
+            .end();
+
+        from("platform-http:/safe?httpMethodRestrict=GET")
+            .routeId("safeFlow")
+"#;
+        assert!(
+            java.contains(clause),
+            "expected clause:{clause}\nin:\n{java}"
+        );
+    }
+
+    #[test]
+    fn on_exception_lists_several_exception_types_as_class_literals() {
+        let java = route_java(vec![handler(
+            &[
+                "java.net.ConnectException",
+                "java.net.SocketTimeoutException",
+            ],
+            true,
+            vec![],
+        )]);
+
+        assert!(
+            code_lines(&java).contains(
+                &"onException(java.net.ConnectException.class, java.net.SocketTimeoutException.class)"
+            ),
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn on_exception_keeps_fully_qualified_class_names() {
+        // Nothing is imported for exception classes, so the package has to
+        // stay on the name; a name that already is a class literal is not
+        // suffixed a second time.
+        let java = route_java(vec![
+            handler(
+                &["org.apache.camel.http.base.HttpOperationFailedException"],
+                false,
+                vec![],
+            ),
+            handler(&["java.sql.SQLException.class"], false, vec![]),
+        ]);
+
+        let code = code_lines(&java);
+        assert!(
+            code.contains(
+                &"onException(org.apache.camel.http.base.HttpOperationFailedException.class)"
+            ),
+            "{java}"
+        );
+        assert!(
+            code.contains(&"onException(java.sql.SQLException.class)"),
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn on_exception_always_states_whether_the_exception_is_handled() {
+        // on-error-continue: the handler's result is the route's reply.
+        let continued = route_java(vec![handler(&["java.lang.Exception"], true, vec![])]);
+        assert!(
+            continued.contains(
+                "        onException(java.lang.Exception.class)\n            .handled(true)\n            .end();\n"
+            ),
+            "{continued}"
+        );
+        // on-error-propagate: the handler runs and the caller still gets
+        // the failure. That is Camel's default, spelled out.
+        let propagated = route_java(vec![handler(&["java.lang.Exception"], false, vec![])]);
+        assert!(
+            propagated.contains(
+                "        onException(java.lang.Exception.class)\n            .handled(false)\n            .end();\n"
+            ),
+            "{propagated}"
+        );
+        // Mule's on-error-continue ends the flow with the handler's result;
+        // Camel's continued(true) would resume the route after the failed step.
+        assert!(!continued.contains("continued("), "{continued}");
+        assert!(!propagated.contains("continued("), "{propagated}");
+    }
+
+    #[test]
+    fn on_exception_without_an_exception_class_is_emitted_commented_out() {
+        // The mapper found no exception class for the handler's Mule error
+        // type. `onException()` would compile and then fail at startup, and
+        // `Exception.class` would catch far more than the Mule handler did.
+        let java = route_java(vec![handler(
+            &[],
+            true,
+            vec![
+                RouteStep::RawDsl("TODO: no exception class for FILE:NOT_FOUND".into()),
+                RouteStep::SetBody {
+                    expression: Expression::Constant("fallback".into()),
+                },
+            ],
+        )]);
+
+        let code = code_lines(&java);
+        assert!(
+            !code
+                .iter()
+                .any(|l| l.contains("onException") || l.contains("fallback")),
+            "a handler without exception class must not be active code:\n{java}"
+        );
+        // Still there for whoever completes it by hand.
+        let commented = r#"
+        // onException(/* TODO: exception class */)
+        //     .handled(true)
+        //     // TODO: no exception class for FILE:NOT_FOUND
+        //     .setBody(constant("fallback"))
+        //     .end();
+
+        from("platform-http:/safe?httpMethodRestrict=GET")
+"#;
+        assert!(
+            java.contains(commented),
+            "expected:{commented}\nin:\n{java}"
+        );
+        // The route itself is unaffected.
+        assert!(code.contains(&r#".routeId("safeFlow")"#), "{java}");
+    }
+
+    // ── Error handling of sub-flow routes ───────────────────────────────
+
+    /// Java source of the RouteBuilder for a route `shared` with one step.
+    fn shared_route_java(source: RouteEndpoint, on_exceptions: Vec<ExceptionHandler>) -> String {
+        generate_route_builder(
+            "SharedRoute",
+            &CamelRoute {
+                id: "shared".into(),
+                source,
+                steps: vec![RouteStep::SetProperty {
+                    name: "enriched".into(),
+                    expression: Expression::Constant("true".into()),
+                }],
+                on_exceptions,
+            },
+        )
+    }
+
+    #[test]
+    fn sub_flow_route_leaves_its_failures_to_the_calling_route() {
+        // A Mule sub-flow has no error handling of its own: what fails in it
+        // is handled by the error handler of the flow that called it. A
+        // Camel route gets the default error handler, and after that one
+        // the onException clauses of the calling route no longer run. So
+        // the route of a sub-flow is emitted without error handler.
+        let java = shared_route_java(RouteEndpoint::Direct("shared".into()), vec![]);
+
+        let route = r#"
+    public void configure() throws Exception {
+        from("direct:shared")
+            .routeId("shared")
+            .errorHandler(noErrorHandler())
+            .setProperty("enriched", constant("true"))
+            ;
+    }
+"#;
+        assert!(java.contains(route), "expected route:{route}\nin:\n{java}");
+    }
+
+    #[test]
+    fn route_of_a_flow_keeps_its_error_handler() {
+        // A flow handles its own errors: with its on-error scopes, and with
+        // the default error handler for the rest. That includes a flow the
+        // mapper could only give a placeholder direct: source.
+        for source in [
+            "platform-http:/safe?httpMethodRestrict=GET",
+            "kafka:orders?brokers=broker-1:9092",
+            "direct:kafka-message-listener",
+        ] {
+            for on_exceptions in [
+                vec![],
+                vec![handler(&["java.lang.Exception"], true, vec![])],
+            ] {
+                let java = shared_route_java(RouteEndpoint::Uri(source.into()), on_exceptions);
+
+                assert!(!java.contains("errorHandler"), "{source}:\n{java}");
+                assert!(
+                    java.contains(&format!(
+                        "        from(\"{source}\")\n            .routeId(\"shared\")\n            .setProperty("
+                    )),
+                    "{source}:\n{java}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_route_with_exception_handlers_keeps_them_in_force() {
+        // onException clauses only work with an error handler: without one
+        // they would be ignored.
+        let java = shared_route_java(
+            RouteEndpoint::Direct("shared".into()),
+            vec![handler(&["java.lang.Exception"], false, vec![])],
+        );
+
+        assert!(!java.contains("errorHandler"), "{java}");
+        assert!(
+            code_lines(&java).contains(&"onException(java.lang.Exception.class)"),
+            "{java}"
+        );
+    }
+
+    // ── `//` comments ───────────────────────────────────────────────────
+
+    /// Java source of `steps`, as emitted inside a route.
+    fn steps_java(steps: &[RouteStep]) -> String {
+        let mut java = String::new();
+        for step in steps {
+            emit_step_dsl(&mut java, step, 3);
+        }
+        java
+    }
+
+    /// The non-blank lines of `java` as javac splits them: a line ends at
+    /// LF, at CR and at CR LF (JLS 3.4), and a `//` comment ends with it.
+    fn javac_lines(java: &str) -> Vec<&str> {
+        java.split(['\n', '\r'])
+            .filter(|l| !l.trim().is_empty())
+            .collect()
+    }
+
+    /// Whether javac reads a Unicode escape in `java`: a `u` after a
+    /// backslash that an even number of backslashes precedes (JLS 3.3).
+    /// It does so before it recognises comments, and rejects the source
+    /// unless four hex digits follow.
+    fn starts_unicode_escape(java: &str) -> bool {
+        let mut backslashes = 0;
+        for c in java.chars() {
+            if c == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            if c == 'u' && backslashes % 2 == 1 {
+                return true;
+            }
+            backslashes = 0;
+        }
+        false
+    }
+
+    #[test]
+    fn comment_text_is_written_as_it_is() {
+        // Quotes, `*/`, backslashes that start no Unicode escape, non-ASCII
+        // text, blank lines, LF and CR LF line ends: nothing of it can end a
+        // `//` comment or break the source, so nothing of it is rewritten.
+        let note = "TODO: review this handler (on-error-continue type=\"HTTP:TIMEOUT\" \
+                    when=\"#[error.description contains 'a*/b' or matches '\\d+\\\\unc' or 'C:\\temp']\")\n\
+                    - größer als 5 € */ /* \"quoted\" \\\\u0041\r\n\
+                    \n\
+                    - last line";
+        let java = steps_java(&[RouteStep::RawDsl(note.into())]);
+
+        let expected = concat!(
+            "            // TODO: review this handler (on-error-continue type=\"HTTP:TIMEOUT\" ",
+            "when=\"#[error.description contains 'a*/b' or matches '\\d+\\\\unc' or 'C:\\temp']\")\n",
+            "            // - größer als 5 € */ /* \"quoted\" \\\\u0041\n",
+            "            // \n",
+            "            // - last line\n",
+        );
+        assert_eq!(java, expected);
+        assert!(!starts_unicode_escape(&java), "{java}");
+    }
+
+    #[test]
+    fn comment_text_with_a_backslash_before_u_does_not_start_a_unicode_escape() {
+        // javac translates Unicode escapes before it looks for comments:
+        // `C:\users` in a comment is an "illegal unicode escape", and
+        // `\u000a` would be a line end in the middle of the comment.
+        for (text, comment) in [
+            (
+                r##"when="#[error.description contains 'C:\users\x']""##,
+                r##"when="#[error.description contains 'C:\\users\x']""##,
+            ),
+            (r"\u000a drop();", r"\\u000a drop();"),
+            (r"\uuu0041", r"\\uuu0041"),
+            (r"a\\\ub", r"a\\\\ub"),
+            (r"\u", r"\\u"),
+            // An even number of backslashes before the `u` is no escape.
+            (r"a\\ub \\\\u0041", r"a\\ub \\\\u0041"),
+        ] {
+            let java = steps_java(&[RouteStep::RawDsl(text.into())]);
+
+            assert_eq!(java, format!("            // {comment}\n"), "{text}");
+            assert!(!starts_unicode_escape(&java), "{text}: {java}");
+        }
+    }
+
+    #[test]
+    fn comment_text_with_a_lone_carriage_return_stays_a_comment() {
+        // For javac a lone CR ends the line like LF does. Text behind it
+        // must not become code.
+        let java = steps_java(&[RouteStep::RawDsl(
+            "when=\"#[error.description contains 'a\rb']\"); drop();\r\nsecond\nthird\r".into(),
+        )]);
+
+        assert_eq!(
+            java,
+            concat!(
+                "            // when=\"#[error.description contains 'a\n",
+                "            // b']\"); drop();\n",
+                "            // second\n",
+                "            // third\n",
+            )
+        );
+        for line in javac_lines(&java) {
+            assert!(line.trim_start().starts_with("//"), "{line:?} in:\n{java}");
+        }
+    }
+
+    #[test]
+    fn commented_out_handler_stays_a_comment_whatever_its_note_says() {
+        // An on-error scope with a `when` condition is emitted commented
+        // out, with the condition quoted in its note.
+        let java = route_java(vec![handler(
+            &[],
+            true,
+            vec![
+                RouteStep::RawDsl(
+                    "TODO: review this handler (on-error-continue \
+                     when=\"#[error.description contains 'C:\\users\\x\ry']\")"
+                        .into(),
+                ),
+                RouteStep::SetBody {
+                    expression: Expression::Constant("fallback".into()),
+                },
+            ],
+        )]);
+
+        assert!(!starts_unicode_escape(&java), "{java}");
+        let lines = javac_lines(&java);
+        let from = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("from("))
+            .expect("route has a from()");
+        let clause_start = lines
+            .iter()
+            .position(|l| l.contains("onException("))
+            .expect("handler is emitted");
+        assert!(clause_start < from, "{java}");
+        for line in &lines[clause_start..from] {
+            assert!(line.trim_start().starts_with("//"), "{line:?} in:\n{java}");
+        }
+        assert!(java.contains(r"'C:\\users\x"), "{java}");
     }
 
     #[test]
