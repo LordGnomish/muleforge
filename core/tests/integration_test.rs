@@ -828,3 +828,98 @@ async fn hello_world_example_error_handler_is_a_handled_on_exception_clause() {
     assert_eq!(scope.len(), 1);
     assert_eq!(scope[0].status, report::DecisionStatus::ManualReview);
 }
+
+// ── Error handlers: failures inside a sub-flow ────────────────────────────
+
+/// In Mule a sub-flow has no error handling of its own: what fails in it is
+/// handled by the error handler of the flow that references it. The route of
+/// a sub-flow therefore has to be without error handler
+/// (`.errorHandler(noErrorHandler())`); with Camel's default error handler
+/// the `onException` clauses of the calling route would never see the
+/// failure. The routes of the flows keep theirs.
+#[tokio::test]
+async fn sub_flow_route_leaves_its_failures_to_the_calling_flows_error_handler() {
+    let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <flow name="callerFlow">
+        <http:listener config-ref="HTTP_config" path="/caller" allowedMethods="GET" />
+        <flow-ref name="shared" />
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="handled by callerFlow" />
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="otherFlow">
+        <http:listener config-ref="HTTP_config" path="/other" allowedMethods="GET" />
+        <flow-ref name="shared" />
+    </flow>
+    <sub-flow name="shared">
+        <set-variable variableName="enriched" value="true" />
+        <logger message="in shared" level="INFO" />
+    </sub-flow>
+</mule>"##;
+    let dir = make_project(xml);
+    let project = parser::parse_project(dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &[], None).await.unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+    let route = |class: &str| {
+        std::fs::read_to_string(
+            out.path()
+                .join(format!("src/main/java/generated/routes/{class}.java")),
+        )
+        .unwrap()
+    };
+
+    let shared = route("SharedRoute");
+    assert!(
+        shared.contains(
+            r#"
+        from("direct:shared")
+            .routeId("shared")
+            .errorHandler(noErrorHandler())
+            .setProperty("enriched", constant("true"))
+"#
+        ),
+        "{shared}"
+    );
+
+    let caller = route("CallerFlowRoute");
+    assert!(
+        caller.contains(
+            r#"
+        onException(java.lang.Exception.class)
+            .handled(true)
+            .setBody(constant("handled by callerFlow"))
+            .end();
+
+        from("platform-http:/caller?httpMethodRestrict=GET")
+            .routeId("callerFlow")
+            .to("direct:shared")
+"#
+        ),
+        "{caller}"
+    );
+    for flow_route in [caller, route("OtherFlowRoute")] {
+        assert!(!flow_route.contains("errorHandler"), "{flow_route}");
+    }
+
+    for element in ["flow-ref", "on-error-continue"] {
+        let found: Vec<_> = decisions
+            .iter()
+            .filter(|d| d.mule_element == element)
+            .collect();
+        assert!(!found.is_empty(), "{element}");
+        for decision in found {
+            assert_eq!(
+                decision.status,
+                report::DecisionStatus::Done,
+                "{element}: {}",
+                decision.rationale
+            );
+        }
+    }
+}

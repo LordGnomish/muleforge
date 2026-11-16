@@ -29,7 +29,7 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 | `remove-variable` | `removeProperty()` | ✅ Auto | |
 | `remove-attribute` | `removeHeader()` | ✅ Auto | |
 | `logger` | `log()` | ✅ Auto | Level preserved |
-| `flow-ref` | `to("direct:name")` | ✅ Auto | Sub-flows → direct endpoints |
+| `flow-ref` | `to("direct:name")` | ✅ Auto | Sub-flows → direct endpoints. A `flow-ref` to a `<flow>`, or to a name without sub-flow route, is flagged `MANUAL_REVIEW` (see Error Handling) |
 | `http:request` | `to("http:...")` | ✅ Auto | URL + method from config-ref |
 | `db:select/insert/update/delete` | `to("sql:...")` | ✅ Auto | SQL from element text |
 | `db:stored-procedure` | `to("sql-stored:...")` | ✅ Auto | Via mapping YAML |
@@ -82,7 +82,9 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 
 Error types of an on-error scope (`type="A, B"`):
 
-- `ANY`, or no `type`: `java.lang.Exception.class` — exact, reported as `DONE`.
+- `ANY`, or no `type`: `java.lang.Exception.class` — every exception, as `ANY`
+  is every error; reported as `DONE`. What the clause covers is described
+  under "Which failures a clause handles" below.
 - Any other known type (`HTTP:CONNECTIVITY`, `HTTP:TIMEOUT`, `HTTP:UNAUTHORIZED`,
   `HTTP:FORBIDDEN`, `DB:CONNECTIVITY`, `DB:BAD_SQL_SYNTAX`,
   `VALIDATION:INVALID_PAYLOAD`): the nearest Java exception class. A class is
@@ -93,6 +95,26 @@ Error types of an on-error scope (`type="A, B"`):
   shadowed by an earlier one (Mule takes the first match) are emitted commented
   out and flagged `MANUAL_REVIEW`.
 - `<error-handler ref="...">` (global error handler) is not migrated and flagged
+  `MANUAL_REVIEW`.
+
+Which failures a clause handles. In Mule the error handler of a flow also
+handles what fails in a flow or sub-flow the flow calls with `flow-ref`, unless
+the called flow handles it itself. A Camel `onException` clause handles what
+fails in its own route; a failure in a route called through `direct:` reaches
+it only if that route has no error handler of its own:
+
+- `<sub-flow>` (no error handling of its own in Mule): its route is emitted
+  with `.errorHandler(noErrorHandler())`, so its failures go to the
+  `onException` clauses of the calling route, as in Mule. The `flow-ref` is
+  reported as `DONE`.
+- `<flow>` called with `flow-ref`: not equivalent, flagged `MANUAL_REVIEW` on
+  the `flow-ref`. The route of the flow keeps its error handler (its own
+  `onException` clauses need it), so an error the flow propagates
+  (`on-error-propagate`, or no matching on-error scope) fails the exchange
+  without running the caller's clauses, where Mule would run the caller's
+  error handler next. The route also starts at the flow's own source and does
+  not consume from `direct:<name>`.
+- `flow-ref` to a name for which no sub-flow route is generated: flagged
   `MANUAL_REVIEW`.
 
 ## Infrastructure Output

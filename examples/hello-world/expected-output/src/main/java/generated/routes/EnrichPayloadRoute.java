@@ -11,6 +11,7 @@ public class EnrichPayloadRoute extends RouteBuilder {
     public void configure() throws Exception {
         from("direct:enrichPayload")
             .routeId("enrichPayload")
+            .errorHandler(noErrorHandler())
             .setProperty("enriched", constant("true"))
             .log(LoggingLevel.DEBUG, "Payload enriched")
             ;

@@ -34,7 +34,10 @@ pub struct CamelRoute {
 pub enum RouteEndpoint {
     /// e.g., platform-http:/path?httpMethodRestrict=GET
     Uri(String),
-    /// e.g., direct:helloFlow (for sub-flows)
+    /// e.g., direct:helloFlow (for sub-flows). A sub-flow has no error
+    /// handling of its own: such a route without exception handlers is
+    /// emitted without error handler, so that its failures are handled by
+    /// the route that called it.
     Direct(String),
 }
 

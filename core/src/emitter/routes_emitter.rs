@@ -77,6 +77,9 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
     };
     java.push_str(&format!("        from({})\n", from_uri));
     java.push_str(&format!("            .routeId(\"{}\")\n", route.id));
+    if leaves_failures_to_caller(route) {
+        java.push_str("            .errorHandler(noErrorHandler())\n");
+    }
 
     for step in &route.steps {
         emit_step_dsl(&mut java, step, 3);
@@ -88,12 +91,35 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
     java
 }
 
+/// Whether the route is written with `.errorHandler(noErrorHandler())`.
+///
+/// It is for the route of a Mule sub-flow: `RouteEndpoint::Direct` without
+/// exception handlers. A sub-flow has no error handling of its own; what
+/// fails in it is handled by the error handler of the flow that references
+/// it. A Camel route, however, gets the default error handler, and a failure
+/// that one has dealt with comes back to the calling route as final: the
+/// caller's `onException` clauses do not run for it. Without error handler
+/// the failure comes back unhandled and the caller's clauses take it.
+/// (`noErrorHandler()` is a method of `RouteBuilder`; no import is needed.)
+///
+/// Every other route keeps its error handler: a route with exception
+/// handlers needs it (`onException` clauses do nothing without one), and a
+/// route with a source of its own has no caller to leave a failure to.
+fn leaves_failures_to_caller(route: &CamelRoute) -> bool {
+    matches!(route.source, RouteEndpoint::Direct(_)) && route.on_exceptions.is_empty()
+}
+
 /// One `onException(...)` clause, the Camel form of a Mule on-error scope.
 ///
 /// The clause is declared on the RouteBuilder ahead of `from(...)`. Camel
 /// scopes such a clause to the routes of that RouteBuilder instance, and an
-/// emitted RouteBuilder holds exactly one route, so it handles the errors of
-/// that flow only, like the flow's `<error-handler>` in Mule.
+/// emitted RouteBuilder holds exactly one route, so no other flow's route
+/// uses it. It runs for what fails in that route, and for what fails in a
+/// route called from it through `direct:` only if that route has no error
+/// handler: the route of a sub-flow (see [`leaves_failures_to_caller`]).
+/// That matches the flow's `<error-handler>` in Mule for the flow and the
+/// sub-flows it references. It does not for a `<flow>` it references, whose
+/// route keeps its own error handler; the mapper flags such a flow-ref.
 ///
 /// * `onException(Class<? extends Throwable>...)` takes class literals:
 ///   every exception class is written fully qualified with `.class`.
@@ -811,6 +837,88 @@ mod tests {
         );
         // The route itself is unaffected.
         assert!(code.contains(&r#".routeId("safeFlow")"#), "{java}");
+    }
+
+    // ── Error handling of sub-flow routes ───────────────────────────────
+
+    /// Java source of the RouteBuilder for a route `shared` with one step.
+    fn shared_route_java(source: RouteEndpoint, on_exceptions: Vec<ExceptionHandler>) -> String {
+        generate_route_builder(
+            "SharedRoute",
+            &CamelRoute {
+                id: "shared".into(),
+                source,
+                steps: vec![RouteStep::SetProperty {
+                    name: "enriched".into(),
+                    expression: Expression::Constant("true".into()),
+                }],
+                on_exceptions,
+            },
+        )
+    }
+
+    #[test]
+    fn sub_flow_route_leaves_its_failures_to_the_calling_route() {
+        // A Mule sub-flow has no error handling of its own: what fails in it
+        // is handled by the error handler of the flow that called it. A
+        // Camel route gets the default error handler, and after that one
+        // the onException clauses of the calling route no longer run. So
+        // the route of a sub-flow is emitted without error handler.
+        let java = shared_route_java(RouteEndpoint::Direct("shared".into()), vec![]);
+
+        let route = r#"
+    public void configure() throws Exception {
+        from("direct:shared")
+            .routeId("shared")
+            .errorHandler(noErrorHandler())
+            .setProperty("enriched", constant("true"))
+            ;
+    }
+"#;
+        assert!(java.contains(route), "expected route:{route}\nin:\n{java}");
+    }
+
+    #[test]
+    fn route_of_a_flow_keeps_its_error_handler() {
+        // A flow handles its own errors: with its on-error scopes, and with
+        // the default error handler for the rest. That includes a flow the
+        // mapper could only give a placeholder direct: source.
+        for source in [
+            "platform-http:/safe?httpMethodRestrict=GET",
+            "kafka:orders?brokers=broker-1:9092",
+            "direct:kafka-message-listener",
+        ] {
+            for on_exceptions in [
+                vec![],
+                vec![handler(&["java.lang.Exception"], true, vec![])],
+            ] {
+                let java = shared_route_java(RouteEndpoint::Uri(source.into()), on_exceptions);
+
+                assert!(!java.contains("errorHandler"), "{source}:\n{java}");
+                assert!(
+                    java.contains(&format!(
+                        "        from(\"{source}\")\n            .routeId(\"shared\")\n            .setProperty("
+                    )),
+                    "{source}:\n{java}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_route_with_exception_handlers_keeps_them_in_force() {
+        // onException clauses only work with an error handler: without one
+        // they would be ignored.
+        let java = shared_route_java(
+            RouteEndpoint::Direct("shared".into()),
+            vec![handler(&["java.lang.Exception"], false, vec![])],
+        );
+
+        assert!(!java.contains("errorHandler"), "{java}");
+        assert!(
+            code_lines(&java).contains(&"onException(java.lang.Exception.class)"),
+            "{java}"
+        );
     }
 
     // ── `//` comments ───────────────────────────────────────────────────

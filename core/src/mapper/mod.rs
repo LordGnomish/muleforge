@@ -151,10 +151,10 @@ pub async fn map_project(
     for flow in &project.flows {
         if flow.is_sub_flow {
             // Sub-flows map to direct: endpoints
-            let route = map_sub_flow(flow, rules, &mut decisions, &mut all_deps);
+            let route = map_sub_flow(flow, &project.flows, rules, &mut decisions, &mut all_deps);
             camel.routes.push(route);
         } else {
-            let route = map_flow(flow, rules, &mut decisions, &mut all_deps);
+            let route = map_flow(flow, &project.flows, rules, &mut decisions, &mut all_deps);
             camel.routes.push(route);
         }
     }
@@ -211,6 +211,7 @@ fn steps_use_direct(steps: &[RouteStep]) -> bool {
 
 fn map_flow(
     flow: &crate::ast::mule_ast::MuleFlow,
+    flows: &[crate::ast::mule_ast::MuleFlow],
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -224,14 +225,14 @@ fn map_flow(
             source = map_source(proc, rules, decisions, deps);
             continue;
         }
-        let step = map_processor(proc, rules, decisions, deps);
+        let step = map_processor(proc, flows, rules, decisions, deps);
         steps.extend(step);
     }
 
     let on_exceptions = flow
         .error_handlers
         .iter()
-        .flat_map(|eh| map_error_handler(eh, rules, decisions, deps))
+        .flat_map(|eh| map_error_handler(eh, flows, rules, decisions, deps))
         .collect();
 
     CamelRoute {
@@ -242,8 +243,20 @@ fn map_flow(
     }
 }
 
+/// The route of a `<sub-flow>`: `from("direct:<name>")`, called by the
+/// flow-refs that name it.
+///
+/// A Mule sub-flow has no error handling of its own. It runs as part of the
+/// flow that references it, and what fails in it is handled by that flow's
+/// error handler. A Camel route always has an error handler (the default
+/// one, unless told otherwise), and once that has dealt with a failure the
+/// `onException` clauses of the calling route do not run for it. So this
+/// route, `RouteEndpoint::Direct` without exception handlers, is the one the
+/// emitter writes with `.errorHandler(noErrorHandler())`: its failures go
+/// back to the calling route and to that route's clauses.
 fn map_sub_flow(
     flow: &crate::ast::mule_ast::MuleFlow,
+    flows: &[crate::ast::mule_ast::MuleFlow],
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -251,7 +264,7 @@ fn map_sub_flow(
     let steps: Vec<RouteStep> = flow
         .processors
         .iter()
-        .flat_map(|p| map_processor(p, rules, decisions, deps))
+        .flat_map(|p| map_processor(p, flows, rules, decisions, deps))
         .collect();
 
     CamelRoute {
@@ -400,8 +413,13 @@ fn map_source(
     }
 }
 
+/// Map one message processor to route steps.
+///
+/// `flows` are the flows and sub-flows of the project, as they are mapped
+/// to routes: what a `flow-ref` can point at.
 fn map_processor(
     elem: &MuleElement,
+    flows: &[crate::ast::mule_ast::MuleFlow],
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -491,14 +509,14 @@ fn map_processor(
                     let steps: Vec<RouteStep> = child
                         .children
                         .iter()
-                        .flat_map(|c| map_processor(c, rules, decisions, deps))
+                        .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
                         .collect();
                     whens.push((Expression::Simple(expr), steps));
                 } else if child.name == "otherwise" {
                     let steps: Vec<RouteStep> = child
                         .children
                         .iter()
-                        .flat_map(|c| map_processor(c, rules, decisions, deps))
+                        .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
                         .collect();
                     otherwise = Some(steps);
                 }
@@ -518,7 +536,7 @@ fn map_processor(
             let steps: Vec<RouteStep> = elem
                 .children
                 .iter()
-                .flat_map(|c| map_processor(c, rules, decisions, deps))
+                .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
                 .collect();
             record_decision(
                 decisions,
@@ -539,7 +557,7 @@ fn map_processor(
             let steps: Vec<RouteStep> = elem
                 .children
                 .iter()
-                .flat_map(|c| map_processor(c, rules, decisions, deps))
+                .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
                 .collect();
             record_decision(
                 decisions,
@@ -555,15 +573,52 @@ fn map_processor(
                 steps,
             }]
         }
+        // A flow-ref runs its target as part of the calling flow, and what
+        // the target does not handle itself goes to the caller's error
+        // handler. Only the route of a sub-flow behaves like that (see
+        // `map_sub_flow`), so only a flow-ref to a sub-flow is done.
         ("", "flow-ref") => {
             let name = elem.attr("name").unwrap_or("unknown").to_string();
-            record_decision(
-                decisions,
-                elem,
-                DecisionStatus::Done,
-                None,
-                "flow-ref -> direct endpoint",
-            );
+            match flows.iter().find(|f| f.name == name) {
+                Some(target) if target.is_sub_flow => record_decision(
+                    decisions,
+                    elem,
+                    DecisionStatus::Done,
+                    None,
+                    "flow-ref -> direct endpoint",
+                ),
+                // The target's route starts at the flow's own source, and it
+                // keeps its error handler: it needs it for the flow's on-error
+                // scopes, and with it the caller's onException clauses see
+                // none of the flow's errors. Camel cannot have both on one
+                // route, so this is left to a person.
+                Some(_) => record_decision(
+                    decisions,
+                    elem,
+                    DecisionStatus::ManualReview,
+                    None,
+                    &format!(
+                        "flow-ref -> direct:{name}; review: {name} is a <flow>, not a \
+                         <sub-flow>. Its route does not consume from direct:{name} - add that \
+                         consumer. It also keeps its own error handling: an error the flow does \
+                         not handle itself (on-error-propagate, or no on-error scope that \
+                         matches) fails the exchange without running the onException clauses of \
+                         the calling route, while Mule hands it to the caller's error handler"
+                    ),
+                ),
+                None => record_decision(
+                    decisions,
+                    elem,
+                    DecisionStatus::ManualReview,
+                    None,
+                    &format!(
+                        "flow-ref -> direct:{name}; review: no sub-flow route named {name} is \
+                         generated, so nothing consumes from direct:{name} and it is unknown \
+                         whether errors of the target reach the onException clauses of the \
+                         calling route"
+                    ),
+                ),
+            }
             vec![RouteStep::ToUri(format!("direct:{}", name))]
         }
         ("", "transform") | ("ee", "transform") => {
@@ -749,6 +804,7 @@ const ANY_EXCEPTION: &str = "java.lang.Exception";
 /// review, in the report and with a TODO in the generated clause.
 fn map_error_handler(
     eh: &MuleElement,
+    flows: &[crate::ast::mule_ast::MuleFlow],
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -861,7 +917,7 @@ fn map_error_handler(
             child
                 .children
                 .iter()
-                .flat_map(|c| map_processor(c, rules, decisions, deps)),
+                .flat_map(|c| map_processor(c, flows, rules, decisions, deps)),
         );
 
         let clause = if classes.is_empty() {
@@ -1133,7 +1189,7 @@ mod tests {
     }
 
     fn to_uris(e: &MuleElement, rules: &[Rule]) -> Vec<String> {
-        map_processor(e, rules, &mut Vec::new(), &mut Vec::new())
+        map_processor(e, &[], rules, &mut Vec::new(), &mut Vec::new())
             .into_iter()
             .map(|step| match step {
                 RouteStep::ToUri(uri) => uri,
@@ -1320,6 +1376,207 @@ mappings:
         );
     }
 
+    // ── flow-ref and the error handler of the caller ────────────────────
+
+    async fn map_flows(flows: Vec<MuleFlow>) -> (CamelProject, Vec<MappingDecision>) {
+        let project = MuleProject {
+            name: "orders".into(),
+            flows,
+            configs: vec![],
+            properties: Default::default(),
+        };
+        map_project(&project, &[], None).await.unwrap()
+    }
+
+    /// A flow with an HTTP listener that calls `target` through a flow-ref
+    /// and handles every error with an on-error-continue.
+    fn caller_of(target: &str) -> MuleFlow {
+        let mut caller = flow(
+            "callerFlow",
+            false,
+            vec![http_listener(), elem("", "flow-ref", &[("name", target)])],
+        );
+        caller.error_handlers = vec![error_handler(vec![on_error("on-error-continue", &[])])];
+        caller
+    }
+
+    fn decisions_for<'a>(
+        decisions: &'a [MappingDecision],
+        element: &str,
+    ) -> Vec<&'a MappingDecision> {
+        decisions
+            .iter()
+            .filter(|d| d.mule_element == element)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn flow_ref_to_a_sub_flow_is_done_and_its_route_has_no_handlers_of_its_own() {
+        // The sub-flow's route is the one kind of route the emitter writes
+        // without error handler (`RouteEndpoint::Direct`, no exception
+        // handlers), so what fails in it reaches the caller's onException
+        // clauses like it reaches the caller's error handler in Mule.
+        let (camel, decisions) = map_flows(vec![
+            caller_of("shared"),
+            flow(
+                "otherFlow",
+                false,
+                vec![http_listener(), elem("", "flow-ref", &[("name", "shared")])],
+            ),
+            flow(
+                "shared",
+                true,
+                vec![elem("", "logger", &[("message", "in shared")])],
+            ),
+        ])
+        .await;
+
+        let shared = camel.routes.iter().find(|r| r.id == "shared").unwrap();
+        assert!(
+            matches!(&shared.source, RouteEndpoint::Direct(name) if name == "shared"),
+            "{:?}",
+            shared.source
+        );
+        assert!(shared.on_exceptions.is_empty());
+        // Only a sub-flow becomes such a route.
+        for route in camel.routes.iter().filter(|r| r.id != "shared") {
+            assert!(
+                matches!(route.source, RouteEndpoint::Uri(_)),
+                "{}: {:?}",
+                route.id,
+                route.source
+            );
+        }
+
+        let flow_refs = decisions_for(&decisions, "flow-ref");
+        assert_eq!(flow_refs.len(), 2);
+        for decision in flow_refs {
+            assert_eq!(
+                decision.status,
+                DecisionStatus::Done,
+                "{}",
+                decision.rationale
+            );
+        }
+        let scopes = decisions_for(&decisions, "on-error-continue");
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].status, DecisionStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn flow_ref_to_a_flow_is_flagged_for_review() {
+        // A flow called through flow-ref handles its own errors first, and
+        // Mule hands what it propagates on to the caller's error handler.
+        // The flow's route keeps its error handler (it needs it for its own
+        // on-error scopes), and what that propagates does not reach the
+        // caller's onException clauses. Nor does the route consume from
+        // direct:<name>. So the flow-ref is not done.
+        let mut with_handler = flow(
+            "auditFlow",
+            false,
+            vec![elem("", "logger", &[("message", "audit")])],
+        );
+        with_handler.error_handlers =
+            vec![error_handler(vec![on_error("on-error-propagate", &[])])];
+        let with_source = flow(
+            "auditFlow",
+            false,
+            vec![http_listener(), elem("", "logger", &[("message", "audit")])],
+        );
+
+        for target in [with_handler, with_source] {
+            let (camel, decisions) = map_flows(vec![caller_of("auditFlow"), target]).await;
+
+            let flow_refs = decisions_for(&decisions, "flow-ref");
+            assert_eq!(flow_refs.len(), 1);
+            assert_eq!(flow_refs[0].status, DecisionStatus::ManualReview);
+            let rationale = &flow_refs[0].rationale;
+            assert!(
+                rationale.contains("auditFlow")
+                    && rationale.contains("direct:auditFlow")
+                    && rationale.contains("<flow>")
+                    && rationale.contains("onException"),
+                "{rationale}"
+            );
+            // The step is still emitted, and the called flow's route is not
+            // turned into a route without error handler.
+            let caller = camel.routes.iter().find(|r| r.id == "callerFlow").unwrap();
+            assert!(
+                matches!(&caller.steps[..], [RouteStep::ToUri(uri)] if uri == "direct:auditFlow"),
+                "{:?}",
+                caller.steps
+            );
+            let audit = camel.routes.iter().find(|r| r.id == "auditFlow").unwrap();
+            assert!(
+                matches!(audit.source, RouteEndpoint::Uri(_)),
+                "{:?}",
+                audit.source
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn flow_ref_without_a_sub_flow_route_is_flagged_for_review() {
+        // Nothing consumes from direct:<name>, and nothing can be said
+        // about where the errors of the target go.
+        let (_, decisions) = map_flows(vec![caller_of("elsewhere")]).await;
+
+        let flow_refs = decisions_for(&decisions, "flow-ref");
+        assert_eq!(flow_refs.len(), 1);
+        assert_eq!(flow_refs[0].status, DecisionStatus::ManualReview);
+        assert!(
+            flow_refs[0].rationale.contains("direct:elsewhere"),
+            "{}",
+            flow_refs[0].rationale
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_ref_in_an_error_handler_or_a_scope_is_judged_the_same_way() {
+        let mut scope = on_error("on-error-continue", &[]);
+        scope.children = vec![
+            elem("", "flow-ref", &[("name", "shared")]),
+            elem("", "flow-ref", &[("name", "auditFlow")]),
+        ];
+        let mut handled = flow("pricesFlow", false, vec![http_listener()]);
+        handled.error_handlers = vec![error_handler(vec![scope])];
+
+        let mut when = elem("", "when", &[("expression", "#[true]")]);
+        when.children = vec![
+            elem("", "flow-ref", &[("name", "shared")]),
+            elem("", "flow-ref", &[("name", "auditFlow")]),
+        ];
+        let mut choice = elem("", "choice", &[]);
+        choice.children = vec![when];
+        let nested = flow("ordersFlow", false, vec![http_listener(), choice]);
+
+        for caller in [handled, nested] {
+            let (_, decisions) = map_flows(vec![
+                caller,
+                flow(
+                    "shared",
+                    true,
+                    vec![elem("", "logger", &[("message", "in shared")])],
+                ),
+                flow(
+                    "auditFlow",
+                    false,
+                    vec![http_listener(), elem("", "logger", &[("message", "audit")])],
+                ),
+            ])
+            .await;
+
+            let statuses: Vec<DecisionStatus> = decisions_for(&decisions, "flow-ref")
+                .iter()
+                .map(|d| d.status)
+                .collect();
+            assert_eq!(
+                statuses,
+                [DecisionStatus::Done, DecisionStatus::ManualReview]
+            );
+        }
+    }
+
     // ── Error handlers ──────────────────────────────────────────────────
 
     /// `<error-handler>` holding the given on-error scopes.
@@ -1340,8 +1597,13 @@ mappings:
     /// recorded for the on-error scopes themselves (not for their processors).
     fn map_scopes(scopes: Vec<MuleElement>) -> (Vec<ExceptionHandler>, Vec<MappingDecision>) {
         let mut decisions = Vec::new();
-        let handlers =
-            map_error_handler(&error_handler(scopes), &[], &mut decisions, &mut Vec::new());
+        let handlers = map_error_handler(
+            &error_handler(scopes),
+            &[],
+            &[],
+            &mut decisions,
+            &mut Vec::new(),
+        );
         decisions.retain(|d| d.mule_element.starts_with("on-error-"));
         (handlers, decisions)
     }
@@ -1510,6 +1772,7 @@ mappings:
                 &[("type", "HTTP:FORBIDDEN")],
             )]),
             &[],
+            &[],
             &mut Vec::new(),
             &mut deps,
         );
@@ -1660,7 +1923,7 @@ mappings:
         // migrated; the flow must not look as if it had no error handling.
         let reference = elem("", "error-handler", &[("ref", "globalErrorHandler")]);
         let mut decisions = Vec::new();
-        let handlers = map_error_handler(&reference, &[], &mut decisions, &mut Vec::new());
+        let handlers = map_error_handler(&reference, &[], &[], &mut decisions, &mut Vec::new());
 
         assert!(handlers.is_empty());
         assert_eq!(decisions.len(), 1);
