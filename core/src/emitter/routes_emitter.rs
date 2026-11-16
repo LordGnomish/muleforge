@@ -246,11 +246,48 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
             ));
         }
         RouteStep::RawDsl(dsl) => {
-            for line in dsl.lines() {
+            for line in comment_lines(dsl) {
                 java.push_str(&format!("{}// {}\n", pad, line));
             }
         }
     }
+}
+
+/// `text` as the lines of a `//` comment, one comment line per text line.
+///
+/// The text comes from the Mule XML (attribute values quoted in review
+/// notes, for example) and must not be able to leave the comment:
+///
+/// * javac ends a line, and a `//` comment with it, at LF, CR LF and at a
+///   lone CR (JLS 3.4). Each of them starts a new comment line.
+/// * javac translates Unicode escapes before it recognises comments (JLS
+///   3.3): `C:\users` in a comment is an "illegal unicode escape", and
+///   `\u000a` would end the comment. A `u` starts an escape when an odd
+///   number of backslashes stands before it; such a run gets one more
+///   backslash, which makes it a row of plain backslashes for javac.
+///
+/// Any other text is written as it is.
+fn comment_lines(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(|line| {
+            let mut out = String::with_capacity(line.len());
+            let mut backslashes = 0;
+            for c in line.chars() {
+                if c == '\\' {
+                    backslashes += 1;
+                } else {
+                    if c == 'u' && backslashes % 2 == 1 {
+                        out.push('\\');
+                    }
+                    backslashes = 0;
+                }
+                out.push(c);
+            }
+            out
+        })
+        .collect()
 }
 
 fn expr_to_java(expr: &Expression) -> String {
@@ -774,6 +811,149 @@ mod tests {
         );
         // The route itself is unaffected.
         assert!(code.contains(&r#".routeId("safeFlow")"#), "{java}");
+    }
+
+    // ── `//` comments ───────────────────────────────────────────────────
+
+    /// Java source of `steps`, as emitted inside a route.
+    fn steps_java(steps: &[RouteStep]) -> String {
+        let mut java = String::new();
+        for step in steps {
+            emit_step_dsl(&mut java, step, 3);
+        }
+        java
+    }
+
+    /// The non-blank lines of `java` as javac splits them: a line ends at
+    /// LF, at CR and at CR LF (JLS 3.4), and a `//` comment ends with it.
+    fn javac_lines(java: &str) -> Vec<&str> {
+        java.split(['\n', '\r'])
+            .filter(|l| !l.trim().is_empty())
+            .collect()
+    }
+
+    /// Whether javac reads a Unicode escape in `java`: a `u` after a
+    /// backslash that an even number of backslashes precedes (JLS 3.3).
+    /// It does so before it recognises comments, and rejects the source
+    /// unless four hex digits follow.
+    fn starts_unicode_escape(java: &str) -> bool {
+        let mut backslashes = 0;
+        for c in java.chars() {
+            if c == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            if c == 'u' && backslashes % 2 == 1 {
+                return true;
+            }
+            backslashes = 0;
+        }
+        false
+    }
+
+    #[test]
+    fn comment_text_is_written_as_it_is() {
+        // Quotes, `*/`, backslashes that start no Unicode escape, non-ASCII
+        // text, blank lines, LF and CR LF line ends: nothing of it can end a
+        // `//` comment or break the source, so nothing of it is rewritten.
+        let note = "TODO: review this handler (on-error-continue type=\"HTTP:TIMEOUT\" \
+                    when=\"#[error.description contains 'a*/b' or matches '\\d+\\\\unc' or 'C:\\temp']\")\n\
+                    - größer als 5 € */ /* \"quoted\" \\\\u0041\r\n\
+                    \n\
+                    - last line";
+        let java = steps_java(&[RouteStep::RawDsl(note.into())]);
+
+        let expected = concat!(
+            "            // TODO: review this handler (on-error-continue type=\"HTTP:TIMEOUT\" ",
+            "when=\"#[error.description contains 'a*/b' or matches '\\d+\\\\unc' or 'C:\\temp']\")\n",
+            "            // - größer als 5 € */ /* \"quoted\" \\\\u0041\n",
+            "            // \n",
+            "            // - last line\n",
+        );
+        assert_eq!(java, expected);
+        assert!(!starts_unicode_escape(&java), "{java}");
+    }
+
+    #[test]
+    fn comment_text_with_a_backslash_before_u_does_not_start_a_unicode_escape() {
+        // javac translates Unicode escapes before it looks for comments:
+        // `C:\users` in a comment is an "illegal unicode escape", and
+        // `\u000a` would be a line end in the middle of the comment.
+        for (text, comment) in [
+            (
+                r##"when="#[error.description contains 'C:\users\x']""##,
+                r##"when="#[error.description contains 'C:\\users\x']""##,
+            ),
+            (r"\u000a drop();", r"\\u000a drop();"),
+            (r"\uuu0041", r"\\uuu0041"),
+            (r"a\\\ub", r"a\\\\ub"),
+            (r"\u", r"\\u"),
+            // An even number of backslashes before the `u` is no escape.
+            (r"a\\ub \\\\u0041", r"a\\ub \\\\u0041"),
+        ] {
+            let java = steps_java(&[RouteStep::RawDsl(text.into())]);
+
+            assert_eq!(java, format!("            // {comment}\n"), "{text}");
+            assert!(!starts_unicode_escape(&java), "{text}: {java}");
+        }
+    }
+
+    #[test]
+    fn comment_text_with_a_lone_carriage_return_stays_a_comment() {
+        // For javac a lone CR ends the line like LF does. Text behind it
+        // must not become code.
+        let java = steps_java(&[RouteStep::RawDsl(
+            "when=\"#[error.description contains 'a\rb']\"); drop();\r\nsecond\nthird\r".into(),
+        )]);
+
+        assert_eq!(
+            java,
+            concat!(
+                "            // when=\"#[error.description contains 'a\n",
+                "            // b']\"); drop();\n",
+                "            // second\n",
+                "            // third\n",
+            )
+        );
+        for line in javac_lines(&java) {
+            assert!(line.trim_start().starts_with("//"), "{line:?} in:\n{java}");
+        }
+    }
+
+    #[test]
+    fn commented_out_handler_stays_a_comment_whatever_its_note_says() {
+        // An on-error scope with a `when` condition is emitted commented
+        // out, with the condition quoted in its note.
+        let java = route_java(vec![handler(
+            &[],
+            true,
+            vec![
+                RouteStep::RawDsl(
+                    "TODO: review this handler (on-error-continue \
+                     when=\"#[error.description contains 'C:\\users\\x\ry']\")"
+                        .into(),
+                ),
+                RouteStep::SetBody {
+                    expression: Expression::Constant("fallback".into()),
+                },
+            ],
+        )]);
+
+        assert!(!starts_unicode_escape(&java), "{java}");
+        let lines = javac_lines(&java);
+        let from = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("from("))
+            .expect("route has a from()");
+        let clause_start = lines
+            .iter()
+            .position(|l| l.contains("onException("))
+            .expect("handler is emitted");
+        assert!(clause_start < from, "{java}");
+        for line in &lines[clause_start..from] {
+            assert!(line.trim_start().starts_with("//"), "{line:?} in:\n{java}");
+        }
+        assert!(java.contains(r"'C:\\users\x"), "{java}");
     }
 
     #[test]
