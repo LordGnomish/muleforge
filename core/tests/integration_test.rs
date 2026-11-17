@@ -923,3 +923,155 @@ async fn sub_flow_route_leaves_its_failures_to_the_calling_flows_error_handler()
         }
     }
 }
+
+// ── Expressions: choice conditions, set-variable and set-payload values ───
+
+/// Migrate `examples/hello-world` with the shipped rules. Returns the
+/// emitted route classes (name -> Java source) and the mapping decisions.
+async fn migrate_hello_world_example() -> (
+    std::collections::BTreeMap<String, String>,
+    Vec<report::MappingDecision>,
+) {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rules = mapper::load_rules(&manifest_dir.join("../mappings")).unwrap();
+    let project = parser::parse_project(&manifest_dir.join("../examples/hello-world")).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+
+    let mut routes = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(out.path().join("src/main/java/generated/routes")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        routes.insert(name, std::fs::read_to_string(&path).unwrap());
+    }
+    (routes, decisions)
+}
+
+/// The lines of `java` that are code: trimmed, without blank and comment
+/// lines.
+fn code_lines(java: &str) -> Vec<&str> {
+    java.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .collect()
+}
+
+/// `routerFlow` of `examples/hello-world` routes on `#[payload.type == 'A']`.
+/// The route used to get `.when(simple("#[payload.type == 'A']"))`, which
+/// Camel rejects at startup ("Unexpected token # at location 0"), and the
+/// choice was reported as done.
+///
+/// `payload.type` reads a field of a payload whose type the migrator does
+/// not know, so the condition is not converted: the branch stays, with the
+/// Mule expression in a TODO and a predicate that fails when it is
+/// evaluated (never a guess), and the choice is flagged for review. The
+/// otherwise branch is kept as it is.
+#[tokio::test]
+async fn hello_world_example_choice_conditions_are_flagged_and_fail_loudly() {
+    let (routes, decisions) = migrate_hello_world_example().await;
+    let java = &routes["RouterFlowRoute"];
+
+    let code = code_lines(java);
+    let from = code
+        .iter()
+        .position(|l| l.starts_with("from("))
+        .unwrap_or_else(|| panic!("no from() in:\n{java}"));
+    assert_eq!(
+        code[from..from + 11],
+        [
+            r#"from("platform-http:/route?httpMethodRestrict=POST")"#,
+            r#".routeId("routerFlow")"#,
+            ".choice()",
+            r#".when(exchange -> { throw new UnsupportedOperationException("choice condition not migrated: #[payload.type == 'A']"); })"#,
+            r#".setBody(constant("Routed to handler A"))"#,
+            r#".when(exchange -> { throw new UnsupportedOperationException("choice condition not migrated: #[payload.type == 'B']"); })"#,
+            r#".setBody(constant("Routed to handler B"))"#,
+            ".otherwise()",
+            r#".setBody(constant("Default handler"))"#,
+            ".endChoice()",
+            ";",
+        ],
+        "{java}"
+    );
+    for condition in ["#[payload.type == 'A']", "#[payload.type == 'B']"] {
+        assert!(
+            java.contains(&format!(
+                "// TODO: review this condition, it is not converted (Mule: {condition})"
+            )),
+            "{java}"
+        );
+    }
+
+    // One decision for the choice, and it is not "done".
+    let choice: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element == "choice")
+        .collect();
+    assert_eq!(choice.len(), 1, "{choice:?}");
+    assert_eq!(choice[0].status, report::DecisionStatus::ManualReview);
+    assert_eq!(choice[0].rule_id.as_deref(), Some("choice-router"));
+    for condition in ["#[payload.type == 'A']", "#[payload.type == 'B']"] {
+        assert!(
+            choice[0].rationale.contains(condition),
+            "{}",
+            choice[0].rationale
+        );
+    }
+}
+
+/// `echoFlow` of `examples/hello-world` has
+/// `<set-variable variableName="originalPayload" value="#[payload]" />`,
+/// which used to be emitted as the literal string `"#[payload]"`. The whole
+/// payload is the Camel message body, whatever its type.
+#[tokio::test]
+async fn hello_world_example_set_variable_takes_the_payload_from_the_body() {
+    let (routes, decisions) = migrate_hello_world_example().await;
+    let java = &routes["EchoFlowRoute"];
+
+    let code = code_lines(java);
+    let from = code
+        .iter()
+        .position(|l| l.starts_with("from("))
+        .unwrap_or_else(|| panic!("no from() in:\n{java}"));
+    assert_eq!(
+        code[from..from + 3],
+        [
+            r#"from("platform-http:/echo?httpMethodRestrict=POST")"#,
+            r#".routeId("echoFlow")"#,
+            r#".setProperty("originalPayload", simple("${body}"))"#,
+        ],
+        "{java}"
+    );
+
+    // No route of the example passes a Mule expression on to Camel.
+    for (name, java) in &routes {
+        for line in code_lines(java) {
+            assert!(
+                !line.contains(r##"simple("#["##) && !line.contains(r##"constant("#["##),
+                "{name}: {line}"
+            );
+        }
+    }
+
+    // Every set-variable and set-payload of the example is a literal or the
+    // whole payload: done, and reported once per element.
+    for (element, count) in [("set-variable", 2), ("set-payload", 5)] {
+        let found: Vec<_> = decisions
+            .iter()
+            .filter(|d| d.mule_element == element)
+            .collect();
+        assert_eq!(found.len(), count, "{element}: {found:?}");
+        for decision in found {
+            assert_eq!(
+                decision.status,
+                report::DecisionStatus::Done,
+                "{element}: {}",
+                decision.rationale
+            );
+        }
+    }
+}

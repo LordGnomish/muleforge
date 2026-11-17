@@ -86,14 +86,31 @@ pub enum RouteStep {
     RawDsl(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expression {
+    /// A string constant: `constant("text")`.
     Constant(String),
+    /// A constant that is not a string, written as the Java literal it is:
+    /// `constant(42)`, `constant(true)`.
+    Literal(String),
     Simple(String),
     Header(String),
     Property(String),
     /// Reference to a generated bean that produces the value.
     BeanRef(String),
+    /// A Mule expression that is not converted (see `docs/mapping/MATRIX.md`,
+    /// "Expressions"): `original` is the Mule attribute value, `reason` says
+    /// why it is left to a person.
+    ///
+    /// It is never emitted as an expression Camel would evaluate. The
+    /// emitter writes the step so that the route compiles and starts, says
+    /// in a `TODO` what is missing, and fails when the step is reached: a
+    /// choice condition becomes a predicate that throws, a step that needs
+    /// the value (`setBody`, `setProperty`, ...) becomes `throwException`.
+    Unconverted {
+        original: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

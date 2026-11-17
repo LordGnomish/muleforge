@@ -2,6 +2,251 @@
 //!
 //! MEL expressions use #[...] syntax in Mule 3/4. Most can be directly
 //! mapped to Camel's Simple expression language.
+//!
+//! Two conversions live here:
+//!
+//! * [`mel_to_simple`] / [`interpolate_mel`]: lenient, for text that is
+//!   only displayed (logger messages).
+//! * [`convert_value`] / [`convert_condition`]: strict, for what decides
+//!   what a route does (set-variable and set-payload values, choice
+//!   conditions). They convert the shapes that mean the same in Camel
+//!   whatever the payload is, and return [`Expression::Unconverted`] with
+//!   the reason for everything else. `docs/mapping/MATRIX.md`
+//!   ("Expressions") has the table and the reasons.
+
+use crate::ast::camel_ir::Expression;
+
+// ── Strict conversion ───────────────────────────────────────────────────
+
+const WHY_PAYLOAD_FIELD: &str = "it reads a field of the payload: Mule reads it from JSON, XML, \
+     a Map or an object according to the MIME type of the payload, while Simple's \
+     ${body.field} calls a getter on a Java object and does not read a field out of a JSON or \
+     XML body; the payload type is not known to the migrator";
+const WHY_PAYLOAD_COMPARED: &str = "it compares the payload: Mule compares the value it reads \
+     according to the MIME type of the payload (the JSON document \"A\" equals 'A', an empty \
+     body is null), Simple compares the body as it arrived; the payload type is not known to \
+     the migrator";
+const WHY_ATTRIBUTES: &str = "it reads message attributes: what they hold depends on the source \
+     and on the last connector operation of the flow, which the conversion does not follow \
+     (and Camel keeps HTTP request headers and query parameters in one header map)";
+const WHY_VARIABLE_FIELD: &str = "it reads into the value of a variable (a field, or a name \
+     that is not a plain identifier), which depends on the type of the value the variable holds";
+const WHY_NOT_BOOLEAN: &str = "it uses a value as the condition: Mule expects a Boolean, while \
+     Simple takes every value except null, false, \"false\" and \"\" as true";
+const WHY_ORDERING: &str = "it compares with <, >, <= or >=: how two values are ordered depends \
+     on their types (number or text), which are not known to the migrator";
+const WHY_EMBEDDED: &str = "it mixes text and #[...] expressions, or is not one complete \
+     #[...] expression";
+const WHY_OTHER_VALUE: &str = "it is not one of the shapes that are converted: payload, \
+     vars.name, or a string, integer or boolean literal";
+const WHY_OTHER_CONDITION: &str = "it is not one of the shapes that are converted: vars.name \
+     == or != a string, integer, boolean or null literal or another vars.name, or true / false";
+
+/// An operand that means the same in Mule and in Camel.
+enum Operand {
+    Payload,
+    /// A flow variable, by name.
+    Variable(String),
+    Text(String),
+    Integer(i32),
+    Boolean(bool),
+    Null,
+}
+
+/// The value of a `set-variable` / `set-payload` as a Camel expression.
+///
+/// * no `#[...]`: a string in Mule, a string constant in Camel;
+/// * `#[payload]`: the message body, `${body}`;
+/// * `#[vars.name]`: the exchange property `name` (`set-variable` is
+///   `setProperty`), `${exchangeProperty.name}`;
+/// * `#['text']`, `#[42]`, `#[true]`: a constant of the same type.
+///
+/// Everything else is [`Expression::Unconverted`].
+pub fn convert_value(raw: &str) -> Expression {
+    if !raw.contains("#[") {
+        return Expression::Constant(raw.to_string());
+    }
+    let Some(inner) = whole_expression(raw) else {
+        return unconverted(raw, WHY_EMBEDDED);
+    };
+    match parse_operand(inner) {
+        Some(Operand::Payload) => Expression::Simple("${body}".into()),
+        Some(Operand::Variable(name)) => Expression::Simple(exchange_property(&name)),
+        Some(Operand::Text(text)) => Expression::Constant(text),
+        Some(Operand::Integer(number)) => Expression::Literal(number.to_string()),
+        Some(Operand::Boolean(value)) => Expression::Literal(value.to_string()),
+        Some(Operand::Null) => unconverted(raw, WHY_OTHER_VALUE),
+        None => unconverted(raw, why_not_an_operand(inner).unwrap_or(WHY_OTHER_VALUE)),
+    }
+}
+
+/// The `expression` of a choice `<when>` as a Camel predicate.
+///
+/// * `vars.name == literal`, `vars.name != literal`, with a string,
+///   integer, boolean or `null` literal, or another `vars.name`, on the
+///   other side: the same comparison in Simple, the exchange property on
+///   the left;
+/// * `true` / `false`: a boolean constant.
+///
+/// Everything else is [`Expression::Unconverted`].
+pub fn convert_condition(raw: &str) -> Expression {
+    let inner = whole_expression(raw).unwrap_or_else(|| raw.trim());
+    if inner.contains("#[") {
+        return unconverted(raw, WHY_EMBEDDED);
+    }
+    if inner == "true" || inner == "false" {
+        return Expression::Literal(inner.to_string());
+    }
+
+    let Some((left, operator, right)) = split_comparison(inner) else {
+        let why = match parse_operand(inner) {
+            Some(Operand::Payload | Operand::Variable(_)) => WHY_NOT_BOOLEAN,
+            _ => why_not_an_operand(inner).unwrap_or(WHY_OTHER_CONDITION),
+        };
+        return unconverted(raw, why);
+    };
+
+    let (left, right) = (left.trim(), right.trim());
+    let (left, right) = match (parse_operand(left), parse_operand(right)) {
+        (Some(left), Some(right)) => (left, right),
+        (None, _) => {
+            return unconverted(raw, why_not_an_operand(left).unwrap_or(WHY_OTHER_CONDITION))
+        }
+        (_, None) => {
+            return unconverted(
+                raw,
+                why_not_an_operand(right).unwrap_or(WHY_OTHER_CONDITION),
+            )
+        }
+    };
+    if matches!(left, Operand::Payload) || matches!(right, Operand::Payload) {
+        return unconverted(raw, WHY_PAYLOAD_COMPARED);
+    }
+    if operator != "==" && operator != "!=" {
+        return unconverted(raw, WHY_ORDERING);
+    }
+    // Simple needs the function on the left. `==` and `!=` do not care
+    // which side is which.
+    let (variable, other) = match (left, right) {
+        (Operand::Variable(name), other) | (other, Operand::Variable(name)) => (name, other),
+        _ => return unconverted(raw, WHY_OTHER_CONDITION),
+    };
+    let other = match other {
+        Operand::Variable(name) => exchange_property(&name),
+        Operand::Text(text) => format!("'{text}'"),
+        Operand::Integer(number) => number.to_string(),
+        Operand::Boolean(value) => value.to_string(),
+        Operand::Null => "null".to_string(),
+        Operand::Payload => return unconverted(raw, WHY_PAYLOAD_COMPARED),
+    };
+    Expression::Simple(format!(
+        "{} {operator} {other}",
+        exchange_property(&variable)
+    ))
+}
+
+fn unconverted(raw: &str, reason: &str) -> Expression {
+    Expression::Unconverted {
+        original: raw.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn exchange_property(name: &str) -> String {
+    format!("${{exchangeProperty.{name}}}")
+}
+
+/// The expression inside `raw` if `raw` is one complete `#[...]`
+/// expression: the bracket that closes `#[` is its last character.
+fn whole_expression(raw: &str) -> Option<&str> {
+    let body = raw.trim().strip_prefix("#[")?;
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    for (i, c) in body.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (i + 1 == body.len()).then(|| body[..i].trim());
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+fn parse_operand(operand: &str) -> Option<Operand> {
+    match operand {
+        "payload" | "message.payload" => return Some(Operand::Payload),
+        "true" => return Some(Operand::Boolean(true)),
+        "false" => return Some(Operand::Boolean(false)),
+        "null" => return Some(Operand::Null),
+        _ => {}
+    }
+    if let Some(text) = string_literal(operand) {
+        return Some(Operand::Text(text.to_string()));
+    }
+    if is_number(operand) {
+        // An integer that is the same Java `int` literal; a decimal or a
+        // larger number has no single Java type that is right.
+        return operand.parse::<i32>().ok().map(Operand::Integer);
+    }
+    let selector = operand
+        .strip_prefix("vars")
+        .or_else(|| operand.strip_prefix("flowVars"))?;
+    let name = match selector.strip_prefix('.') {
+        Some(name) => name,
+        None => string_literal(selector.strip_prefix('[')?.strip_suffix(']')?)?,
+    };
+    is_identifier(name).then(|| Operand::Variable(name.to_string()))
+}
+
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Why `operand` (which [`parse_operand`] did not take) is not converted,
+/// if it is one of the references that need more than the migrator knows.
+fn why_not_an_operand(operand: &str) -> Option<&'static str> {
+    let starts_with_any =
+        |prefixes: &[&str]| prefixes.iter().any(|prefix| operand.starts_with(prefix));
+    if starts_with_any(&[
+        "payload.",
+        "payload[",
+        "message.payload.",
+        "message.payload[",
+    ]) {
+        Some(WHY_PAYLOAD_FIELD)
+    } else if starts_with_any(&[
+        "attributes",
+        "message.attributes",
+        "message.inboundProperties",
+    ]) {
+        Some(WHY_ATTRIBUTES)
+    } else if starts_with_any(&["vars.", "vars[", "flowVars.", "flowVars["])
+        && !operand.contains(char::is_whitespace)
+    {
+        Some(WHY_VARIABLE_FIELD)
+    } else {
+        None
+    }
+}
+
+// ── Lenient conversion (logger messages) ────────────────────────────────
 
 /// Convert a MEL expression to Camel Simple expression.
 /// Returns the Simple expression string, or None if too complex.
@@ -359,5 +604,213 @@ mod tests {
     #[test]
     fn interpolate_rejects_a_comparison() {
         assert_eq!(interpolate_mel("is A: #[payload.type == 'A']"), None);
+    }
+
+    // ── convert_value: set-variable / set-payload values ─────────────────
+
+    fn simple(s: &str) -> Expression {
+        Expression::Simple(s.into())
+    }
+
+    fn constant(s: &str) -> Expression {
+        Expression::Constant(s.into())
+    }
+
+    fn literal(s: &str) -> Expression {
+        Expression::Literal(s.into())
+    }
+
+    /// The reason of an unconverted expression; panics if it was converted.
+    fn reason_of(raw: &str, converted: Expression) -> String {
+        match converted {
+            Expression::Unconverted { original, reason } => {
+                assert_eq!(original, raw, "the Mule expression is kept as written");
+                assert!(!reason.is_empty());
+                reason
+            }
+            other => panic!("{raw} must not be converted, got {other:?}"),
+        }
+    }
+
+    /// A value without `#[...]` is a string in Mule, `value="true"` included.
+    #[test]
+    fn value_without_expression_is_a_string_constant() {
+        assert_eq!(
+            convert_value("Hello from MuleForge!"),
+            constant("Hello from MuleForge!")
+        );
+        assert_eq!(convert_value("true"), constant("true"));
+        assert_eq!(convert_value("42"), constant("42"));
+        assert_eq!(convert_value(""), constant(""));
+    }
+
+    #[test]
+    fn value_payload_is_the_message_body() {
+        for raw in ["#[payload]", "#[ payload ]", "#[message.payload]"] {
+            assert_eq!(convert_value(raw), simple("${body}"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn value_variable_is_an_exchange_property() {
+        for raw in [
+            "#[vars.orderId]",
+            "#[vars['orderId']]",
+            r#"#[vars["orderId"]]"#,
+            "#[flowVars.orderId]",
+        ] {
+            assert_eq!(
+                convert_value(raw),
+                simple("${exchangeProperty.orderId}"),
+                "{raw}"
+            );
+        }
+    }
+
+    /// A string stays a string; a number or boolean must not become one.
+    #[test]
+    fn value_literal_keeps_its_type() {
+        assert_eq!(convert_value("#['ok']"), constant("ok"));
+        assert_eq!(convert_value(r#"#["two words"]"#), constant("two words"));
+        assert_eq!(convert_value("#[42]"), literal("42"));
+        assert_eq!(convert_value("#[-1]"), literal("-1"));
+        assert_eq!(convert_value("#[true]"), literal("true"));
+        assert_eq!(convert_value("#[false]"), literal("false"));
+    }
+
+    #[test]
+    fn value_that_reads_into_the_payload_is_not_converted() {
+        for raw in [
+            "#[payload.id]",
+            "#[payload.items[0]]",
+            "#[payload['id']]",
+            "#[message.payload.id]",
+        ] {
+            let reason = reason_of(raw, convert_value(raw));
+            assert!(reason.contains("field of the payload"), "{raw}: {reason}");
+        }
+    }
+
+    #[test]
+    fn value_of_any_other_shape_is_not_converted() {
+        for raw in [
+            "#[now()]",
+            "#[uuid()]",
+            "#['a' ++ vars.b]",
+            "#[vars.order.id]",
+            "#[vars['order-id']]",
+            "#[attributes.headers.host]",
+            "#[attributes.queryParams.id]",
+            "#[null]",
+            "#[3.5]",
+            "#[99999999999]",
+            "#[vars.a == 'x']",
+            "#[output application/json --- {a: 1}]",
+            "#[if (vars.a == 1) 'x' else 'y']",
+            "Hello #[payload]",
+            "#[payload] and #[vars.x]",
+            "#['it's']",
+            "#['$(payload)']",
+            "#['{{secret}}']",
+            "#[payload",
+        ] {
+            reason_of(raw, convert_value(raw));
+        }
+    }
+
+    // ── convert_condition: choice conditions ─────────────────────────────
+
+    #[test]
+    fn condition_compares_a_variable_with_a_literal() {
+        for (raw, expected) in [
+            ("#[vars.type == 'A']", "${exchangeProperty.type} == 'A'"),
+            (r#"#[vars.type != "A"]"#, "${exchangeProperty.type} != 'A'"),
+            ("#[vars.count == 3]", "${exchangeProperty.count} == 3"),
+            (
+                "#[vars.active == true]",
+                "${exchangeProperty.active} == true",
+            ),
+            ("#[vars.id != null]", "${exchangeProperty.id} != null"),
+            ("#[vars.id == null]", "${exchangeProperty.id} == null"),
+            ("#[flowVars.type == 'A']", "${exchangeProperty.type} == 'A'"),
+            ("#[vars['type']=='A']", "${exchangeProperty.type} == 'A'"),
+        ] {
+            assert_eq!(convert_condition(raw), simple(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn condition_compares_two_variables() {
+        assert_eq!(
+            convert_condition("#[vars.owner == vars.user]"),
+            simple("${exchangeProperty.owner} == ${exchangeProperty.user}")
+        );
+    }
+
+    /// Simple needs the function on the left; `==` and `!=` mean the same
+    /// with their sides swapped.
+    #[test]
+    fn condition_with_the_literal_on_the_left_is_turned_around() {
+        assert_eq!(
+            convert_condition("#['A' == vars.type]"),
+            simple("${exchangeProperty.type} == 'A'")
+        );
+        assert_eq!(
+            convert_condition("#[null != vars.id]"),
+            simple("${exchangeProperty.id} != null")
+        );
+    }
+
+    #[test]
+    fn condition_boolean_literal_is_a_boolean_constant() {
+        assert_eq!(convert_condition("#[true]"), literal("true"));
+        assert_eq!(convert_condition("#[false]"), literal("false"));
+    }
+
+    /// The condition of `examples/hello-world`: `${body.type}` would call
+    /// getType() on the body, it does not read a field of a JSON payload.
+    #[test]
+    fn condition_on_a_payload_field_is_not_converted() {
+        let raw = "#[payload.type == 'A']";
+        let reason = reason_of(raw, convert_condition(raw));
+        assert!(reason.contains("field of the payload"), "{reason}");
+    }
+
+    #[test]
+    fn condition_that_compares_the_payload_is_not_converted() {
+        for raw in [
+            "#[payload == 'A']",
+            "#[payload != null]",
+            "#['A' == payload]",
+        ] {
+            let reason = reason_of(raw, convert_condition(raw));
+            assert!(reason.contains("compares the payload"), "{raw}: {reason}");
+        }
+    }
+
+    #[test]
+    fn condition_of_any_other_shape_is_not_converted() {
+        for raw in [
+            "#[vars.count > 3]",
+            "#[vars.count <= vars.limit]",
+            "#[vars.flag]",
+            "#[payload]",
+            "#[vars.a == 'x' and vars.b == 'y']",
+            "#[vars.a == 'x' or vars.b == 'y']",
+            "#[not (vars.a == 'x')]",
+            "#[isEmpty(payload)]",
+            "#[sizeOf(vars.items) == 2]",
+            "#[attributes.queryParams.id == '1']",
+            "#[attributes.headers['x-tenant'] == 'a']",
+            "#[vars.order.id == 1]",
+            "#[vars.a ~= 1]",
+            "#['a' == 'a']",
+            "#[vars.a == 'it's']",
+            "#[vars.a == '${x}']",
+            "#[vars.a == 1.5]",
+            "",
+        ] {
+            reason_of(raw, convert_condition(raw));
+        }
     }
 }

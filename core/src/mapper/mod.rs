@@ -426,50 +426,56 @@ fn map_processor(
 ) -> Vec<RouteStep> {
     let qname = elem.qualified_name();
 
-    // Try rule match first
+    // Try rule match first. A rule with a URI template is the whole
+    // mapping. A rule without one (`set-payload`, `choice-router`, ...)
+    // only names the Camel construct: the built-in mapping below does the
+    // work and records the element's one decision, under the rule's id. The
+    // rule must not report the element as done on its own, the built-in
+    // mapping may find that it is not.
+    let mut rule_id = None;
     if let Some(rule) = find_rule(rules, &elem.namespace, &elem.name) {
-        record_decision(
-            decisions,
-            elem,
-            DecisionStatus::Done,
-            Some(&rule.id),
-            &rule.notes,
-        );
         deps.extend(rule.maven_deps.iter().cloned());
         if let Some(ref uri) = rule.camel_uri_template {
+            record_decision(
+                decisions,
+                elem,
+                DecisionStatus::Done,
+                Some(&rule.id),
+                &rule.notes,
+            );
             return vec![RouteStep::ToUri(rule_endpoint_uri(rule, uri, elem))];
         }
+        rule_id = Some(rule.id.as_str());
     }
 
     // Built-in processor mappings
     match (elem.namespace.as_str(), elem.name.as_str()) {
+        // The value is a string, or an expression that is converted only
+        // if it means the same in Camel whatever the payload is (see
+        // `mel::convert_value`). An unconverted value stays in the step as
+        // `Expression::Unconverted`; the emitter makes the route fail there.
         ("", "set-payload") => {
-            let val = elem.attr("value").unwrap_or("").to_string();
-            record_decision(
+            let expression = crate::mel::convert_value(elem.attr("value").unwrap_or(""));
+            record_value_decision(
                 decisions,
                 elem,
-                DecisionStatus::Done,
-                None,
+                rule_id,
+                &expression,
                 "set-payload -> setBody",
             );
-            vec![RouteStep::SetBody {
-                expression: Expression::Constant(val),
-            }]
+            vec![RouteStep::SetBody { expression }]
         }
         ("", "set-variable") => {
             let name = elem.attr("variableName").unwrap_or("var").to_string();
-            let val = elem.attr("value").unwrap_or("").to_string();
-            record_decision(
+            let expression = crate::mel::convert_value(elem.attr("value").unwrap_or(""));
+            record_value_decision(
                 decisions,
                 elem,
-                DecisionStatus::Done,
-                None,
+                rule_id,
+                &expression,
                 "set-variable -> setProperty",
             );
-            vec![RouteStep::SetProperty {
-                name,
-                expression: Expression::Constant(val),
-            }]
+            vec![RouteStep::SetProperty { name, expression }]
         }
         ("", "logger") | ("", "log") => {
             let raw = elem.attr("message").unwrap_or("");
@@ -483,14 +489,20 @@ fn map_processor(
             // Embedded #[...] expressions become Camel Simple ${...}; if any
             // cannot be converted, keep the original text and flag it.
             let msg = if let Some(converted) = crate::mel::interpolate_mel(raw) {
-                record_decision(decisions, elem, DecisionStatus::Done, None, "logger -> log");
+                record_decision(
+                    decisions,
+                    elem,
+                    DecisionStatus::Done,
+                    rule_id,
+                    "logger -> log",
+                );
                 converted
             } else {
                 record_decision(
                     decisions,
                     elem,
                     DecisionStatus::ManualReview,
-                    None,
+                    rule_id,
                     "logger -> log (message has an unconverted MEL expression)",
                 );
                 raw.to_string()
@@ -500,18 +512,31 @@ fn map_processor(
                 message: msg,
             }]
         }
+        // Mule takes the first `when` whose expression is true, else the
+        // `otherwise`; so does Camel's choice. Every branch is kept, in
+        // order. A condition is converted only if it means the same in
+        // Camel whatever the payload is (see `mel::convert_condition`); one
+        // that is not stays as `Expression::Unconverted`, which the emitter
+        // writes as a predicate that fails when it is evaluated. A `when`
+        // without expression is not converted either: nothing says what it
+        // should match.
         ("", "choice") => {
             let mut whens = Vec::new();
             let mut otherwise = None;
+            let mut unconverted = Vec::new();
             for child in &elem.children {
                 if child.name == "when" {
-                    let expr = child.attr("expression").unwrap_or("true").to_string();
+                    let condition =
+                        crate::mel::convert_condition(child.attr("expression").unwrap_or(""));
+                    if let Expression::Unconverted { original, reason } = &condition {
+                        unconverted.push(format!("{original} ({reason})"));
+                    }
                     let steps: Vec<RouteStep> = child
                         .children
                         .iter()
                         .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
                         .collect();
-                    whens.push((Expression::Simple(expr), steps));
+                    whens.push((condition, steps));
                 } else if child.name == "otherwise" {
                     let steps: Vec<RouteStep> = child
                         .children
@@ -521,13 +546,31 @@ fn map_processor(
                     otherwise = Some(steps);
                 }
             }
-            record_decision(
-                decisions,
-                elem,
-                DecisionStatus::Done,
-                None,
-                "choice -> choice",
-            );
+            if unconverted.is_empty() {
+                record_decision(
+                    decisions,
+                    elem,
+                    DecisionStatus::Done,
+                    rule_id,
+                    "choice -> choice",
+                );
+            } else {
+                record_decision(
+                    decisions,
+                    elem,
+                    DecisionStatus::ManualReview,
+                    rule_id,
+                    &format!(
+                        "choice -> choice; review: {} of {} conditions are not converted. Each \
+                         is emitted as a predicate that fails when it is evaluated, so a \
+                         message that gets as far as that condition fails instead of taking a \
+                         branch by guess: {}",
+                        unconverted.len(),
+                        whens.len(),
+                        unconverted.join("; ")
+                    ),
+                );
+            }
             vec![RouteStep::Choice { whens, otherwise }]
         }
         ("", "scatter-gather") | ("", "split") => {
@@ -542,7 +585,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::Done,
-                None,
+                rule_id,
                 "scatter-gather/split -> split",
             );
             vec![RouteStep::Split {
@@ -563,7 +606,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::Done,
-                None,
+                rule_id,
                 "foreach -> split",
             );
             vec![RouteStep::Split {
@@ -584,7 +627,7 @@ fn map_processor(
                     decisions,
                     elem,
                     DecisionStatus::Done,
-                    None,
+                    rule_id,
                     "flow-ref -> direct endpoint",
                 ),
                 // The target's route starts at the flow's own source, and it
@@ -596,7 +639,7 @@ fn map_processor(
                     decisions,
                     elem,
                     DecisionStatus::ManualReview,
-                    None,
+                    rule_id,
                     &format!(
                         "flow-ref -> direct:{name}; review: {name} is a <flow>, not a \
                          <sub-flow>. Its route does not consume from direct:{name} - add that \
@@ -610,7 +653,7 @@ fn map_processor(
                     decisions,
                     elem,
                     DecisionStatus::ManualReview,
-                    None,
+                    rule_id,
                     &format!(
                         "flow-ref -> direct:{name}; review: no sub-flow route named {name} is \
                          generated, so nothing consumes from direct:{name} and it is unknown \
@@ -634,7 +677,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::ManualReview,
-                None,
+                rule_id,
                 "DataWeave transform requires manual or LLM-assisted conversion",
             );
             vec![RouteStep::RawDsl(format!(
@@ -663,7 +706,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::Done,
-                None,
+                rule_id,
                 "HTTP request -> http endpoint",
             );
             deps.push(MavenDependency {
@@ -682,7 +725,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::Done,
-                None,
+                rule_id,
                 &format!("db:{} -> sql endpoint", elem.name),
             );
             deps.push(MavenDependency {
@@ -701,7 +744,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::Done,
-                None,
+                rule_id,
                 "Kafka publish -> kafka endpoint",
             );
             deps.push(MavenDependency {
@@ -721,7 +764,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::Done,
-                None,
+                rule_id,
                 "JMS publish -> jms endpoint",
             );
             deps.push(MavenDependency {
@@ -745,7 +788,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::Done,
-                None,
+                rule_id,
                 &format!("{} write -> {} endpoint", elem.namespace, proto),
             );
             if proto == "sftp" {
@@ -762,7 +805,7 @@ fn map_processor(
                 decisions,
                 elem,
                 DecisionStatus::ManualReview,
-                None,
+                rule_id,
                 &format!("No mapping for {} - needs manual review", qname),
             );
             vec![RouteStep::RawDsl(format!(
@@ -1130,6 +1173,30 @@ fn mule_placeholders_to_camel(value: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The decision for a step that sets a value (`set-payload`,
+/// `set-variable`): done if the value is converted, flagged if it is not.
+fn record_value_decision(
+    decisions: &mut Vec<MappingDecision>,
+    elem: &MuleElement,
+    rule_id: Option<&str>,
+    value: &Expression,
+    mapping: &str,
+) {
+    match value {
+        Expression::Unconverted { original, reason } => record_decision(
+            decisions,
+            elem,
+            DecisionStatus::ManualReview,
+            rule_id,
+            &format!(
+                "{mapping}; review: the value {original} is not converted ({reason}). The \
+                 route fails at this step until it is replaced"
+            ),
+        ),
+        _ => record_decision(decisions, elem, DecisionStatus::Done, rule_id, mapping),
+    }
 }
 
 fn record_decision(
@@ -2125,5 +2192,298 @@ mappings:
             assert_eq!(source_uri(&consumer, &rules), "kafka:orders-topic");
             assert_eq!(to_uris(&publish, &rules), ["kafka:orders-out"]);
         }
+    }
+
+    // ── Expressions: choice, set-variable, set-payload ──────────────────
+
+    fn steps_and_decisions(
+        e: &MuleElement,
+        rules: &[Rule],
+    ) -> (Vec<RouteStep>, Vec<MappingDecision>) {
+        let mut decisions = Vec::new();
+        let steps = map_processor(e, &[], rules, &mut decisions, &mut Vec::new());
+        (steps, decisions)
+    }
+
+    /// `<when expression="...">` with one set-payload in it.
+    fn when(expression: &str, payload: &str) -> MuleElement {
+        let mut when = elem("", "when", &[("expression", expression)]);
+        when.children = vec![elem("", "set-payload", &[("value", payload)])];
+        when
+    }
+
+    fn otherwise(payload: &str) -> MuleElement {
+        let mut otherwise = elem("", "otherwise", &[]);
+        otherwise.children = vec![elem("", "set-payload", &[("value", payload)])];
+        otherwise
+    }
+
+    fn choice(children: Vec<MuleElement>) -> MuleElement {
+        let mut choice = elem("", "choice", &[]);
+        choice.children = children;
+        choice
+    }
+
+    type Branches = (Vec<(Expression, Vec<RouteStep>)>, Option<Vec<RouteStep>>);
+
+    fn only_choice(steps: Vec<RouteStep>) -> Branches {
+        match <[RouteStep; 1]>::try_from(steps) {
+            Ok([RouteStep::Choice { whens, otherwise }]) => (whens, otherwise),
+            other => panic!("expected one Choice step, got {other:?}"),
+        }
+    }
+
+    /// The body constants a branch sets, to tell the branches apart.
+    fn bodies(steps: &[RouteStep]) -> Vec<&str> {
+        steps
+            .iter()
+            .map(|step| match step {
+                RouteStep::SetBody {
+                    expression: Expression::Constant(text),
+                } => text.as_str(),
+                other => panic!("expected setBody(constant), got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn simple(s: &str) -> Expression {
+        Expression::Simple(s.into())
+    }
+
+    fn is_unconverted(expression: &Expression, mule: &str) -> bool {
+        matches!(expression, Expression::Unconverted { original, .. } if original == mule)
+    }
+
+    #[test]
+    fn choice_with_convertible_conditions_is_done() {
+        let router = choice(vec![
+            when("#[vars.type == 'A']", "a"),
+            when("#[vars.type == 'B']", "b"),
+            otherwise("default"),
+        ]);
+        for rules in shipped_and_builtin_rules() {
+            let (steps, decisions) = steps_and_decisions(&router, &rules);
+            let (whens, otherwise) = only_choice(steps);
+
+            assert_eq!(whens.len(), 2);
+            assert_eq!(whens[0].0, simple("${exchangeProperty.type} == 'A'"));
+            assert_eq!(bodies(&whens[0].1), ["a"]);
+            assert_eq!(whens[1].0, simple("${exchangeProperty.type} == 'B'"));
+            assert_eq!(bodies(&whens[1].1), ["b"]);
+            assert_eq!(bodies(&otherwise.expect("otherwise branch")), ["default"]);
+
+            let choice = decisions_for(&decisions, "choice");
+            assert_eq!(choice.len(), 1, "{choice:?}");
+            assert_eq!(choice[0].status, DecisionStatus::Done);
+        }
+    }
+
+    /// A condition that is not converted keeps its branch (and every other
+    /// branch), is never handed to Camel as an expression, and flags the
+    /// choice. There is no row that still calls the choice done.
+    #[test]
+    fn choice_with_an_unconvertible_condition_is_flagged_and_keeps_every_branch() {
+        let router = choice(vec![
+            when("#[vars.type == 'A']", "a"),
+            when("#[payload.type == 'B']", "b"),
+            otherwise("default"),
+        ]);
+        for rules in shipped_and_builtin_rules() {
+            let (steps, decisions) = steps_and_decisions(&router, &rules);
+            let (whens, otherwise) = only_choice(steps);
+
+            assert_eq!(whens.len(), 2);
+            assert_eq!(whens[0].0, simple("${exchangeProperty.type} == 'A'"));
+            assert_eq!(bodies(&whens[0].1), ["a"]);
+            assert!(
+                is_unconverted(&whens[1].0, "#[payload.type == 'B']"),
+                "{:?}",
+                whens[1].0
+            );
+            assert_eq!(bodies(&whens[1].1), ["b"]);
+            assert_eq!(bodies(&otherwise.expect("otherwise branch")), ["default"]);
+
+            let choice = decisions_for(&decisions, "choice");
+            assert_eq!(choice.len(), 1, "{choice:?}");
+            assert_eq!(choice[0].status, DecisionStatus::ManualReview);
+            let rationale = &choice[0].rationale;
+            assert!(rationale.contains("1 of 2 conditions"), "{rationale}");
+            assert!(rationale.contains("#[payload.type == 'B']"), "{rationale}");
+            assert!(!rationale.contains("#[vars.type == 'A']"), "{rationale}");
+        }
+    }
+
+    #[test]
+    fn choice_without_otherwise_has_no_otherwise_branch() {
+        let router = choice(vec![when("#[vars.type == 'A']", "a")]);
+        let (steps, _) = steps_and_decisions(&router, &[]);
+        let (whens, otherwise) = only_choice(steps);
+        assert_eq!(whens.len(), 1);
+        assert!(otherwise.is_none());
+    }
+
+    /// A `when` without expression used to become a branch that always
+    /// matches. What it should match is unknown: not converted.
+    #[test]
+    fn when_without_expression_is_not_made_to_match_always() {
+        let mut when = elem("", "when", &[]);
+        when.children = vec![elem("", "set-payload", &[("value", "a")])];
+        let (steps, decisions) = steps_and_decisions(&choice(vec![when]), &[]);
+        let (whens, _) = only_choice(steps);
+        assert!(is_unconverted(&whens[0].0, ""), "{:?}", whens[0].0);
+        assert_eq!(
+            decisions_for(&decisions, "choice")[0].status,
+            DecisionStatus::ManualReview
+        );
+    }
+
+    /// The decision of the one step `element` maps to: its expression, and
+    /// the property name for a set-variable.
+    fn set_step(
+        element: &MuleElement,
+        rules: &[Rule],
+    ) -> (Option<String>, Expression, Vec<MappingDecision>) {
+        let (steps, decisions) = steps_and_decisions(element, rules);
+        match <[RouteStep; 1]>::try_from(steps) {
+            Ok([RouteStep::SetProperty { name, expression }]) => {
+                (Some(name), expression, decisions)
+            }
+            Ok([RouteStep::SetBody { expression }]) => (None, expression, decisions),
+            other => panic!("expected one setProperty or setBody step, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_variable_with_an_expression_reads_it_from_the_exchange() {
+        for (value, expected) in [
+            ("#[payload]", simple("${body}")),
+            ("#[vars.other]", simple("${exchangeProperty.other}")),
+            ("#[42]", Expression::Literal("42".into())),
+            ("#['text']", Expression::Constant("text".into())),
+        ] {
+            let set = elem(
+                "",
+                "set-variable",
+                &[("variableName", "original"), ("value", value)],
+            );
+            for rules in shipped_and_builtin_rules() {
+                let (name, expression, decisions) = set_step(&set, &rules);
+                assert_eq!(name.as_deref(), Some("original"));
+                assert_eq!(expression, expected, "{value}");
+                assert_eq!(decisions.len(), 1, "{decisions:?}");
+                assert_eq!(decisions[0].status, DecisionStatus::Done);
+            }
+        }
+    }
+
+    #[test]
+    fn set_variable_with_a_literal_is_a_string_constant() {
+        let set = elem(
+            "",
+            "set-variable",
+            &[("variableName", "enriched"), ("value", "true")],
+        );
+        for rules in shipped_and_builtin_rules() {
+            let (name, expression, decisions) = set_step(&set, &rules);
+            assert_eq!(name.as_deref(), Some("enriched"));
+            assert_eq!(expression, Expression::Constant("true".into()));
+            assert_eq!(decisions.len(), 1, "{decisions:?}");
+            assert_eq!(decisions[0].status, DecisionStatus::Done);
+        }
+    }
+
+    #[test]
+    fn set_variable_with_an_unconvertible_expression_is_flagged() {
+        let set = elem(
+            "",
+            "set-variable",
+            &[("variableName", "id"), ("value", "#[payload.id]")],
+        );
+        for rules in shipped_and_builtin_rules() {
+            let (name, expression, decisions) = set_step(&set, &rules);
+            assert_eq!(name.as_deref(), Some("id"));
+            assert!(
+                is_unconverted(&expression, "#[payload.id]"),
+                "{expression:?}"
+            );
+            assert_eq!(decisions.len(), 1, "{decisions:?}");
+            assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+            assert!(
+                decisions[0].rationale.contains("#[payload.id]"),
+                "{}",
+                decisions[0].rationale
+            );
+        }
+    }
+
+    #[test]
+    fn set_payload_with_an_expression_a_literal_and_an_unconvertible_expression() {
+        for (value, expected, status) in [
+            (
+                "#[vars.original]",
+                Some(simple("${exchangeProperty.original}")),
+                DecisionStatus::Done,
+            ),
+            ("#[payload]", Some(simple("${body}")), DecisionStatus::Done),
+            (
+                "Routed to handler A",
+                Some(Expression::Constant("Routed to handler A".into())),
+                DecisionStatus::Done,
+            ),
+            ("#[now()]", None, DecisionStatus::ManualReview),
+            (
+                "#[output application/json --- {a: payload.b}]",
+                None,
+                DecisionStatus::ManualReview,
+            ),
+        ] {
+            let set = elem("", "set-payload", &[("value", value)]);
+            for rules in shipped_and_builtin_rules() {
+                let (name, expression, decisions) = set_step(&set, &rules);
+                assert_eq!(name, None);
+                match &expected {
+                    Some(expected) => assert_eq!(&expression, expected, "{value}"),
+                    None => assert!(is_unconverted(&expression, value), "{expression:?}"),
+                }
+                assert_eq!(decisions.len(), 1, "{decisions:?}");
+                assert_eq!(decisions[0].status, status, "{value}");
+                if status == DecisionStatus::ManualReview {
+                    assert!(
+                        decisions[0].rationale.contains(value),
+                        "{}",
+                        decisions[0].rationale
+                    );
+                }
+            }
+        }
+    }
+
+    /// A rule without URI template (`set-payload`, `choice-router`, ...)
+    /// only names the Camel construct; the built-in mapping does the work.
+    /// The element gets one decision, under the rule's id, with the status
+    /// the built-in mapping found - not a second row that says "done".
+    #[test]
+    fn rule_without_uri_template_does_not_add_a_done_row_of_its_own() {
+        let [shipped, _] = shipped_and_builtin_rules();
+
+        let set = elem("", "set-payload", &[("value", "#[now()]")]);
+        let (_, decisions) = steps_and_decisions(&set, &shipped);
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].rule_id.as_deref(), Some("set-payload"));
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+
+        let set = elem("", "set-payload", &[("value", "ok")]);
+        let (_, decisions) = steps_and_decisions(&set, &shipped);
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].rule_id.as_deref(), Some("set-payload"));
+        assert_eq!(decisions[0].status, DecisionStatus::Done);
+
+        // A rule with URI template still decides on its own.
+        let rules = rules_from_yaml(PARAM_RULES);
+        let send = elem("x", "send", &[("name", "n")]);
+        let (_, decisions) = steps_and_decisions(&send, &rules);
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].rule_id.as_deref(), Some("x-send"));
+        assert_eq!(decisions[0].status, DecisionStatus::Done);
     }
 }
