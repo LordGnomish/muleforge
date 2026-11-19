@@ -37,6 +37,11 @@ const WHY_ORDERING: &str = "it compares with <, >, <= or >=: how two values are 
      on their types (number or text), which are not known to the migrator";
 const WHY_EMBEDDED: &str = "it mixes text and #[...] expressions, or is not one complete \
      #[...] expression";
+const WHY_PROPERTY_PLACEHOLDER: &str = "it contains a Mule property placeholder (${key}), \
+     which Mule replaces with the value of the property when the application starts, and the \
+     property is not in the properties files of the project; as a constant the route would hand \
+     on the text ${key} itself. The usual replacement is a Camel property placeholder \
+     ({{key}}), resolved from application.properties; it is not written automatically";
 const WHY_OTHER_VALUE: &str = "it is not one of the shapes that are converted: payload, \
      vars.name, or a string, integer or boolean literal";
 const WHY_OTHER_CONDITION: &str = "it is not one of the shapes that are converted: vars.name \
@@ -63,7 +68,9 @@ enum Operand {
 
 /// The value of a `set-variable` / `set-payload` as a Camel expression.
 ///
-/// * no `#[...]`: a string in Mule, a string constant in Camel;
+/// * no `#[...]`: a string in Mule, a string constant in Camel - unless
+///   it still has a `${key}` property placeholder in it (one the normalizer
+///   could not resolve), which Mule would replace at startup;
 /// * `#[payload]`: the message body, `${body}`;
 /// * `#[vars.name]`: the exchange property `name` (`set-variable` is
 ///   `setProperty`), `${exchangeProperty.name}`;
@@ -72,6 +79,9 @@ enum Operand {
 /// Everything else is [`Expression::Unconverted`].
 pub fn convert_value(raw: &str) -> Expression {
     if !raw.contains("#[") {
+        if raw.contains("${") {
+            return unconverted(raw, WHY_PROPERTY_PLACEHOLDER);
+        }
         return Expression::Constant(raw.to_string());
     }
     let Some(inner) = whole_expression(raw) else {
