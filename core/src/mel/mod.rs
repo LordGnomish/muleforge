@@ -656,6 +656,36 @@ mod tests {
         }
     }
 
+    /// `${key}` in a value without `#[...]` is a property placeholder: Mule
+    /// puts the value of the property there when the application starts.
+    /// (The normalizer has already replaced the placeholders it could
+    /// resolve from the properties files of the project.) As a string
+    /// constant the flow would hand on the text `${key}` itself.
+    #[test]
+    fn value_with_a_property_placeholder_is_not_converted() {
+        for raw in [
+            "${app.greeting}",
+            "Hello ${app.name}!",
+            "${secure::db.password}",
+            "${a}${b}",
+        ] {
+            let reason = reason_of(raw, convert_value(raw));
+            assert!(
+                reason.contains("Mule property placeholder"),
+                "{raw}: {reason}"
+            );
+            assert!(
+                reason.contains("Camel property placeholder"),
+                "{raw}: {reason}"
+            );
+            assert!(reason.contains("{{key}}"), "{raw}: {reason}");
+        }
+        // A dollar sign or a brace alone is text.
+        for raw in ["costs $5", "{braces}", "$ {not one}", "100$"] {
+            assert_eq!(convert_value(raw), constant(raw), "{raw}");
+        }
+    }
+
     /// A value without `#[...]` is a string in Mule, `value="true"` included.
     #[test]
     fn value_without_expression_is_a_string_constant() {

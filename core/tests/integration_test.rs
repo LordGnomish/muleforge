@@ -1247,3 +1247,92 @@ async fn variable_comparison_does_not_convert_types_and_says_when_it_rests_on_an
          flow aliasFlow from #[payload]. Check the comparison)"
     );
 }
+
+/// `value="${app.greeting}"` is a property placeholder, which Mule resolves
+/// when the application starts. One the migration could not resolve from
+/// the properties of the project used to be emitted as the string constant
+/// `"${app.greeting}"` and reported as done. It is not converted: the step
+/// fails, the report says why and names the Camel replacement. A
+/// placeholder that is resolved from the project's properties is still the
+/// constant it stands for.
+#[tokio::test]
+async fn unresolved_property_placeholder_in_a_value_is_not_emitted_as_a_constant() {
+    let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <flow name="greetFlow">
+        <http:listener config-ref="HTTP_config" path="/greet" allowedMethods="GET" />
+        <set-variable variableName="greeting" value="${app.greeting}" />
+        <set-variable variableName="name" value="${app.name}" />
+        <set-payload value="Hello ${app.missing}" />
+    </flow>
+</mule>"##;
+    let dir = make_project(xml);
+    let resources = dir.path().join("src/main/resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(
+        resources.join("application.properties"),
+        "app.name=orders\n",
+    )
+    .unwrap();
+
+    let project = parser::parse_project(dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &[], None).await.unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+    let java = std::fs::read_to_string(
+        out.path()
+            .join("src/main/java/generated/routes/GreetFlowRoute.java"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        code_lines(&java)
+            .into_iter()
+            .skip_while(|l| !l.starts_with("from("))
+            .collect::<Vec<_>>(),
+        [
+            r#"from("platform-http:/greet?httpMethodRestrict=GET")"#,
+            r#".routeId("greetFlow")"#,
+            r#".throwException(new UnsupportedOperationException("setProperty(\"greeting\") value not migrated: ${app.greeting}"))"#,
+            r#".setProperty("name", constant("orders"))"#,
+            r#".throwException(new UnsupportedOperationException("setBody value not migrated: Hello ${app.missing}"))"#,
+            ";",
+            "}",
+            "}",
+        ],
+        "{java}"
+    );
+    assert!(
+        java.contains(
+            r#"// TODO: review this setProperty("greeting"), its value is not converted (Mule: ${app.greeting})"#
+        ),
+        "{java}"
+    );
+
+    let statuses: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element.starts_with("set-"))
+        .map(|d| (d.mule_element.as_str(), d.status))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("set-variable", report::DecisionStatus::ManualReview),
+            ("set-variable", report::DecisionStatus::Done),
+            ("set-payload", report::DecisionStatus::ManualReview),
+        ]
+    );
+    let greeting = decisions
+        .iter()
+        .find(|d| d.mule_element == "set-variable")
+        .unwrap();
+    assert!(
+        greeting.rationale.contains("${app.greeting}")
+            && greeting.rationale.contains("Mule property placeholder")
+            && greeting.rationale.contains("{{key}}"),
+        "{}",
+        greeting.rationale
+    );
+}
