@@ -87,8 +87,59 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
 
     java.push_str("            ;\n");
     java.push_str("    }\n");
+    if compares_a_number(route) {
+        java.push_str(IS_NUMBER_METHOD);
+    }
     java.push_str("}\n");
     java
+}
+
+/// The method the predicate of a comparison with a number calls (see
+/// [`property_predicate`]); written into a route class that has one.
+///
+/// Mule compares numbers by value, whatever their Java type, and a number
+/// never equals a string or a boolean. No conversion is involved: a
+/// `BigDecimal` or `BigInteger` is compared as it is, every other `Number`
+/// has to give the expected value both as a `double` (no fraction is cut
+/// off) and as a `long` (no precision is lost above 2^53).
+const IS_NUMBER_METHOD: &str = r#"
+    // Whether value is a number equal to expected, as Mule compares numbers:
+    // by value, whatever the Java type (Integer 3, Long 3, Double 3.0 and
+    // BigDecimal 3.0 all equal 3), and never a String ("3") or a Boolean.
+    private static boolean isNumber(Object value, long expected) {
+        if (value instanceof java.math.BigDecimal decimal) {
+            return decimal.compareTo(java.math.BigDecimal.valueOf(expected)) == 0;
+        }
+        if (value instanceof java.math.BigInteger integer) {
+            return integer.equals(java.math.BigInteger.valueOf(expected));
+        }
+        return value instanceof Number number
+                && number.doubleValue() == expected
+                && number.longValue() == expected;
+    }
+"#;
+
+/// Whether a choice of the route (its exception clauses included) compares
+/// a property with a number, so that the class needs [`IS_NUMBER_METHOD`].
+fn compares_a_number(route: &CamelRoute) -> bool {
+    fn in_steps(steps: &[RouteStep]) -> bool {
+        steps.iter().any(|step| match step {
+            RouteStep::Choice { whens, otherwise } => {
+                whens.iter().any(|(condition, steps)| {
+                    matches!(
+                        condition,
+                        Expression::PropertyEquals {
+                            value: ComparedValue::Integer(_),
+                            ..
+                        }
+                    ) || in_steps(steps)
+                }) || otherwise.as_deref().is_some_and(in_steps)
+            }
+            RouteStep::Split { steps, .. } => in_steps(steps),
+            _ => false,
+        })
+    }
+    in_steps(&route.steps) || route.on_exceptions.iter().any(|eh| in_steps(&eh.steps))
 }
 
 /// Whether the route is written with `.errorHandler(noErrorHandler())`.
@@ -252,13 +303,25 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
         RouteStep::Choice { whens, otherwise } => {
             java.push_str(&format!("{}.choice()\n", pad));
             for (expr, steps) in whens {
-                if let Expression::Unconverted { original, reason } = expr {
-                    push_todo(
+                match expr {
+                    Expression::Unconverted { original, reason } => push_todo(
                         java,
                         &format!("{pad}    "),
                         &format!("review this condition, it is not converted (Mule: {original})"),
                         &[reason, UNCONVERTED_CONDITION_FAILS],
-                    );
+                    ),
+                    Expression::PropertyEquals {
+                        original, review, ..
+                    } if !review.is_empty() => {
+                        let notes: Vec<&str> = review.iter().map(String::as_str).collect();
+                        push_todo(
+                            java,
+                            &format!("{pad}    "),
+                            &format!("review this condition (Mule: {original})"),
+                            &notes,
+                        );
+                    }
+                    _ => {}
                 }
                 java.push_str(&format!("{}    .when({})\n", pad, expr_to_java(expr)));
                 for s in steps {
@@ -428,6 +491,51 @@ fn expr_to_java(expr: &Expression) -> String {
             "exchange -> {{ throw new UnsupportedOperationException(\"{}\"); }}",
             escape_java(&format!("choice condition not migrated: {original}"))
         ),
+        Expression::PropertyEquals {
+            name,
+            value,
+            negated,
+            ..
+        } => property_predicate(name, value, *negated),
+    }
+}
+
+/// The Java predicate for "exchange property `name` equals `value`"
+/// (`negated`: does not equal), with Mule's equality: no type is converted.
+///
+/// It is a lambda on the property's Java value, not a Simple expression:
+/// Simple's `==` converts one side to the type of the other, so the string
+/// `"true"` would equal `true` and `"3"` would equal 3.
+///
+/// * a string: `"A".equals(value)` is true only for a `String` with that
+///   text (never for null);
+/// * a boolean: `Boolean.TRUE.equals(value)` is true only for a `Boolean`;
+/// * a number: `isNumber(value, 3)`, see [`IS_NUMBER_METHOD`];
+/// * null: the property is not set, or set to null.
+///
+/// "Does not equal" is the same test with `!` in front (`!= null` for
+/// null), so it is the exact opposite for every value.
+fn property_predicate(name: &str, value: &ComparedValue, negated: bool) -> String {
+    let property = format!("exchange.getProperty(\"{}\")", escape_java(name));
+    let not = if negated { "!" } else { "" };
+    match value {
+        ComparedValue::Text(text) => {
+            format!(
+                "exchange -> {not}\"{}\".equals({property})",
+                escape_java(text)
+            )
+        }
+        ComparedValue::Boolean(value) => {
+            let constant = if *value { "TRUE" } else { "FALSE" };
+            format!("exchange -> {not}Boolean.{constant}.equals({property})")
+        }
+        ComparedValue::Integer(number) => {
+            format!("exchange -> {not}isNumber({property}, {number})")
+        }
+        ComparedValue::Null => {
+            let operator = if negated { "!=" } else { "==" };
+            format!("exchange -> {property} {operator} null")
+        }
     }
 }
 
@@ -1380,6 +1488,27 @@ mod tests {
         }
     }
 
+    fn property_equals(name: &str, value: ComparedValue, negated: bool) -> Expression {
+        Expression::PropertyEquals {
+            original: "#[mule]".into(),
+            name: name.into(),
+            value,
+            negated,
+            review: vec![],
+        }
+    }
+
+    /// One `when` per condition, each with the body `x`.
+    fn choice_of(conditions: Vec<Expression>) -> RouteStep {
+        RouteStep::Choice {
+            whens: conditions
+                .into_iter()
+                .map(|condition| (condition, vec![set_body("x")]))
+                .collect(),
+            otherwise: None,
+        }
+    }
+
     /// The branch stays where it is; its condition is a predicate that
     /// throws, so a message that gets that far fails instead of being
     /// routed by a guess. Branches in front of it work as before.
@@ -1388,7 +1517,7 @@ mod tests {
         let java = http_route(vec![RouteStep::Choice {
             whens: vec![
                 (
-                    Expression::Simple("${exchangeProperty.type} == 'A'".into()),
+                    property_equals("type", ComparedValue::Text("A".into()), false),
                     vec![set_body("a")],
                 ),
                 (
@@ -1402,7 +1531,7 @@ mod tests {
             java.contains(
                 r#"
             .choice()
-                .when(simple("${exchangeProperty.type} == 'A'"))
+                .when(exchange -> "A".equals(exchange.getProperty("type")))
                     .setBody(constant("a"))
                 // TODO: review this condition, it is not converted (Mule: #[payload.type == 'B'])
                 // - the payload type is not known
@@ -1542,5 +1671,174 @@ mod tests {
         for line in java.lines().map(str::trim) {
             assert!(!line.starts_with(".stop()"), "{java}");
         }
+    }
+
+    // ── Exact comparison of an exchange property ────────────────────────
+
+    /// Mule's `==` does not convert types, Simple's does. So the predicate
+    /// is Java on the value of the property: `equals` of a `String` or a
+    /// `Boolean` constant is true only for a value of that type, and `!=`
+    /// is the same test negated.
+    #[test]
+    fn property_comparison_is_a_java_predicate_that_does_not_convert_types() {
+        let java = http_route(vec![choice_of(vec![
+            property_equals("type", ComparedValue::Text("A".into()), false),
+            property_equals("type", ComparedValue::Text("A".into()), true),
+            property_equals("active", ComparedValue::Boolean(true), false),
+            property_equals("active", ComparedValue::Boolean(false), true),
+            property_equals("count", ComparedValue::Integer(3), false),
+            property_equals("count", ComparedValue::Integer(-1), true),
+            property_equals("id", ComparedValue::Null, false),
+            property_equals("id", ComparedValue::Null, true),
+        ])]);
+        let whens: Vec<&str> = java
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with(".when("))
+            .collect();
+        assert_eq!(
+            whens,
+            [
+                r#".when(exchange -> "A".equals(exchange.getProperty("type")))"#,
+                r#".when(exchange -> !"A".equals(exchange.getProperty("type")))"#,
+                r#".when(exchange -> Boolean.TRUE.equals(exchange.getProperty("active")))"#,
+                r#".when(exchange -> !Boolean.FALSE.equals(exchange.getProperty("active")))"#,
+                r#".when(exchange -> isNumber(exchange.getProperty("count"), 3))"#,
+                r#".when(exchange -> !isNumber(exchange.getProperty("count"), -1))"#,
+                r#".when(exchange -> exchange.getProperty("id") == null)"#,
+                r#".when(exchange -> exchange.getProperty("id") != null)"#,
+            ],
+            "{java}"
+        );
+        assert!(!java.contains("simple("), "{java}");
+        assert!(!java.contains("TODO"), "{java}");
+    }
+
+    /// A number equals a number of any Java type with the same value, and
+    /// nothing else. The method that decides it is part of the class that
+    /// calls it, and only of such a class.
+    #[test]
+    fn class_that_compares_a_number_gets_the_method_that_does_it() {
+        let number = || property_equals("count", ComparedValue::Integer(3), false);
+        let method = r#"
+            ;
+    }
+
+    // Whether value is a number equal to expected, as Mule compares numbers:
+    // by value, whatever the Java type (Integer 3, Long 3, Double 3.0 and
+    // BigDecimal 3.0 all equal 3), and never a String ("3") or a Boolean.
+    private static boolean isNumber(Object value, long expected) {
+        if (value instanceof java.math.BigDecimal decimal) {
+            return decimal.compareTo(java.math.BigDecimal.valueOf(expected)) == 0;
+        }
+        if (value instanceof java.math.BigInteger integer) {
+            return integer.equals(java.math.BigInteger.valueOf(expected));
+        }
+        return value instanceof Number number
+                && number.doubleValue() == expected
+                && number.longValue() == expected;
+    }
+}
+"#;
+
+        let direct = http_route(vec![choice_of(vec![number()])]);
+        assert!(direct.ends_with(method), "{direct}");
+
+        // Nested in a branch, in a split and in an exception clause.
+        let nested = http_route(vec![RouteStep::Choice {
+            whens: vec![(
+                Expression::Literal("true".into()),
+                vec![RouteStep::Split {
+                    expression: Expression::Simple("${body}".into()),
+                    parallel: false,
+                    aggregation_strategy: None,
+                    steps: vec![choice_of(vec![number()])],
+                }],
+            )],
+            otherwise: None,
+        }]);
+        assert!(nested.ends_with(method), "{nested}");
+
+        let otherwise = http_route(vec![RouteStep::Choice {
+            whens: vec![],
+            otherwise: Some(vec![choice_of(vec![number()])]),
+        }]);
+        assert!(otherwise.ends_with(method), "{otherwise}");
+
+        let handler = generate_route_builder(
+            "OrdersRoute",
+            &CamelRoute {
+                id: "orders".into(),
+                source: RouteEndpoint::Uri("platform-http:/orders".into()),
+                steps: vec![],
+                on_exceptions: vec![ExceptionHandler {
+                    exception_classes: vec!["java.lang.Exception".into()],
+                    handled: true,
+                    steps: vec![choice_of(vec![number()])],
+                }],
+            },
+        );
+        assert!(handler.ends_with(method), "{handler}");
+
+        let without = http_route(vec![choice_of(vec![
+            property_equals("type", ComparedValue::Text("A".into()), false),
+            property_equals("active", ComparedValue::Boolean(true), false),
+            property_equals("id", ComparedValue::Null, true),
+        ])]);
+        assert!(!without.contains("isNumber"), "{without}");
+        assert!(without.ends_with("            ;\n    }\n}\n"), "{without}");
+    }
+
+    /// A comparison that rests on an assumption is emitted all the same,
+    /// with what has to be checked in a TODO in front of it. The notes and
+    /// the Mule expression come from the Mule XML and stay in the comment.
+    #[test]
+    fn property_comparison_to_review_gets_a_todo_and_is_still_emitted() {
+        let java = http_route(vec![choice_of(vec![
+            Expression::PropertyEquals {
+                original: "#[vars.kind == 'A']".into(),
+                name: "kind".into(),
+                value: ComparedValue::Text("A".into()),
+                negated: false,
+                review: vec![
+                    "first note".into(),
+                    "second note */\r.stop() C:\\users".into(),
+                ],
+            },
+            property_equals("kind", ComparedValue::Text("B".into()), false),
+        ])]);
+        assert!(
+            java.contains(
+                r#"
+            .choice()
+                // TODO: review this condition (Mule: #[vars.kind == 'A'])
+                // - first note
+                // - second note */
+                // .stop() C:\\users
+                .when(exchange -> "A".equals(exchange.getProperty("kind")))
+                    .setBody(constant("x"))
+                .when(exchange -> "B".equals(exchange.getProperty("kind")))
+                    .setBody(constant("x"))
+            .endChoice()
+"#
+            ),
+            "{java}"
+        );
+    }
+
+    /// The text and the property name end up in Java string literals.
+    #[test]
+    fn property_comparison_escapes_what_it_puts_into_string_literals() {
+        let java = http_route(vec![choice_of(vec![property_equals(
+            "a\"b",
+            ComparedValue::Text("say \"hi\" C:\\users\n${x} {{y}}".into()),
+            false,
+        )])]);
+        assert!(
+            java.contains(
+                r#".when(exchange -> "say \"hi\" C:\\users\n${x} {{y}}".equals(exchange.getProperty("a\"b")))"#
+            ),
+            "{java}"
+        );
     }
 }

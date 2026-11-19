@@ -111,6 +111,43 @@ pub enum Expression {
         original: String,
         reason: String,
     },
+    /// A Mule condition `vars.name == value` / `vars.name != value` with a
+    /// literal value, as an exact comparison of the exchange property
+    /// `name`: Mule's `==` does not convert types, so the property equals
+    /// the value only if it holds a value of that type (see
+    /// [`ComparedValue`]); `negated` is `!=`, the exact opposite.
+    ///
+    /// The emitter writes it as a Java predicate on the property, not in
+    /// Simple, whose `==` converts one side to the type of the other.
+    ///
+    /// `review` holds what a person has to check before relying on it (for
+    /// example that the variable is also set from something that is not a
+    /// literal). The predicate is emitted either way; with a note the
+    /// emitter puts a `TODO` in front of it, quoting `original`, the Mule
+    /// expression as written.
+    PropertyEquals {
+        original: String,
+        name: String,
+        value: ComparedValue,
+        negated: bool,
+        review: Vec<String>,
+    },
+}
+
+/// The literal an exchange property is compared with in
+/// [`Expression::PropertyEquals`], and when the property equals it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComparedValue {
+    /// The property holds a `java.lang.String` with this text.
+    Text(String),
+    /// The property holds a `java.lang.Number` of any type with this
+    /// value: `Integer` 3, `Long` 3, `Double` 3.0 and `BigDecimal` 3.0 all
+    /// equal 3; the string `"3"` does not.
+    Integer(i32),
+    /// The property holds a `java.lang.Boolean` with this value.
+    Boolean(bool),
+    /// The property is not set, or set to null.
+    Null,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
