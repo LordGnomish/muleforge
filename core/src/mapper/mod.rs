@@ -9,6 +9,20 @@ use crate::llm::LlmProvider;
 use crate::report::{DecisionStatus, MappingDecision};
 use crate::Result;
 
+mod variables;
+
+/// What the mapping of a processor can look at beyond the processor: the
+/// rest of the application.
+#[derive(Clone, Copy, Default)]
+struct App<'a> {
+    /// The flows and sub-flows of the project, as they are mapped to
+    /// routes: what a `flow-ref` can point at.
+    flows: &'a [crate::ast::mule_ast::MuleFlow],
+    /// The other top-level elements (a global error handler, ...), which
+    /// are not migrated.
+    globals: &'a [MuleElement],
+}
+
 pub struct Rule {
     pub id: String,
     pub mule_ns: String,
@@ -148,13 +162,17 @@ pub async fn map_project(
         version: None,
     });
 
+    let app = App {
+        flows: &project.flows,
+        globals: &project.globals,
+    };
     for flow in &project.flows {
         if flow.is_sub_flow {
             // Sub-flows map to direct: endpoints
-            let route = map_sub_flow(flow, &project.flows, rules, &mut decisions, &mut all_deps);
+            let route = map_sub_flow(flow, app, rules, &mut decisions, &mut all_deps);
             camel.routes.push(route);
         } else {
-            let route = map_flow(flow, &project.flows, rules, &mut decisions, &mut all_deps);
+            let route = map_flow(flow, app, rules, &mut decisions, &mut all_deps);
             camel.routes.push(route);
         }
     }
@@ -211,7 +229,7 @@ fn steps_use_direct(steps: &[RouteStep]) -> bool {
 
 fn map_flow(
     flow: &crate::ast::mule_ast::MuleFlow,
-    flows: &[crate::ast::mule_ast::MuleFlow],
+    app: App<'_>,
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -225,14 +243,14 @@ fn map_flow(
             source = map_source(proc, rules, decisions, deps);
             continue;
         }
-        let step = map_processor(proc, flows, rules, decisions, deps);
+        let step = map_processor(proc, app, rules, decisions, deps);
         steps.extend(step);
     }
 
     let on_exceptions = flow
         .error_handlers
         .iter()
-        .flat_map(|eh| map_error_handler(eh, flows, rules, decisions, deps))
+        .flat_map(|eh| map_error_handler(eh, app, rules, decisions, deps))
         .collect();
 
     CamelRoute {
@@ -256,7 +274,7 @@ fn map_flow(
 /// back to the calling route and to that route's clauses.
 fn map_sub_flow(
     flow: &crate::ast::mule_ast::MuleFlow,
-    flows: &[crate::ast::mule_ast::MuleFlow],
+    app: App<'_>,
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -264,7 +282,7 @@ fn map_sub_flow(
     let steps: Vec<RouteStep> = flow
         .processors
         .iter()
-        .flat_map(|p| map_processor(p, flows, rules, decisions, deps))
+        .flat_map(|p| map_processor(p, app, rules, decisions, deps))
         .collect();
 
     CamelRoute {
@@ -415,11 +433,11 @@ fn map_source(
 
 /// Map one message processor to route steps.
 ///
-/// `flows` are the flows and sub-flows of the project, as they are mapped
-/// to routes: what a `flow-ref` can point at.
+/// `app` is the application the processor is part of: what a `flow-ref`
+/// can point at, and what sets the variables a condition compares.
 fn map_processor(
     elem: &MuleElement,
-    flows: &[crate::ast::mule_ast::MuleFlow],
+    app: App<'_>,
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -515,38 +533,81 @@ fn map_processor(
         // Mule takes the first `when` whose expression is true, else the
         // `otherwise`; so does Camel's choice. Every branch is kept, in
         // order. A condition is converted only if it means the same in
-        // Camel whatever the payload is (see `mel::convert_condition`); one
+        // Camel whatever the values are (see `mel::convert_condition`); one
         // that is not stays as `Expression::Unconverted`, which the emitter
         // writes as a predicate that fails when it is evaluated. A `when`
         // without expression is not converted either: nothing says what it
         // should match.
+        //
+        // A comparison of a variable is converted to a predicate on the
+        // exchange property that is exact for the value the property
+        // holds. Whether that is the value Mule's variable holds depends
+        // on what sets the variable (see `variable_review`): if that is
+        // not known to be the same, the predicate is emitted all the same
+        // and the choice is flagged with what has to be checked.
         ("", "choice") => {
             let mut whens = Vec::new();
             let mut otherwise = None;
             let mut unconverted = Vec::new();
+            let mut assumed = Vec::new();
             for child in &elem.children {
                 if child.name == "when" {
-                    let condition =
+                    let mut condition =
                         crate::mel::convert_condition(child.attr("expression").unwrap_or(""));
-                    if let Expression::Unconverted { original, reason } = &condition {
-                        unconverted.push(format!("{original} ({reason})"));
+                    match &mut condition {
+                        Expression::Unconverted { original, reason } => {
+                            unconverted.push(format!("{original} ({reason})"));
+                        }
+                        Expression::PropertyEquals {
+                            original,
+                            name,
+                            review,
+                            ..
+                        } => {
+                            review.extend(variable_review(app, name));
+                            if !review.is_empty() {
+                                assumed.push(format!("{original} ({})", review.join("; ")));
+                            }
+                        }
+                        _ => {}
                     }
                     let steps: Vec<RouteStep> = child
                         .children
                         .iter()
-                        .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
+                        .flat_map(|c| map_processor(c, app, rules, decisions, deps))
                         .collect();
                     whens.push((condition, steps));
                 } else if child.name == "otherwise" {
                     let steps: Vec<RouteStep> = child
                         .children
                         .iter()
-                        .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
+                        .flat_map(|c| map_processor(c, app, rules, decisions, deps))
                         .collect();
                     otherwise = Some(steps);
                 }
             }
-            if unconverted.is_empty() {
+            let mut review = Vec::new();
+            if !unconverted.is_empty() {
+                review.push(format!(
+                    "{} of {} conditions are not converted. Each is emitted as a predicate \
+                     that fails when it is evaluated, so a message that gets as far as that \
+                     condition fails instead of taking a branch by guess: {}",
+                    unconverted.len(),
+                    whens.len(),
+                    unconverted.join("; ")
+                ));
+            }
+            if !assumed.is_empty() {
+                review.push(format!(
+                    "{} of {} conditions are converted to an exact comparison of the exchange \
+                     property, which is Mule's result only on an assumption that has to be \
+                     checked: {}",
+                    assumed.len(),
+                    whens.len(),
+                    assumed.join("; ")
+                ));
+            }
+            if review.is_empty() {
                 record_decision(
                     decisions,
                     elem,
@@ -560,15 +621,7 @@ fn map_processor(
                     elem,
                     DecisionStatus::ManualReview,
                     rule_id,
-                    &format!(
-                        "choice -> choice; review: {} of {} conditions are not converted. Each \
-                         is emitted as a predicate that fails when it is evaluated, so a \
-                         message that gets as far as that condition fails instead of taking a \
-                         branch by guess: {}",
-                        unconverted.len(),
-                        whens.len(),
-                        unconverted.join("; ")
-                    ),
+                    &format!("choice -> choice; review: {}", review.join(". ")),
                 );
             }
             vec![RouteStep::Choice { whens, otherwise }]
@@ -579,7 +632,7 @@ fn map_processor(
             let steps: Vec<RouteStep> = elem
                 .children
                 .iter()
-                .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
+                .flat_map(|c| map_processor(c, app, rules, decisions, deps))
                 .collect();
             record_decision(
                 decisions,
@@ -600,7 +653,7 @@ fn map_processor(
             let steps: Vec<RouteStep> = elem
                 .children
                 .iter()
-                .flat_map(|c| map_processor(c, flows, rules, decisions, deps))
+                .flat_map(|c| map_processor(c, app, rules, decisions, deps))
                 .collect();
             record_decision(
                 decisions,
@@ -622,7 +675,7 @@ fn map_processor(
         // `map_sub_flow`), so only a flow-ref to a sub-flow is done.
         ("", "flow-ref") => {
             let name = elem.attr("name").unwrap_or("unknown").to_string();
-            match flows.iter().find(|f| f.name == name) {
+            match app.flows.iter().find(|f| f.name == name) {
                 Some(target) if target.is_sub_flow => record_decision(
                     decisions,
                     elem,
@@ -847,7 +900,7 @@ const ANY_EXCEPTION: &str = "java.lang.Exception";
 /// review, in the report and with a TODO in the generated clause.
 fn map_error_handler(
     eh: &MuleElement,
-    flows: &[crate::ast::mule_ast::MuleFlow],
+    app: App<'_>,
     rules: &[Rule],
     decisions: &mut Vec<MappingDecision>,
     deps: &mut Vec<MavenDependency>,
@@ -960,7 +1013,7 @@ fn map_error_handler(
             child
                 .children
                 .iter()
-                .flat_map(|c| map_processor(c, flows, rules, decisions, deps)),
+                .flat_map(|c| map_processor(c, app, rules, decisions, deps)),
         );
 
         let clause = if classes.is_empty() {
@@ -1175,6 +1228,45 @@ fn mule_placeholders_to_camel(value: &str) -> String {
     out
 }
 
+/// What has to be reviewed about a comparison of variable `name`, which is
+/// converted to a predicate on the exchange property `name`: nothing if
+/// the application sets the variable from literals and from nothing else,
+/// in places the generated routes run like Mule does. Then the property
+/// holds a constant of the type Mule's variable has.
+///
+/// Otherwise the note says what the conversion assumed and names the
+/// assignments it cannot vouch for (see [`variables::assignments`] for
+/// what counts), or that there is none at all.
+fn variable_review(app: App<'_>, name: &str) -> Option<String> {
+    /// How many assignments a note lists before it only counts them.
+    const LISTED: usize = 5;
+
+    let assignments = variables::assignments(app.flows, app.globals, name);
+    if assignments.is_empty() {
+        return Some(format!(
+            "converted assuming variable {name} holds a value this application set from a \
+             literal, but no set-variable for {name} was found in it. Check what sets the \
+             variable, and with which type"
+        ));
+    }
+    let other: Vec<&str> = assignments
+        .iter()
+        .filter(|assignment| !assignment.literal)
+        .map(|assignment| assignment.place.as_str())
+        .collect();
+    if other.is_empty() {
+        return None;
+    }
+    let mut places = other[..other.len().min(LISTED)].join("; ");
+    if other.len() > LISTED {
+        places.push_str(&format!("; and {} more", other.len() - LISTED));
+    }
+    Some(format!(
+        "converted assuming variable {name} holds a value this application set from a literal; \
+         it is also set at: {places}. Check the comparison"
+    ))
+}
+
 /// The decision for a step that sets a value (`set-payload`,
 /// `set-variable`): done if the value is converted, flagged if it is not.
 fn record_value_decision(
@@ -1256,7 +1348,7 @@ mod tests {
     }
 
     fn to_uris(e: &MuleElement, rules: &[Rule]) -> Vec<String> {
-        map_processor(e, &[], rules, &mut Vec::new(), &mut Vec::new())
+        map_processor(e, App::default(), rules, &mut Vec::new(), &mut Vec::new())
             .into_iter()
             .map(|step| match step {
                 RouteStep::ToUri(uri) => uri,
@@ -1376,6 +1468,7 @@ mappings:
             flows,
             configs: vec![],
             properties: Default::default(),
+            globals: vec![],
         };
         let (camel, _) = map_project(&project, &[], None).await.unwrap();
         camel
@@ -1451,6 +1544,7 @@ mappings:
             flows,
             configs: vec![],
             properties: Default::default(),
+            globals: vec![],
         };
         map_project(&project, &[], None).await.unwrap()
     }
@@ -1666,7 +1760,7 @@ mappings:
         let mut decisions = Vec::new();
         let handlers = map_error_handler(
             &error_handler(scopes),
-            &[],
+            App::default(),
             &[],
             &mut decisions,
             &mut Vec::new(),
@@ -1838,7 +1932,7 @@ mappings:
                 "on-error-continue",
                 &[("type", "HTTP:FORBIDDEN")],
             )]),
-            &[],
+            App::default(),
             &[],
             &mut Vec::new(),
             &mut deps,
@@ -1990,7 +2084,13 @@ mappings:
         // migrated; the flow must not look as if it had no error handling.
         let reference = elem("", "error-handler", &[("ref", "globalErrorHandler")]);
         let mut decisions = Vec::new();
-        let handlers = map_error_handler(&reference, &[], &[], &mut decisions, &mut Vec::new());
+        let handlers = map_error_handler(
+            &reference,
+            App::default(),
+            &[],
+            &mut decisions,
+            &mut Vec::new(),
+        );
 
         assert!(handlers.is_empty());
         assert_eq!(decisions.len(), 1);
@@ -2209,8 +2309,12 @@ mappings:
         e: &MuleElement,
         rules: &[Rule],
     ) -> (Vec<RouteStep>, Vec<MappingDecision>) {
+        let app = App {
+            flows,
+            globals: &[],
+        };
         let mut decisions = Vec::new();
-        let steps = map_processor(e, flows, rules, &mut decisions, &mut Vec::new());
+        let steps = map_processor(e, app, rules, &mut decisions, &mut Vec::new());
         (steps, decisions)
     }
 
@@ -2625,6 +2729,41 @@ mappings:
             );
             assert_eq!(decision.status, DecisionStatus::ManualReview);
         }
+    }
+
+    /// A global error handler is not migrated, so what it sets is not set
+    /// by the generated routes - also when it is a literal.
+    #[tokio::test]
+    async fn literal_in_a_global_error_handler_does_not_count() {
+        let handler = scope(
+            "",
+            "error-handler",
+            &[("name", "globalHandler")],
+            vec![scope(
+                "",
+                "on-error-continue",
+                &[],
+                vec![set_variable("kind", "A")],
+            )],
+        );
+        let project = MuleProject {
+            name: "orders".into(),
+            flows: vec![flow_with_choice(vec![set_variable("kind", "A")], KIND_IS_A)],
+            configs: vec![],
+            properties: Default::default(),
+            globals: vec![handler],
+        };
+        let (_, decisions) = map_project(&project, &[], None).await.unwrap();
+        let choice = decisions_for(&decisions, "choice");
+        assert_eq!(choice.len(), 1, "{choice:?}");
+        assert_eq!(choice[0].status, DecisionStatus::ManualReview);
+        assert!(
+            choice[0]
+                .rationale
+                .contains("set-variable in global error-handler globalHandler"),
+            "{}",
+            choice[0].rationale
+        );
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ pub fn parse_project(input_dir: &Path) -> Result<MuleProject> {
 
     let mut flows = Vec::new();
     let mut configs = Vec::new();
+    let mut globals = Vec::new();
     let xml_files = discover_xml_files(&mule_xml_dir)?;
 
     for xml_path in xml_files {
@@ -33,6 +34,7 @@ pub fn parse_project(input_dir: &Path) -> Result<MuleProject> {
         let parsed = parse_xml(&content, &xml_path)?;
         flows.extend(parsed.flows);
         configs.extend(parsed.configs);
+        globals.extend(parsed.globals);
     }
 
     let properties = load_properties(input_dir).unwrap_or_default();
@@ -42,6 +44,7 @@ pub fn parse_project(input_dir: &Path) -> Result<MuleProject> {
         flows,
         configs,
         properties,
+        globals,
     })
 }
 
@@ -54,6 +57,8 @@ pub fn normalize(project: MuleProject) -> Result<MuleProject> {
 struct ParsedFile {
     flows: Vec<MuleFlow>,
     configs: Vec<MuleElement>,
+    /// Top-level elements with children that are neither.
+    globals: Vec<MuleElement>,
 }
 
 fn discover_xml_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -181,6 +186,7 @@ fn parse_xml(content: &str, source: &Path) -> Result<ParsedFile> {
     let mut buf = Vec::new();
     let mut flows = Vec::new();
     let mut configs = Vec::new();
+    let mut globals = Vec::new();
 
     // Skip to the root <mule> element
     loop {
@@ -197,6 +203,7 @@ fn parse_xml(content: &str, source: &Path) -> Result<ParsedFile> {
                 return Ok(ParsedFile {
                     flows: vec![],
                     configs: vec![],
+                    globals: vec![],
                 })
             }
             Err(e) => {
@@ -239,8 +246,11 @@ fn parse_xml(content: &str, source: &Path) -> Result<ParsedFile> {
                     });
                 } else if is_config_element(&elem.namespace, &elem.name) {
                     configs.push(elem);
+                } else {
+                    // Not migrated, but kept: a global <error-handler> and
+                    // the like can do what a flow does.
+                    globals.push(elem);
                 }
-                // else: skip global elements like <configuration>, xml namespace decls, etc.
             }
             Ok(Event::Empty(ref e)) => {
                 let qname = String::from_utf8_lossy(e.name().as_ref()).to_string();
@@ -273,7 +283,11 @@ fn parse_xml(content: &str, source: &Path) -> Result<ParsedFile> {
         buf.clear();
     }
 
-    Ok(ParsedFile { flows, configs })
+    Ok(ParsedFile {
+        flows,
+        configs,
+        globals,
+    })
 }
 
 fn load_properties(input_dir: &Path) -> Result<HashMap<String, String>> {
@@ -349,6 +363,38 @@ mod tests {
         assert_eq!(project.flows[0].name, "helloFlow");
         assert_eq!(project.flows[0].processors.len(), 2);
         assert_eq!(project.configs.len(), 1);
+    }
+
+    /// A top-level element with children that is neither a flow nor a
+    /// connector config is kept, with its children.
+    #[test]
+    fn test_parse_keeps_other_global_elements() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <http:listener-config name="HTTP_Listener_config">
+        <http:listener-connection host="0.0.0.0" port="8081" />
+    </http:listener-config>
+    <configuration defaultErrorHandler-ref="globalHandler" />
+    <error-handler name="globalHandler">
+        <on-error-continue>
+            <set-variable variableName="status" value="#[payload]" />
+        </on-error-continue>
+    </error-handler>
+    <flow name="helloFlow">
+        <http:listener config-ref="HTTP_Listener_config" path="/hello" />
+    </flow>
+</mule>"##;
+        let dir = create_mule_project(xml);
+        let project = parse_project(dir.path()).unwrap();
+        assert_eq!(project.flows.len(), 1);
+        assert_eq!(project.configs.len(), 1);
+        assert_eq!(project.globals.len(), 1);
+        let handler = &project.globals[0];
+        assert_eq!(handler.name, "error-handler");
+        assert_eq!(handler.attr("name"), Some("globalHandler"));
+        let set = &handler.children[0].children[0];
+        assert_eq!(set.attr("variableName"), Some("status"));
     }
 
     #[test]

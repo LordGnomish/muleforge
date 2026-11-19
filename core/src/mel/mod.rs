@@ -10,11 +10,11 @@
 //! * [`convert_value`] / [`convert_condition`]: strict, for what decides
 //!   what a route does (set-variable and set-payload values, choice
 //!   conditions). They convert the shapes that mean the same in Camel
-//!   whatever the payload is, and return [`Expression::Unconverted`] with
+//!   whatever the values are, and return [`Expression::Unconverted`] with
 //!   the reason for everything else. `docs/mapping/MATRIX.md`
 //!   ("Expressions") has the table and the reasons.
 
-use crate::ast::camel_ir::Expression;
+use crate::ast::camel_ir::{ComparedValue, Expression};
 
 // ── Strict conversion ───────────────────────────────────────────────────
 
@@ -40,7 +40,15 @@ const WHY_EMBEDDED: &str = "it mixes text and #[...] expressions, or is not one 
 const WHY_OTHER_VALUE: &str = "it is not one of the shapes that are converted: payload, \
      vars.name, or a string, integer or boolean literal";
 const WHY_OTHER_CONDITION: &str = "it is not one of the shapes that are converted: vars.name \
-     == or != a string, integer, boolean or null literal or another vars.name, or true / false";
+     == or != a string, integer, boolean or null literal, or true / false";
+const WHY_TWO_VARIABLES: &str = "it compares two variables: Mule's == is true only if both \
+     values have the same type and are equal, and there is no simple Camel predicate that is \
+     exactly that for any two Java values (Simple's == converts one side to the type of the \
+     other)";
+/// The note on a comparison written with `flowVars`.
+const REVIEW_MEL: &str = "it is written with flowVars, the Mule 3 (MEL) syntax: the predicate \
+     compares without converting types, as Mule 4 does; what MEL's == does with values of \
+     different types was not checked";
 
 /// An operand that means the same in Mule and in Camel.
 enum Operand {
@@ -83,12 +91,19 @@ pub fn convert_value(raw: &str) -> Expression {
 /// The `expression` of a choice `<when>` as a Camel predicate.
 ///
 /// * `vars.name == literal`, `vars.name != literal`, with a string,
-///   integer, boolean or `null` literal, or another `vars.name`, on the
-///   other side: the same comparison in Simple, the exchange property on
-///   the left;
+///   integer, boolean or `null` literal on the other side:
+///   [`Expression::PropertyEquals`], the comparison of the exchange
+///   property `name` with that literal. Mule 4's `==` does not convert
+///   types (`"true" == true` is false), so it is not a Simple expression,
+///   whose `==` does; the emitter writes a predicate on the Java value.
+///   Whether the property holds what the Mule variable holds is not known
+///   here: the mapper looks at what sets the variable and adds what has to
+///   be reviewed. A comparison written with `flowVars` (Mule 3) already
+///   comes with a note.
 /// * `true` / `false`: a boolean constant.
 ///
-/// Everything else is [`Expression::Unconverted`].
+/// Everything else is [`Expression::Unconverted`], two variables compared
+/// with each other included.
 pub fn convert_condition(raw: &str) -> Expression {
     let inner = whole_expression(raw).unwrap_or_else(|| raw.trim());
     if inner.contains("#[") {
@@ -107,7 +122,7 @@ pub fn convert_condition(raw: &str) -> Expression {
     };
 
     let (left, right) = (left.trim(), right.trim());
-    let (left, right) = match (parse_operand(left), parse_operand(right)) {
+    let (parsed_left, parsed_right) = match (parse_operand(left), parse_operand(right)) {
         (Some(left), Some(right)) => (left, right),
         (None, _) => {
             return unconverted(raw, why_not_an_operand(left).unwrap_or(WHY_OTHER_CONDITION))
@@ -119,30 +134,39 @@ pub fn convert_condition(raw: &str) -> Expression {
             )
         }
     };
-    if matches!(left, Operand::Payload) || matches!(right, Operand::Payload) {
+    if matches!(parsed_left, Operand::Payload) || matches!(parsed_right, Operand::Payload) {
         return unconverted(raw, WHY_PAYLOAD_COMPARED);
     }
     if operator != "==" && operator != "!=" {
         return unconverted(raw, WHY_ORDERING);
     }
-    // Simple needs the function on the left. `==` and `!=` do not care
-    // which side is which.
-    let (variable, other) = match (left, right) {
+    // `==` and `!=` do not care which side is which.
+    let (name, other) = match (parsed_left, parsed_right) {
+        (Operand::Variable(_), Operand::Variable(_)) => return unconverted(raw, WHY_TWO_VARIABLES),
         (Operand::Variable(name), other) | (other, Operand::Variable(name)) => (name, other),
         _ => return unconverted(raw, WHY_OTHER_CONDITION),
     };
-    let other = match other {
-        Operand::Variable(name) => exchange_property(&name),
-        Operand::Text(text) => format!("'{text}'"),
-        Operand::Integer(number) => number.to_string(),
-        Operand::Boolean(value) => value.to_string(),
-        Operand::Null => "null".to_string(),
-        Operand::Payload => return unconverted(raw, WHY_PAYLOAD_COMPARED),
+    let value = match other {
+        Operand::Text(text) => ComparedValue::Text(text),
+        Operand::Integer(number) => ComparedValue::Integer(number),
+        Operand::Boolean(value) => ComparedValue::Boolean(value),
+        Operand::Null => ComparedValue::Null,
+        Operand::Payload | Operand::Variable(_) => return unconverted(raw, WHY_OTHER_CONDITION),
     };
-    Expression::Simple(format!(
-        "{} {operator} {other}",
-        exchange_property(&variable)
-    ))
+    let mel = [left, right]
+        .iter()
+        .any(|side| side.starts_with("flowVars"));
+    Expression::PropertyEquals {
+        original: raw.to_string(),
+        name,
+        value,
+        negated: operator == "!=",
+        review: if mel {
+            vec![REVIEW_MEL.to_string()]
+        } else {
+            Vec::new()
+        },
+    }
 }
 
 fn unconverted(raw: &str, reason: &str) -> Expression {
@@ -488,7 +512,6 @@ pub fn extract_mel(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::camel_ir::ComparedValue;
 
     #[test]
     fn interpolate_replaces_embedded_payload() {
