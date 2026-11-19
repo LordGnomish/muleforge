@@ -81,3 +81,130 @@ fn describe_step(step: &RouteStep) -> String {
         RouteStep::RawDsl(dsl) => format!("Custom: {}", dsl.chars().take(60).collect::<String>()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::camel_ir::{ComparedValue, Expression};
+
+    fn unconverted() -> Expression {
+        Expression::Unconverted {
+            original: "#[now()]".into(),
+            reason: "why".into(),
+        }
+    }
+
+    fn constant() -> Expression {
+        Expression::Constant("text".into())
+    }
+
+    /// A step whose value is not converted is emitted as a step that
+    /// throws. The page must not say that it sets something.
+    #[test]
+    fn step_with_an_unconverted_value_is_described_as_not_migrated() {
+        let fails = "its value is a Mule expression that is not converted, the route fails at \
+                     this step (see the TODO in the route class)";
+        for (step, what) in [
+            (
+                RouteStep::SetBody {
+                    expression: unconverted(),
+                },
+                "set message body".to_string(),
+            ),
+            (
+                RouteStep::SetHeader {
+                    name: "x-id".into(),
+                    expression: unconverted(),
+                },
+                "set header `x-id`".to_string(),
+            ),
+            (
+                RouteStep::SetProperty {
+                    name: "id".into(),
+                    expression: unconverted(),
+                },
+                "set property `id`".to_string(),
+            ),
+            (
+                RouteStep::Split {
+                    expression: unconverted(),
+                    parallel: false,
+                    aggregation_strategy: None,
+                    steps: vec![],
+                },
+                "split".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                describe_step(&step),
+                format!("**Not migrated:** {what} - {fails}")
+            );
+        }
+    }
+
+    #[test]
+    fn step_with_a_converted_value_is_described_as_before() {
+        assert_eq!(
+            describe_step(&RouteStep::SetBody {
+                expression: constant()
+            }),
+            "Set message body"
+        );
+        assert_eq!(
+            describe_step(&RouteStep::SetProperty {
+                name: "id".into(),
+                expression: constant()
+            }),
+            "Set property `id`"
+        );
+        assert_eq!(
+            describe_step(&RouteStep::SetHeader {
+                name: "x-id".into(),
+                expression: constant()
+            }),
+            "Set header `x-id`"
+        );
+    }
+
+    /// A choice says how many of its conditions fail instead of deciding,
+    /// and how many are converted on an assumption.
+    #[test]
+    fn choice_says_which_of_its_conditions_are_not_migrated_or_to_review() {
+        let compared = |review: Vec<String>| Expression::PropertyEquals {
+            original: "#[vars.a == 'x']".into(),
+            name: "a".into(),
+            value: ComparedValue::Text("x".into()),
+            negated: false,
+            review,
+        };
+        let choice = |conditions: Vec<Expression>| RouteStep::Choice {
+            whens: conditions.into_iter().map(|c| (c, vec![])).collect(),
+            otherwise: None,
+        };
+
+        assert_eq!(
+            describe_step(&choice(vec![compared(vec![]), compared(vec![])])),
+            "Choice router (2 branches)"
+        );
+        assert_eq!(
+            describe_step(&choice(vec![
+                compared(vec![]),
+                unconverted(),
+                unconverted()
+            ])),
+            "Choice router (3 branches; **not migrated: 2 of 3 conditions** - a message that \
+             reaches one of them fails there; see the TODO in the route class)"
+        );
+        assert_eq!(
+            describe_step(&choice(vec![compared(vec!["check".into()])])),
+            "Choice router (1 branches; to review: 1 of 1 conditions, converted on an \
+             assumption; see the TODO in the route class)"
+        );
+        assert_eq!(
+            describe_step(&choice(vec![compared(vec!["check".into()]), unconverted()])),
+            "Choice router (2 branches; **not migrated: 1 of 2 conditions** - a message that \
+             reaches one of them fails there; to review: 1 of 2 conditions, converted on an \
+             assumption; see the TODO in the route class)"
+        );
+    }
+}
