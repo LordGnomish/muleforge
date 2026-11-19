@@ -99,7 +99,21 @@ fn sanitize_id(s: &str) -> String {
         .collect()
 }
 
+/// The label of a step in the diagram.
+///
+/// A step whose value is not converted is emitted as a step that throws
+/// (see `RouteStep::is_unconverted`), and an unconverted choice condition
+/// as a predicate that throws: the label says so.
 fn step_label(step: &RouteStep) -> String {
+    if step.is_unconverted() {
+        let what = match step {
+            RouteStep::SetBody { .. } => "setBody".to_string(),
+            RouteStep::SetHeader { name, .. } => format!("setHeader({name})"),
+            RouteStep::SetProperty { name, .. } => format!("setProperty({name})"),
+            _ => "split".to_string(),
+        };
+        return format!("NOT MIGRATED: {what} (fails here)");
+    }
     match step {
         RouteStep::SetBody { .. } => "setBody".into(),
         RouteStep::SetHeader { name, .. } => format!("setHeader({})", name),
@@ -122,7 +136,20 @@ fn step_label(step: &RouteStep) -> String {
             }
         }
         RouteStep::ProcessBean(b) => format!("bean({})", b),
-        RouteStep::Choice { whens, .. } => format!("choice({} branches)", whens.len()),
+        RouteStep::Choice { whens, .. } => {
+            let unconverted = whens
+                .iter()
+                .filter(|(condition, _)| matches!(condition, Expression::Unconverted { .. }))
+                .count();
+            if unconverted > 0 {
+                format!(
+                    "choice({} branches, {unconverted} NOT MIGRATED)",
+                    whens.len()
+                )
+            } else {
+                format!("choice({} branches)", whens.len())
+            }
+        }
         RouteStep::Split { parallel, .. } => {
             if *parallel {
                 "split(parallel)".into()

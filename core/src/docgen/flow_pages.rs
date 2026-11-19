@@ -1,6 +1,6 @@
 //! Per-flow documentation pages.
 
-use crate::ast::camel_ir::{CamelProject, RouteEndpoint, RouteStep};
+use crate::ast::camel_ir::{CamelProject, Expression, RouteEndpoint, RouteStep};
 use crate::report::MigrationReport;
 use crate::Result;
 use std::path::Path;
@@ -55,7 +55,25 @@ pub fn generate(ir: &CamelProject, report: &MigrationReport, docs_dir: &Path) ->
     Ok(())
 }
 
+/// One line about a step of the route, for the page of its flow.
+///
+/// A step whose value is a Mule expression that is not converted is
+/// emitted as a step that throws, and a choice condition that is not
+/// converted as a predicate that throws. The page says that, instead of
+/// describing the step the route does not have.
 fn describe_step(step: &RouteStep) -> String {
+    if step.is_unconverted() {
+        let what = match step {
+            RouteStep::SetBody { .. } => "set message body".to_string(),
+            RouteStep::SetHeader { name, .. } => format!("set header `{name}`"),
+            RouteStep::SetProperty { name, .. } => format!("set property `{name}`"),
+            _ => "split".to_string(),
+        };
+        return format!(
+            "**Not migrated:** {what} - its value is a Mule expression that is not converted, \
+             the route fails at this step (see the TODO in the route class)"
+        );
+    }
     match step {
         RouteStep::SetBody { .. } => "Set message body".into(),
         RouteStep::SetHeader { name, .. } => format!("Set header `{}`", name),
@@ -66,7 +84,32 @@ fn describe_step(step: &RouteStep) -> String {
         }
         RouteStep::ToUri(uri) => format!("Send to `{}`", uri),
         RouteStep::ProcessBean(b) => format!("Process bean `{}`", b),
-        RouteStep::Choice { whens, .. } => format!("Choice router ({} branches)", whens.len()),
+        RouteStep::Choice { whens, .. } => {
+            let count =
+                |wanted: fn(&Expression) -> bool| whens.iter().filter(|(c, _)| wanted(c)).count();
+            let unconverted = count(|c| matches!(c, Expression::Unconverted { .. }));
+            let to_review = count(
+                |c| matches!(c, Expression::PropertyEquals { review, .. } if !review.is_empty()),
+            );
+            let mut notes = String::new();
+            if unconverted > 0 {
+                notes.push_str(&format!(
+                    "; **not migrated: {unconverted} of {} conditions** - a message that \
+                     reaches one of them fails there",
+                    whens.len()
+                ));
+            }
+            if to_review > 0 {
+                notes.push_str(&format!(
+                    "; to review: {to_review} of {} conditions, converted on an assumption",
+                    whens.len()
+                ));
+            }
+            if !notes.is_empty() {
+                notes.push_str("; see the TODO in the route class");
+            }
+            format!("Choice router ({} branches{notes})", whens.len())
+        }
         RouteStep::Split { parallel, .. } => {
             if *parallel {
                 "Parallel split".into()

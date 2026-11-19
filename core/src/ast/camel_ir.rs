@@ -86,6 +86,24 @@ pub enum RouteStep {
     RawDsl(String),
 }
 
+impl RouteStep {
+    /// Whether the step needs a value (`setBody`, `setHeader`,
+    /// `setProperty`) or an expression (`split`) that is a Mule expression
+    /// which is not converted. Such a step is not emitted as that step: the
+    /// route throws there (see [`Expression::Unconverted`]), and whatever
+    /// describes the route has to say so.
+    pub fn is_unconverted(&self) -> bool {
+        matches!(
+            self,
+            RouteStep::SetBody { expression }
+                | RouteStep::SetHeader { expression, .. }
+                | RouteStep::SetProperty { expression, .. }
+                | RouteStep::Split { expression, .. }
+                if matches!(expression, Expression::Unconverted { .. })
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expression {
     /// A string constant: `constant("text")`.
