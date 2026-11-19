@@ -2200,8 +2200,17 @@ mappings:
         e: &MuleElement,
         rules: &[Rule],
     ) -> (Vec<RouteStep>, Vec<MappingDecision>) {
+        steps_and_decisions_in(&[], e, rules)
+    }
+
+    /// Map `e` as a processor of an application with these flows.
+    fn steps_and_decisions_in(
+        flows: &[MuleFlow],
+        e: &MuleElement,
+        rules: &[Rule],
+    ) -> (Vec<RouteStep>, Vec<MappingDecision>) {
         let mut decisions = Vec::new();
-        let steps = map_processor(e, &[], rules, &mut decisions, &mut Vec::new());
+        let steps = map_processor(e, flows, rules, &mut decisions, &mut Vec::new());
         (steps, decisions)
     }
 
@@ -2254,6 +2263,35 @@ mappings:
         matches!(expression, Expression::Unconverted { original, .. } if original == mule)
     }
 
+    /// `vars.name == 'text'` as written in `mule`, with nothing to review.
+    fn equals_text(mule: &str, name: &str, text: &str) -> Expression {
+        Expression::PropertyEquals {
+            original: mule.into(),
+            name: name.into(),
+            value: ComparedValue::Text(text.into()),
+            negated: false,
+            review: vec![],
+        }
+    }
+
+    fn set_variable(name: &str, value: &str) -> MuleElement {
+        elem(
+            "",
+            "set-variable",
+            &[("variableName", name), ("value", value)],
+        )
+    }
+
+    /// A flow that sets variable `name` from the literal string `value`:
+    /// the application of a choice that compares that variable.
+    fn flow_that_sets(name: &str, value: &str) -> MuleFlow {
+        flow(
+            "setupFlow",
+            false,
+            vec![http_listener(), set_variable(name, value)],
+        )
+    }
+
     #[test]
     fn choice_with_convertible_conditions_is_done() {
         let router = choice(vec![
@@ -2261,20 +2299,22 @@ mappings:
             when("#[vars.type == 'B']", "b"),
             otherwise("default"),
         ]);
+        let flows = [flow_that_sets("type", "A")];
         for rules in shipped_and_builtin_rules() {
-            let (steps, decisions) = steps_and_decisions(&router, &rules);
+            let (steps, decisions) = steps_and_decisions_in(&flows, &router, &rules);
             let (whens, otherwise) = only_choice(steps);
 
             assert_eq!(whens.len(), 2);
-            assert_eq!(whens[0].0, simple("${exchangeProperty.type} == 'A'"));
+            assert_eq!(whens[0].0, equals_text("#[vars.type == 'A']", "type", "A"));
             assert_eq!(bodies(&whens[0].1), ["a"]);
-            assert_eq!(whens[1].0, simple("${exchangeProperty.type} == 'B'"));
+            assert_eq!(whens[1].0, equals_text("#[vars.type == 'B']", "type", "B"));
             assert_eq!(bodies(&whens[1].1), ["b"]);
             assert_eq!(bodies(&otherwise.expect("otherwise branch")), ["default"]);
 
             let choice = decisions_for(&decisions, "choice");
             assert_eq!(choice.len(), 1, "{choice:?}");
             assert_eq!(choice[0].status, DecisionStatus::Done);
+            assert_eq!(choice[0].rationale, "choice -> choice");
         }
     }
 
@@ -2288,12 +2328,13 @@ mappings:
             when("#[payload.type == 'B']", "b"),
             otherwise("default"),
         ]);
+        let flows = [flow_that_sets("type", "A")];
         for rules in shipped_and_builtin_rules() {
-            let (steps, decisions) = steps_and_decisions(&router, &rules);
+            let (steps, decisions) = steps_and_decisions_in(&flows, &router, &rules);
             let (whens, otherwise) = only_choice(steps);
 
             assert_eq!(whens.len(), 2);
-            assert_eq!(whens[0].0, simple("${exchangeProperty.type} == 'A'"));
+            assert_eq!(whens[0].0, equals_text("#[vars.type == 'A']", "type", "A"));
             assert_eq!(bodies(&whens[0].1), ["a"]);
             assert!(
                 is_unconverted(&whens[1].0, "#[payload.type == 'B']"),
@@ -2311,6 +2352,400 @@ mappings:
             assert!(rationale.contains("#[payload.type == 'B']"), "{rationale}");
             assert!(!rationale.contains("#[vars.type == 'A']"), "{rationale}");
         }
+    }
+
+    // ── Comparison of a variable: what the variable holds ───────────────
+
+    /// A flow `ordersFlow` with an HTTP listener, the steps `before`, and a
+    /// choice with one `when` on `condition`.
+    fn flow_with_choice(before: Vec<MuleElement>, condition: &str) -> MuleFlow {
+        let mut processors = vec![http_listener()];
+        processors.extend(before);
+        processors.push(choice(vec![when(condition, "a"), otherwise("default")]));
+        flow("ordersFlow", false, processors)
+    }
+
+    /// Map the application and return the condition of the first `when` of
+    /// the choice of `ordersFlow`, and the decision of that choice.
+    async fn condition_and_decision(flows: Vec<MuleFlow>) -> (Expression, MappingDecision) {
+        let (camel, decisions) = map_flows(flows).await;
+        let route = camel
+            .routes
+            .iter()
+            .find(|r| r.id == "ordersFlow")
+            .expect("route of ordersFlow");
+        let condition = route
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                RouteStep::Choice { whens, .. } => Some(whens[0].0.clone()),
+                _ => None,
+            })
+            .expect("a choice in ordersFlow");
+        // ordersFlow is mapped last, and its choice is the last choice.
+        let decision = decisions_for(&decisions, "choice")
+            .last()
+            .copied()
+            .expect("decision of the choice")
+            .clone();
+        (condition, decision)
+    }
+
+    /// The review notes of a converted comparison of variable `kind`.
+    fn review_of(condition: &Expression) -> &[String] {
+        match condition {
+            Expression::PropertyEquals { name, review, .. } => {
+                assert_eq!(name, "kind");
+                review
+            }
+            other => panic!("expected a comparison of a property, got {other:?}"),
+        }
+    }
+
+    fn scope(
+        ns: &str,
+        name: &str,
+        attrs: &[(&str, &str)],
+        children: Vec<MuleElement>,
+    ) -> MuleElement {
+        let mut scope = elem(ns, name, attrs);
+        scope.children = children;
+        scope
+    }
+
+    const KIND_IS_A: &str = "#[vars.kind == 'A']";
+
+    /// The predicate compares the Java value of the exchange property. That
+    /// is Mule's result if the property holds what the Mule variable holds,
+    /// which is known when the application only ever sets the variable from
+    /// a literal: `setProperty` with a constant of the same type.
+    #[tokio::test]
+    async fn comparison_of_a_variable_that_is_only_set_from_literals_is_done() {
+        for value in ["A", "true", "42", "", "#['A']", "#[42]", "#[true]"] {
+            let (condition, decision) = condition_and_decision(vec![flow_with_choice(
+                vec![set_variable("kind", value)],
+                KIND_IS_A,
+            )])
+            .await;
+            assert_eq!(condition, equals_text(KIND_IS_A, "kind", "A"), "{value}");
+            assert_eq!(decision.status, DecisionStatus::Done, "{value}");
+            assert_eq!(decision.rationale, "choice -> choice", "{value}");
+        }
+    }
+
+    /// Every assignment of the application counts, wherever it is: another
+    /// flow, a sub-flow, a branch of a choice, an on-error scope that
+    /// handles every error.
+    #[tokio::test]
+    async fn literal_assignments_anywhere_in_the_application_keep_the_comparison_done() {
+        let mut elsewhere = flow(
+            "otherFlow",
+            false,
+            vec![
+                http_listener(),
+                choice(vec![scope(
+                    "",
+                    "when",
+                    &[("expression", "#[true]")],
+                    vec![set_variable("kind", "B")],
+                )]),
+            ],
+        );
+        elsewhere.error_handlers = vec![error_handler(vec![scope(
+            "",
+            "on-error-continue",
+            &[],
+            vec![set_variable("kind", "#[0]")],
+        )])];
+        let shared = flow("shared", true, vec![set_variable("kind", "#['A']")]);
+        // Referenced twice, so that the sub-flow stays a sub-flow.
+        let callers = flow(
+            "callerFlow",
+            false,
+            vec![
+                http_listener(),
+                elem("", "flow-ref", &[("name", "shared")]),
+                elem("", "flow-ref", &[("name", "shared")]),
+            ],
+        );
+
+        let (condition, decision) = condition_and_decision(vec![
+            elsewhere,
+            shared,
+            callers,
+            flow_with_choice(vec![], KIND_IS_A),
+        ])
+        .await;
+        assert_eq!(condition, equals_text(KIND_IS_A, "kind", "A"));
+        assert_eq!(
+            decision.status,
+            DecisionStatus::Done,
+            "{}",
+            decision.rationale
+        );
+    }
+
+    /// Anything else that can set the variable may leave something in the
+    /// exchange property that is not what Mule's variable holds (the raw
+    /// body instead of the value Mule reads from it, the result of a
+    /// transformation or of a connector that is not migrated, ...), or not
+    /// set the property at all. The predicate is still emitted; the choice
+    /// is flagged and says which assignment it is about.
+    #[tokio::test]
+    async fn comparison_is_flagged_when_something_else_than_a_literal_sets_the_variable() {
+        let literal = || set_variable("kind", "A");
+        let cases: Vec<(MuleElement, &str)> = vec![
+            (
+                set_variable("kind", "#[payload]"),
+                "set-variable in flow otherFlow from #[payload]",
+            ),
+            (
+                set_variable("kind", "#[vars.other]"),
+                "set-variable in flow otherFlow from #[vars.other]",
+            ),
+            (
+                set_variable("kind", "#[payload.id]"),
+                "set-variable in flow otherFlow from #[payload.id]",
+            ),
+            (
+                scope(
+                    "ee",
+                    "transform",
+                    &[],
+                    vec![scope(
+                        "ee",
+                        "variables",
+                        &[],
+                        vec![elem("ee", "set-variable", &[("variableName", "kind")])],
+                    )],
+                ),
+                "ee:set-variable variableName=\"kind\" in flow otherFlow",
+            ),
+            (
+                elem("http", "request", &[("path", "/x"), ("target", "kind")]),
+                "http:request target=\"kind\" in flow otherFlow",
+            ),
+            (
+                elem("x", "enrich", &[("targetVariable", "kind")]),
+                "x:enrich targetVariable=\"kind\" in flow otherFlow",
+            ),
+            (
+                elem("", "enricher", &[("target", "#[flowVars.kind]")]),
+                "enricher target=\"#[flowVars.kind]\" in flow otherFlow",
+            ),
+            (
+                elem("", "remove-variable", &[("variableName", "kind")]),
+                "remove-variable in flow otherFlow",
+            ),
+            (
+                scope("", "foreach", &[], vec![literal()]),
+                "set-variable in flow otherFlow inside foreach",
+            ),
+            (
+                scope("", "try", &[], vec![literal()]),
+                "set-variable in flow otherFlow inside try",
+            ),
+            (
+                elem(
+                    "",
+                    "set-variable",
+                    &[
+                        ("variableName", "kind"),
+                        ("value", "3"),
+                        ("mimeType", "application/json"),
+                    ],
+                ),
+                "set-variable in flow otherFlow with mimeType=\"application/json\"",
+            ),
+            (
+                elem(
+                    "",
+                    "set-variable",
+                    &[("variableName", "${var.name}"), ("value", "A")],
+                ),
+                "set-variable variableName=\"${var.name}\" in flow otherFlow",
+            ),
+            (
+                elem("", "flow-ref", &[("name", "elsewhere")]),
+                "flow-ref to elsewhere in flow otherFlow",
+            ),
+        ];
+        for (element, place) in cases {
+            let other = flow("otherFlow", false, vec![http_listener(), element]);
+            let (condition, decision) =
+                condition_and_decision(vec![other, flow_with_choice(vec![literal()], KIND_IS_A)])
+                    .await;
+
+            let review = review_of(&condition);
+            assert_eq!(review.len(), 1, "{place}: {review:?}");
+            assert!(
+                review[0].starts_with(
+                    "converted assuming variable kind holds a value this application set from \
+                     a literal; it is also set at: "
+                ),
+                "{place}: {review:?}"
+            );
+            assert!(review[0].contains(place), "{place}: {review:?}");
+
+            assert_eq!(decision.status, DecisionStatus::ManualReview, "{place}");
+            let rationale = &decision.rationale;
+            assert!(rationale.contains("1 of 1 conditions"), "{rationale}");
+            assert!(rationale.contains(KIND_IS_A), "{rationale}");
+            assert!(rationale.contains(place), "{rationale}");
+            assert!(!rationale.contains("not converted"), "{rationale}");
+        }
+    }
+
+    /// An on-error scope for some error types only, or with a `when`, is
+    /// emitted as an approximation or commented out: what it sets is not
+    /// known to be set in the generated route.
+    #[tokio::test]
+    async fn literal_in_an_on_error_scope_that_is_not_migrated_exactly_does_not_count() {
+        for attrs in [
+            vec![("type", "HTTP:TIMEOUT")],
+            vec![("when", "#[error.cause != null]")],
+        ] {
+            let mut other = flow("otherFlow", false, vec![http_listener()]);
+            other.error_handlers = vec![error_handler(vec![scope(
+                "",
+                "on-error-continue",
+                &attrs,
+                vec![set_variable("kind", "A")],
+            )])];
+            let (condition, decision) = condition_and_decision(vec![
+                other,
+                flow_with_choice(vec![set_variable("kind", "A")], KIND_IS_A),
+            ])
+            .await;
+            let review = review_of(&condition);
+            assert_eq!(review.len(), 1, "{review:?}");
+            assert!(
+                review[0].contains("set-variable in flow otherFlow inside on-error-continue"),
+                "{review:?}"
+            );
+            assert_eq!(decision.status, DecisionStatus::ManualReview);
+        }
+    }
+
+    #[tokio::test]
+    async fn comparison_is_flagged_when_nothing_sets_the_variable() {
+        let (condition, decision) = condition_and_decision(vec![
+            flow(
+                "otherFlow",
+                false,
+                vec![http_listener(), set_variable("other", "A")],
+            ),
+            flow_with_choice(vec![], KIND_IS_A),
+        ])
+        .await;
+        let review = review_of(&condition);
+        assert_eq!(review.len(), 1, "{review:?}");
+        assert!(
+            review[0].contains("no set-variable for kind was found"),
+            "{review:?}"
+        );
+        assert_eq!(decision.status, DecisionStatus::ManualReview);
+        assert!(
+            decision.rationale.contains(KIND_IS_A),
+            "{}",
+            decision.rationale
+        );
+    }
+
+    /// A foreach sets `counter` and `rootMessage` (or the names it is
+    /// given) without a set-variable.
+    #[tokio::test]
+    async fn variables_a_foreach_sets_are_not_literals() {
+        /// The decision of a choice on `condition`, in an application
+        /// that sets `variable` from a literal and has `foreach` elsewhere.
+        async fn mapped(foreach: MuleElement, variable: &str, condition: &str) -> MappingDecision {
+            let (_, decisions) = map_flows(vec![
+                flow("otherFlow", false, vec![http_listener(), foreach]),
+                flow_with_choice(vec![set_variable(variable, "#[1]")], condition),
+            ])
+            .await;
+            decisions_for(&decisions, "choice")
+                .last()
+                .copied()
+                .expect("decision of the choice")
+                .clone()
+        }
+        let condition = "#[vars.counter == 1]";
+
+        let decision = mapped(elem("", "foreach", &[]), "counter", condition).await;
+        assert_eq!(decision.status, DecisionStatus::ManualReview);
+        assert!(
+            decision.rationale.contains("foreach in flow otherFlow"),
+            "{}",
+            decision.rationale
+        );
+
+        // Renamed: `counter` is an ordinary variable, `i` is the counter.
+        let renamed = || elem("", "foreach", &[("counterVariableName", "i")]);
+        let decision = mapped(renamed(), "counter", condition).await;
+        assert_eq!(
+            decision.status,
+            DecisionStatus::Done,
+            "{}",
+            decision.rationale
+        );
+        let decision = mapped(renamed(), "i", "#[vars.i == 1]").await;
+        assert_eq!(decision.status, DecisionStatus::ManualReview);
+        assert!(
+            decision
+                .rationale
+                .contains("foreach counterVariableName=\"i\" in flow otherFlow"),
+            "{}",
+            decision.rationale
+        );
+    }
+
+    /// `flowVars` is Mule 3: the note of the conversion flags the choice,
+    /// also when only literals set the variable.
+    #[tokio::test]
+    async fn comparison_on_flow_vars_is_flagged() {
+        let raw = "#[flowVars.kind == 'A']";
+        let (condition, decision) =
+            condition_and_decision(vec![flow_with_choice(vec![set_variable("kind", "A")], raw)])
+                .await;
+        let review = review_of(&condition);
+        assert_eq!(review.len(), 1, "{review:?}");
+        assert!(review[0].contains("flowVars"), "{review:?}");
+        assert_eq!(decision.status, DecisionStatus::ManualReview);
+        assert!(decision.rationale.contains(raw), "{}", decision.rationale);
+    }
+
+    /// Unconverted conditions and conditions that rest on an assumption are
+    /// reported side by side; a condition that is simply right is not
+    /// mentioned.
+    #[tokio::test]
+    async fn choice_reports_unconverted_and_assumed_conditions_and_no_others() {
+        let router = choice(vec![
+            when(KIND_IS_A, "a"),
+            when("#[payload.type == 'B']", "b"),
+            when("#[vars.unset != null]", "c"),
+        ]);
+        let (_, decisions) = map_flows(vec![flow(
+            "ordersFlow",
+            false,
+            vec![http_listener(), set_variable("kind", "A"), router],
+        )])
+        .await;
+        let choice = decisions_for(&decisions, "choice");
+        assert_eq!(choice.len(), 1, "{choice:?}");
+        assert_eq!(choice[0].status, DecisionStatus::ManualReview);
+        let rationale = &choice[0].rationale;
+        assert!(
+            rationale.contains("1 of 3 conditions are not converted"),
+            "{rationale}"
+        );
+        assert!(rationale.contains("#[payload.type == 'B']"), "{rationale}");
+        assert!(
+            rationale.contains("1 of 3 conditions are converted to an exact comparison"),
+            "{rationale}"
+        );
+        assert!(rationale.contains("#[vars.unset != null]"), "{rationale}");
+        assert!(!rationale.contains(KIND_IS_A), "{rationale}");
     }
 
     #[test]

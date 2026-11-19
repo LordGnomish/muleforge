@@ -488,6 +488,7 @@ pub fn extract_mel(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::camel_ir::ComparedValue;
 
     #[test]
     fn interpolate_replaces_embedded_payload() {
@@ -720,45 +721,150 @@ mod tests {
 
     // ── convert_condition: choice conditions ─────────────────────────────
 
-    #[test]
-    fn condition_compares_a_variable_with_a_literal() {
-        for (raw, expected) in [
-            ("#[vars.type == 'A']", "${exchangeProperty.type} == 'A'"),
-            (r#"#[vars.type != "A"]"#, "${exchangeProperty.type} != 'A'"),
-            ("#[vars.count == 3]", "${exchangeProperty.count} == 3"),
-            (
-                "#[vars.active == true]",
-                "${exchangeProperty.active} == true",
-            ),
-            ("#[vars.id != null]", "${exchangeProperty.id} != null"),
-            ("#[vars.id == null]", "${exchangeProperty.id} == null"),
-            ("#[flowVars.type == 'A']", "${exchangeProperty.type} == 'A'"),
-            ("#[vars['type']=='A']", "${exchangeProperty.type} == 'A'"),
-        ] {
-            assert_eq!(convert_condition(raw), simple(expected), "{raw}");
+    /// `vars.name == value` (`negated`: `!=`) as [`convert_condition`]
+    /// gives it for the Mule expression `raw`, with nothing to review.
+    fn compared(raw: &str, name: &str, value: ComparedValue, negated: bool) -> Expression {
+        Expression::PropertyEquals {
+            original: raw.into(),
+            name: name.into(),
+            value,
+            negated,
+            review: vec![],
         }
     }
 
-    #[test]
-    fn condition_compares_two_variables() {
-        assert_eq!(
-            convert_condition("#[vars.owner == vars.user]"),
-            simple("${exchangeProperty.owner} == ${exchangeProperty.user}")
-        );
+    fn text(s: &str) -> ComparedValue {
+        ComparedValue::Text(s.into())
     }
 
-    /// Simple needs the function on the left; `==` and `!=` mean the same
-    /// with their sides swapped.
+    /// Mule's `==` does not convert types (`"true" == true` is false), so
+    /// the comparison is not written in Simple, whose `==` does: it keeps
+    /// the name, the literal with its type, and whether it is `==` or `!=`.
     #[test]
-    fn condition_with_the_literal_on_the_left_is_turned_around() {
-        assert_eq!(
-            convert_condition("#['A' == vars.type]"),
-            simple("${exchangeProperty.type} == 'A'")
-        );
-        assert_eq!(
-            convert_condition("#[null != vars.id]"),
-            simple("${exchangeProperty.id} != null")
-        );
+    fn condition_compares_a_variable_with_a_literal() {
+        for (raw, name, value, negated) in [
+            ("#[vars.type == 'A']", "type", text("A"), false),
+            (r#"#[vars.type != "A"]"#, "type", text("A"), true),
+            (
+                "#[vars.count == 3]",
+                "count",
+                ComparedValue::Integer(3),
+                false,
+            ),
+            (
+                "#[vars.count != -1]",
+                "count",
+                ComparedValue::Integer(-1),
+                true,
+            ),
+            ("#[vars.count == '3']", "count", text("3"), false),
+            (
+                "#[vars.active == true]",
+                "active",
+                ComparedValue::Boolean(true),
+                false,
+            ),
+            (
+                "#[vars.active != false]",
+                "active",
+                ComparedValue::Boolean(false),
+                true,
+            ),
+            ("#[vars.active == 'true']", "active", text("true"), false),
+            ("#[vars.id != null]", "id", ComparedValue::Null, true),
+            ("#[vars.id == null]", "id", ComparedValue::Null, false),
+            ("#[vars['type']=='A']", "type", text("A"), false),
+            ("vars.type == 'A'", "type", text("A"), false),
+        ] {
+            assert_eq!(
+                convert_condition(raw),
+                compared(raw, name, value, negated),
+                "{raw}"
+            );
+        }
+    }
+
+    /// No Simple expression is produced for a comparison, whatever the
+    /// literal is.
+    #[test]
+    fn condition_is_never_a_simple_comparison() {
+        for raw in [
+            "#[vars.a == 'x']",
+            "#[vars.a != 'x']",
+            "#[vars.a == 1]",
+            "#[vars.a == true]",
+            "#[vars.a == null]",
+            "#[vars.a == vars.b]",
+            "#[flowVars.a == 'x']",
+        ] {
+            assert!(
+                !matches!(convert_condition(raw), Expression::Simple(_)),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Mule's `==` is true for two variables only if their values have the
+    /// same type and are equal. There is no cheap Camel predicate that is
+    /// exactly that for any two Java values, so it is left to a person.
+    #[test]
+    fn condition_that_compares_two_variables_is_not_converted() {
+        for raw in [
+            "#[vars.owner == vars.user]",
+            "#[vars.owner != vars.user]",
+            "#[flowVars.owner == vars.user]",
+        ] {
+            let reason = reason_of(raw, convert_condition(raw));
+            assert!(reason.contains("two variables"), "{raw}: {reason}");
+        }
+    }
+
+    /// `==` and `!=` mean the same with their sides swapped.
+    #[test]
+    fn condition_with_the_literal_on_the_left_is_the_same_comparison() {
+        for (raw, name, value, negated) in [
+            ("#['A' == vars.type]", "type", text("A"), false),
+            ("#[null != vars.id]", "id", ComparedValue::Null, true),
+            (
+                "#[3 == vars.count]",
+                "count",
+                ComparedValue::Integer(3),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                convert_condition(raw),
+                compared(raw, name, value, negated),
+                "{raw}"
+            );
+        }
+    }
+
+    /// `flowVars` is Mule 3 (MEL). The comparison is converted like the
+    /// Mule 4 one, with a note: what MEL's `==` does with values of
+    /// different types was not checked.
+    #[test]
+    fn condition_on_flow_vars_is_converted_with_a_note_to_review() {
+        for raw in ["#[flowVars.type == 'A']", "#['A' == flowVars.type]"] {
+            match convert_condition(raw) {
+                Expression::PropertyEquals {
+                    original,
+                    name,
+                    value,
+                    negated,
+                    review,
+                } => {
+                    assert_eq!(original, raw);
+                    assert_eq!(name, "type");
+                    assert_eq!(value, text("A"));
+                    assert!(!negated);
+                    assert_eq!(review.len(), 1, "{review:?}");
+                    assert!(review[0].contains("flowVars"), "{review:?}");
+                    assert!(review[0].contains("Mule 3"), "{review:?}");
+                }
+                other => panic!("{raw}: {other:?}"),
+            }
+        }
     }
 
     #[test]

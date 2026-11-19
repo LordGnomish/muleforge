@@ -1075,3 +1075,175 @@ async fn hello_world_example_set_variable_takes_the_payload_from_the_body() {
         }
     }
 }
+
+/// A comparison of a variable with a literal. Mule 4 (DataWeave) does not
+/// convert types for `==`: a variable set with `value="true"` holds the
+/// string `"true"`, which is not the boolean `true`. Camel's Simple does
+/// convert (`${exchangeProperty.enriched} == true` is true for the string),
+/// so the route used to take the `when` branch where Mule takes
+/// `otherwise`, and the choice was reported as done.
+///
+/// The condition is emitted as a Java predicate on the value of the
+/// exchange property that does not convert types. It is reported as done
+/// only if the application sets the variable from literals and nothing
+/// else; a variable that is (also) set from the payload may hold something
+/// else than Mule's value, so that choice is flagged, with the predicate
+/// still emitted and a TODO in front of it.
+#[tokio::test]
+async fn variable_comparison_does_not_convert_types_and_says_when_it_rests_on_an_assumption() {
+    let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <flow name="strictFlow">
+        <http:listener config-ref="HTTP_config" path="/strict" allowedMethods="GET" />
+        <set-variable variableName="enriched" value="true" />
+        <choice>
+            <when expression="#[vars.enriched == true]">
+                <set-payload value="when" />
+            </when>
+            <otherwise>
+                <set-payload value="otherwise" />
+            </otherwise>
+        </choice>
+    </flow>
+    <flow name="countFlow">
+        <http:listener config-ref="HTTP_config" path="/count" allowedMethods="GET" />
+        <set-variable variableName="retries" value="#[3]" />
+        <choice>
+            <when expression="#[vars.retries == 3]">
+                <set-payload value="three" />
+            </when>
+            <when expression="#[vars.retries != '3']">
+                <set-payload value="not the text" />
+            </when>
+            <when expression="#[vars.retries == null]">
+                <set-payload value="none" />
+            </when>
+        </choice>
+    </flow>
+    <flow name="aliasFlow">
+        <http:listener config-ref="HTTP_config" path="/alias" allowedMethods="POST" />
+        <set-variable variableName="originalPayload" value="#[payload]" />
+        <choice>
+            <when expression="#[vars.originalPayload == 'A']">
+                <set-payload value="when" />
+            </when>
+            <otherwise>
+                <set-payload value="otherwise" />
+            </otherwise>
+        </choice>
+    </flow>
+</mule>"##;
+    let dir = make_project(xml);
+    let project = parser::parse_project(dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let rules =
+        mapper::load_rules(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mappings"))
+            .unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+    let route = |class: &str| {
+        std::fs::read_to_string(
+            out.path()
+                .join(format!("src/main/java/generated/routes/{class}.java")),
+        )
+        .unwrap()
+    };
+
+    let strict = route("StrictFlowRoute");
+    assert!(
+        strict.contains(
+            r#"
+            .setProperty("enriched", constant("true"))
+            .choice()
+                .when(exchange -> Boolean.TRUE.equals(exchange.getProperty("enriched")))
+                    .setBody(constant("when"))
+                .otherwise()
+                    .setBody(constant("otherwise"))
+            .endChoice()
+            ;
+    }
+}
+"#
+        ),
+        "{strict}"
+    );
+
+    let count = route("CountFlowRoute");
+    assert!(
+        count.contains(
+            r#"
+            .setProperty("retries", constant(3))
+            .choice()
+                .when(exchange -> isNumber(exchange.getProperty("retries"), 3))
+                    .setBody(constant("three"))
+                .when(exchange -> !"3".equals(exchange.getProperty("retries")))
+                    .setBody(constant("not the text"))
+                .when(exchange -> exchange.getProperty("retries") == null)
+                    .setBody(constant("none"))
+            .endChoice()
+            ;
+    }
+
+    // Whether value is a number equal to expected, as Mule compares numbers:
+"#
+        ),
+        "{count}"
+    );
+    assert!(
+        count.contains("    private static boolean isNumber(Object value, long expected) {\n"),
+        "{count}"
+    );
+
+    let alias = route("AliasFlowRoute");
+    assert!(
+        alias.contains(
+            r#"
+            .setProperty("originalPayload", simple("${body}"))
+            .choice()
+                // TODO: review this condition (Mule: #[vars.originalPayload == 'A'])
+                // - converted assuming variable originalPayload holds a value this application set from a literal; it is also set at: set-variable in flow aliasFlow from #[payload]. Check the comparison
+                .when(exchange -> "A".equals(exchange.getProperty("originalPayload")))
+                    .setBody(constant("when"))
+                .otherwise()
+                    .setBody(constant("otherwise"))
+            .endChoice()
+"#
+        ),
+        "{alias}"
+    );
+
+    // No comparison is written in Simple, and no class without a number
+    // comparison gets the method for it.
+    for java in [&strict, &count, &alias] {
+        assert!(!java.contains("simple(\"${exchangeProperty"), "{java}");
+    }
+    for java in [&strict, &alias] {
+        assert!(!java.contains("isNumber"), "{java}");
+    }
+
+    // One row per choice, in the order of the flows.
+    let choices: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element == "choice")
+        .collect();
+    assert_eq!(choices.len(), 3, "{choices:?}");
+    for done in &choices[..2] {
+        assert_eq!(done.status, report::DecisionStatus::Done, "{done:?}");
+        assert_eq!(done.rationale, "choice -> choice");
+    }
+    let flagged = choices[2];
+    assert_eq!(flagged.status, report::DecisionStatus::ManualReview);
+    assert_eq!(flagged.rule_id.as_deref(), Some("choice-router"));
+    assert_eq!(
+        flagged.rationale,
+        "choice -> choice; review: 1 of 1 conditions are converted to an exact comparison of the \
+         exchange property, which is Mule's result only on an assumption that has to be \
+         checked: #[vars.originalPayload == 'A'] (converted assuming variable originalPayload \
+         holds a value this application set from a literal; it is also set at: set-variable in \
+         flow aliasFlow from #[payload]. Check the comparison)"
+    );
+}
