@@ -923,3 +923,416 @@ async fn sub_flow_route_leaves_its_failures_to_the_calling_flows_error_handler()
         }
     }
 }
+
+// ── Expressions: choice conditions, set-variable and set-payload values ───
+
+/// Migrate `examples/hello-world` with the shipped rules. Returns the
+/// emitted route classes (name -> Java source) and the mapping decisions.
+async fn migrate_hello_world_example() -> (
+    std::collections::BTreeMap<String, String>,
+    Vec<report::MappingDecision>,
+) {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rules = mapper::load_rules(&manifest_dir.join("../mappings")).unwrap();
+    let project = parser::parse_project(&manifest_dir.join("../examples/hello-world")).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+
+    let mut routes = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(out.path().join("src/main/java/generated/routes")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        routes.insert(name, std::fs::read_to_string(&path).unwrap());
+    }
+    (routes, decisions)
+}
+
+/// The lines of `java` that are code: trimmed, without blank and comment
+/// lines.
+fn code_lines(java: &str) -> Vec<&str> {
+    java.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .collect()
+}
+
+/// `routerFlow` of `examples/hello-world` routes on `#[payload.type == 'A']`.
+/// The route used to get `.when(simple("#[payload.type == 'A']"))`, which
+/// Camel rejects at startup ("Unexpected token # at location 0"), and the
+/// choice was reported as done.
+///
+/// `payload.type` reads a field of a payload whose type the migrator does
+/// not know, so the condition is not converted: the branch stays, with the
+/// Mule expression in a TODO and a predicate that fails when it is
+/// evaluated (never a guess), and the choice is flagged for review. The
+/// otherwise branch is kept as it is.
+#[tokio::test]
+async fn hello_world_example_choice_conditions_are_flagged_and_fail_loudly() {
+    let (routes, decisions) = migrate_hello_world_example().await;
+    let java = &routes["RouterFlowRoute"];
+
+    let code = code_lines(java);
+    let from = code
+        .iter()
+        .position(|l| l.starts_with("from("))
+        .unwrap_or_else(|| panic!("no from() in:\n{java}"));
+    assert_eq!(
+        code[from..from + 11],
+        [
+            r#"from("platform-http:/route?httpMethodRestrict=POST")"#,
+            r#".routeId("routerFlow")"#,
+            ".choice()",
+            r#".when(exchange -> { throw new UnsupportedOperationException("choice condition not migrated: #[payload.type == 'A']"); })"#,
+            r#".setBody(constant("Routed to handler A"))"#,
+            r#".when(exchange -> { throw new UnsupportedOperationException("choice condition not migrated: #[payload.type == 'B']"); })"#,
+            r#".setBody(constant("Routed to handler B"))"#,
+            ".otherwise()",
+            r#".setBody(constant("Default handler"))"#,
+            ".endChoice()",
+            ";",
+        ],
+        "{java}"
+    );
+    for condition in ["#[payload.type == 'A']", "#[payload.type == 'B']"] {
+        assert!(
+            java.contains(&format!(
+                "// TODO: review this condition, it is not converted (Mule: {condition})"
+            )),
+            "{java}"
+        );
+    }
+
+    // One decision for the choice, and it is not "done".
+    let choice: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element == "choice")
+        .collect();
+    assert_eq!(choice.len(), 1, "{choice:?}");
+    assert_eq!(choice[0].status, report::DecisionStatus::ManualReview);
+    assert_eq!(choice[0].rule_id.as_deref(), Some("choice-router"));
+    for condition in ["#[payload.type == 'A']", "#[payload.type == 'B']"] {
+        assert!(
+            choice[0].rationale.contains(condition),
+            "{}",
+            choice[0].rationale
+        );
+    }
+}
+
+/// `echoFlow` of `examples/hello-world` has
+/// `<set-variable variableName="originalPayload" value="#[payload]" />`,
+/// which used to be emitted as the literal string `"#[payload]"`. The whole
+/// payload is the Camel message body, whatever its type.
+#[tokio::test]
+async fn hello_world_example_set_variable_takes_the_payload_from_the_body() {
+    let (routes, decisions) = migrate_hello_world_example().await;
+    let java = &routes["EchoFlowRoute"];
+
+    let code = code_lines(java);
+    let from = code
+        .iter()
+        .position(|l| l.starts_with("from("))
+        .unwrap_or_else(|| panic!("no from() in:\n{java}"));
+    assert_eq!(
+        code[from..from + 3],
+        [
+            r#"from("platform-http:/echo?httpMethodRestrict=POST")"#,
+            r#".routeId("echoFlow")"#,
+            r#".setProperty("originalPayload", simple("${body}"))"#,
+        ],
+        "{java}"
+    );
+
+    // No route of the example passes a Mule expression on to Camel.
+    for (name, java) in &routes {
+        for line in code_lines(java) {
+            assert!(
+                !line.contains(r##"simple("#["##) && !line.contains(r##"constant("#["##),
+                "{name}: {line}"
+            );
+        }
+    }
+
+    // Every set-variable and set-payload of the example is a literal or the
+    // whole payload: done, and reported once per element.
+    for (element, count) in [("set-variable", 2), ("set-payload", 5)] {
+        let found: Vec<_> = decisions
+            .iter()
+            .filter(|d| d.mule_element == element)
+            .collect();
+        assert_eq!(found.len(), count, "{element}: {found:?}");
+        for decision in found {
+            assert_eq!(
+                decision.status,
+                report::DecisionStatus::Done,
+                "{element}: {}",
+                decision.rationale
+            );
+        }
+    }
+}
+
+/// A comparison of a variable with a literal. Mule 4 (DataWeave) does not
+/// convert types for `==`: a variable set with `value="true"` holds the
+/// string `"true"`, which is not the boolean `true`. Camel's Simple does
+/// convert (`${exchangeProperty.enriched} == true` is true for the string),
+/// so the route used to take the `when` branch where Mule takes
+/// `otherwise`, and the choice was reported as done.
+///
+/// The condition is emitted as a Java predicate on the value of the
+/// exchange property that does not convert types. It is reported as done
+/// only if the application sets the variable from literals and nothing
+/// else; a variable that is (also) set from the payload may hold something
+/// else than Mule's value, so that choice is flagged, with the predicate
+/// still emitted and a TODO in front of it.
+#[tokio::test]
+async fn variable_comparison_does_not_convert_types_and_says_when_it_rests_on_an_assumption() {
+    let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <flow name="strictFlow">
+        <http:listener config-ref="HTTP_config" path="/strict" allowedMethods="GET" />
+        <set-variable variableName="enriched" value="true" />
+        <choice>
+            <when expression="#[vars.enriched == true]">
+                <set-payload value="when" />
+            </when>
+            <otherwise>
+                <set-payload value="otherwise" />
+            </otherwise>
+        </choice>
+    </flow>
+    <flow name="countFlow">
+        <http:listener config-ref="HTTP_config" path="/count" allowedMethods="GET" />
+        <set-variable variableName="retries" value="#[3]" />
+        <choice>
+            <when expression="#[vars.retries == 3]">
+                <set-payload value="three" />
+            </when>
+            <when expression="#[vars.retries != '3']">
+                <set-payload value="not the text" />
+            </when>
+            <when expression="#[vars.retries == null]">
+                <set-payload value="none" />
+            </when>
+        </choice>
+    </flow>
+    <flow name="aliasFlow">
+        <http:listener config-ref="HTTP_config" path="/alias" allowedMethods="POST" />
+        <set-variable variableName="originalPayload" value="#[payload]" />
+        <choice>
+            <when expression="#[vars.originalPayload == 'A']">
+                <set-payload value="when" />
+            </when>
+            <otherwise>
+                <set-payload value="otherwise" />
+            </otherwise>
+        </choice>
+    </flow>
+</mule>"##;
+    let dir = make_project(xml);
+    let project = parser::parse_project(dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let rules =
+        mapper::load_rules(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mappings"))
+            .unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+    let route = |class: &str| {
+        std::fs::read_to_string(
+            out.path()
+                .join(format!("src/main/java/generated/routes/{class}.java")),
+        )
+        .unwrap()
+    };
+
+    let strict = route("StrictFlowRoute");
+    assert!(
+        strict.contains(
+            r#"
+            .setProperty("enriched", constant("true"))
+            .choice()
+                .when(exchange -> Boolean.TRUE.equals(exchange.getProperty("enriched")))
+                    .setBody(constant("when"))
+                .otherwise()
+                    .setBody(constant("otherwise"))
+            .endChoice()
+            ;
+    }
+}
+"#
+        ),
+        "{strict}"
+    );
+
+    let count = route("CountFlowRoute");
+    assert!(
+        count.contains(
+            r#"
+            .setProperty("retries", constant(3))
+            .choice()
+                .when(exchange -> isNumber(exchange.getProperty("retries"), 3))
+                    .setBody(constant("three"))
+                .when(exchange -> !"3".equals(exchange.getProperty("retries")))
+                    .setBody(constant("not the text"))
+                .when(exchange -> exchange.getProperty("retries") == null)
+                    .setBody(constant("none"))
+            .endChoice()
+            ;
+    }
+
+    // Whether value is a number equal to expected, as Mule compares numbers:
+"#
+        ),
+        "{count}"
+    );
+    assert!(
+        count.contains("    private static boolean isNumber(Object value, long expected) {\n"),
+        "{count}"
+    );
+
+    let alias = route("AliasFlowRoute");
+    assert!(
+        alias.contains(
+            r#"
+            .setProperty("originalPayload", simple("${body}"))
+            .choice()
+                // TODO: review this condition (Mule: #[vars.originalPayload == 'A'])
+                // - converted assuming variable originalPayload holds a value this application set from a literal; it is also set at: set-variable in flow aliasFlow from #[payload]. Check the comparison
+                .when(exchange -> "A".equals(exchange.getProperty("originalPayload")))
+                    .setBody(constant("when"))
+                .otherwise()
+                    .setBody(constant("otherwise"))
+            .endChoice()
+"#
+        ),
+        "{alias}"
+    );
+
+    // No comparison is written in Simple, and no class without a number
+    // comparison gets the method for it.
+    for java in [&strict, &count, &alias] {
+        assert!(!java.contains("simple(\"${exchangeProperty"), "{java}");
+    }
+    for java in [&strict, &alias] {
+        assert!(!java.contains("isNumber"), "{java}");
+    }
+
+    // One row per choice, in the order of the flows.
+    let choices: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element == "choice")
+        .collect();
+    assert_eq!(choices.len(), 3, "{choices:?}");
+    for done in &choices[..2] {
+        assert_eq!(done.status, report::DecisionStatus::Done, "{done:?}");
+        assert_eq!(done.rationale, "choice -> choice");
+    }
+    let flagged = choices[2];
+    assert_eq!(flagged.status, report::DecisionStatus::ManualReview);
+    assert_eq!(flagged.rule_id.as_deref(), Some("choice-router"));
+    assert_eq!(
+        flagged.rationale,
+        "choice -> choice; review: 1 of 1 conditions are converted to an exact comparison of the \
+         exchange property, which is Mule's result only on an assumption that has to be \
+         checked: #[vars.originalPayload == 'A'] (converted assuming variable originalPayload \
+         holds a value this application set from a literal; it is also set at: set-variable in \
+         flow aliasFlow from #[payload]. Check the comparison)"
+    );
+}
+
+/// `value="${app.greeting}"` is a property placeholder, which Mule resolves
+/// when the application starts. One the migration could not resolve from
+/// the properties of the project used to be emitted as the string constant
+/// `"${app.greeting}"` and reported as done. It is not converted: the step
+/// fails, the report says why and names the Camel replacement. A
+/// placeholder that is resolved from the project's properties is still the
+/// constant it stands for.
+#[tokio::test]
+async fn unresolved_property_placeholder_in_a_value_is_not_emitted_as_a_constant() {
+    let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <flow name="greetFlow">
+        <http:listener config-ref="HTTP_config" path="/greet" allowedMethods="GET" />
+        <set-variable variableName="greeting" value="${app.greeting}" />
+        <set-variable variableName="name" value="${app.name}" />
+        <set-payload value="Hello ${app.missing}" />
+    </flow>
+</mule>"##;
+    let dir = make_project(xml);
+    let resources = dir.path().join("src/main/resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(
+        resources.join("application.properties"),
+        "app.name=orders\n",
+    )
+    .unwrap();
+
+    let project = parser::parse_project(dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &[], None).await.unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+    let java = std::fs::read_to_string(
+        out.path()
+            .join("src/main/java/generated/routes/GreetFlowRoute.java"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        code_lines(&java)
+            .into_iter()
+            .skip_while(|l| !l.starts_with("from("))
+            .collect::<Vec<_>>(),
+        [
+            r#"from("platform-http:/greet?httpMethodRestrict=GET")"#,
+            r#".routeId("greetFlow")"#,
+            r#".throwException(new UnsupportedOperationException("setProperty(\"greeting\") value not migrated: ${app.greeting}"))"#,
+            r#".setProperty("name", constant("orders"))"#,
+            r#".throwException(new UnsupportedOperationException("setBody value not migrated: Hello ${app.missing}"))"#,
+            ";",
+            "}",
+            "}",
+        ],
+        "{java}"
+    );
+    assert!(
+        java.contains(
+            r#"// TODO: review this setProperty("greeting"), its value is not converted (Mule: ${app.greeting})"#
+        ),
+        "{java}"
+    );
+
+    let statuses: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element.starts_with("set-"))
+        .map(|d| (d.mule_element.as_str(), d.status))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("set-variable", report::DecisionStatus::ManualReview),
+            ("set-variable", report::DecisionStatus::Done),
+            ("set-payload", report::DecisionStatus::ManualReview),
+        ]
+    );
+    let greeting = decisions
+        .iter()
+        .find(|d| d.mule_element == "set-variable")
+        .unwrap();
+    assert!(
+        greeting.rationale.contains("${app.greeting}")
+            && greeting.rationale.contains("Mule property placeholder")
+            && greeting.rationale.contains("{{key}}"),
+        "{}",
+        greeting.rationale
+    );
+}

@@ -13,6 +13,11 @@ pub struct MuleProject {
     pub configs: Vec<MuleElement>,
     /// Merged key-value map from all application.properties / yaml files.
     pub properties: HashMap<String, String>,
+    /// Every other top-level element that has children: a global
+    /// `<error-handler>`, for example. They are not migrated; they are kept
+    /// so that what they do (set a variable, ...) can be taken into account.
+    #[serde(default)]
+    pub globals: Vec<MuleElement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

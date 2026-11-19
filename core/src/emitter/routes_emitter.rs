@@ -87,8 +87,59 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
 
     java.push_str("            ;\n");
     java.push_str("    }\n");
+    if compares_a_number(route) {
+        java.push_str(IS_NUMBER_METHOD);
+    }
     java.push_str("}\n");
     java
+}
+
+/// The method the predicate of a comparison with a number calls (see
+/// [`property_predicate`]); written into a route class that has one.
+///
+/// Mule compares numbers by value, whatever their Java type, and a number
+/// never equals a string or a boolean. No conversion is involved: a
+/// `BigDecimal` or `BigInteger` is compared as it is, every other `Number`
+/// has to give the expected value both as a `double` (no fraction is cut
+/// off) and as a `long` (no precision is lost above 2^53).
+const IS_NUMBER_METHOD: &str = r#"
+    // Whether value is a number equal to expected, as Mule compares numbers:
+    // by value, whatever the Java type (Integer 3, Long 3, Double 3.0 and
+    // BigDecimal 3.0 all equal 3), and never a String ("3") or a Boolean.
+    private static boolean isNumber(Object value, long expected) {
+        if (value instanceof java.math.BigDecimal decimal) {
+            return decimal.compareTo(java.math.BigDecimal.valueOf(expected)) == 0;
+        }
+        if (value instanceof java.math.BigInteger integer) {
+            return integer.equals(java.math.BigInteger.valueOf(expected));
+        }
+        return value instanceof Number number
+                && number.doubleValue() == expected
+                && number.longValue() == expected;
+    }
+"#;
+
+/// Whether a choice of the route (its exception clauses included) compares
+/// a property with a number, so that the class needs [`IS_NUMBER_METHOD`].
+fn compares_a_number(route: &CamelRoute) -> bool {
+    fn in_steps(steps: &[RouteStep]) -> bool {
+        steps.iter().any(|step| match step {
+            RouteStep::Choice { whens, otherwise } => {
+                whens.iter().any(|(condition, steps)| {
+                    matches!(
+                        condition,
+                        Expression::PropertyEquals {
+                            value: ComparedValue::Integer(_),
+                            ..
+                        }
+                    ) || in_steps(steps)
+                }) || otherwise.as_deref().is_some_and(in_steps)
+            }
+            RouteStep::Split { steps, .. } => in_steps(steps),
+            _ => false,
+        })
+    }
+    in_steps(&route.steps) || route.on_exceptions.iter().any(|eh| in_steps(&eh.steps))
 }
 
 /// Whether the route is written with `.errorHandler(noErrorHandler())`.
@@ -174,6 +225,37 @@ fn java_class_literal(class_name: &str) -> String {
 
 fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
     let pad = "    ".repeat(indent);
+
+    // A step whose value is a Mule expression that is not converted is not
+    // written as that step: the route fails there instead (see
+    // `emit_unconverted_step`).
+    let needs_value = match step {
+        RouteStep::SetBody { expression } => Some(("setBody".to_string(), "value", expression)),
+        RouteStep::SetHeader { name, expression } => {
+            Some((format!("setHeader(\"{name}\")"), "value", expression))
+        }
+        RouteStep::SetProperty { name, expression } => {
+            Some((format!("setProperty(\"{name}\")"), "value", expression))
+        }
+        RouteStep::Split { expression, .. } => {
+            Some(("split".to_string(), "expression", expression))
+        }
+        _ => None,
+    };
+    if let Some((what, part, Expression::Unconverted { original, reason })) = needs_value {
+        let mut notes = vec![reason.as_str(), UNCONVERTED_STEP_FAILS];
+        if matches!(step, RouteStep::Split { .. }) {
+            notes.push("the steps of the split follow it and are not reached");
+        }
+        emit_unconverted_step(java, &pad, &what, part, original, &notes);
+        if let RouteStep::Split { steps, .. } = step {
+            for s in steps {
+                emit_step_dsl(java, s, indent);
+            }
+        }
+        return;
+    }
+
     match step {
         RouteStep::SetBody { expression } => {
             java.push_str(&format!("{}.setBody({})\n", pad, expr_to_java(expression)));
@@ -221,6 +303,26 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
         RouteStep::Choice { whens, otherwise } => {
             java.push_str(&format!("{}.choice()\n", pad));
             for (expr, steps) in whens {
+                match expr {
+                    Expression::Unconverted { original, reason } => push_todo(
+                        java,
+                        &format!("{pad}    "),
+                        &format!("review this condition, it is not converted (Mule: {original})"),
+                        &[reason, UNCONVERTED_CONDITION_FAILS],
+                    ),
+                    Expression::PropertyEquals {
+                        original, review, ..
+                    } if !review.is_empty() => {
+                        let notes: Vec<&str> = review.iter().map(String::as_str).collect();
+                        push_todo(
+                            java,
+                            &format!("{pad}    "),
+                            &format!("review this condition (Mule: {original})"),
+                            &notes,
+                        );
+                    }
+                    _ => {}
+                }
                 java.push_str(&format!("{}    .when({})\n", pad, expr_to_java(expr)));
                 for s in steps {
                     emit_step_dsl(java, s, indent + 2);
@@ -279,6 +381,78 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize) {
     }
 }
 
+/// Why a step with an unconverted value is written as a step that throws.
+const UNCONVERTED_STEP_FAILS: &str = "the route fails at this step instead of going on with a \
+     wrong value; replace it with the converted step";
+/// Why an unconverted choice condition is written as a predicate that
+/// throws.
+const UNCONVERTED_CONDITION_FAILS: &str = "a message that reaches this condition fails here \
+     instead of taking a branch by guess; replace the predicate";
+
+/// The step `what` (`setBody`, `setProperty("name")`, ...) whose `part`
+/// (value, expression) is the Mule expression `original`, which is not
+/// converted.
+///
+/// The step cannot be written: there is nothing right to set. Writing the
+/// Mule expression as a string, or leaving the step out, would let the
+/// route go on with a wrong or missing value and give a wrong result
+/// without a sign of it. So the route says what is missing (`TODO`) and
+/// fails when it gets there: `throwException`, which compiles, lets the
+/// application start, and is handled like any other failure of the route.
+fn emit_unconverted_step(
+    java: &mut String,
+    pad: &str,
+    what: &str,
+    part: &str,
+    original: &str,
+    notes: &[&str],
+) {
+    push_todo(
+        java,
+        pad,
+        &format!("review this {what}, its {part} is not converted (Mule: {original})"),
+        notes,
+    );
+    java.push_str(&format!(
+        "{pad}.throwException(new UnsupportedOperationException(\"{}\"))\n",
+        escape_java(&format!(
+            "{what} {part} not migrated: {}",
+            expression_for_message(original)
+        ))
+    ));
+}
+
+/// How many characters of a Mule expression an exception message quotes.
+const MESSAGE_EXPRESSION_LIMIT: usize = 200;
+
+/// The Mule expression `original` as it is quoted in the message of the
+/// exception that an unconverted step or condition throws: all of it up to
+/// [`MESSAGE_EXPRESSION_LIMIT`] characters, else its beginning (cut between
+/// two characters) and a note. A Java string constant holds at most 65535
+/// bytes, and a message of that size would not help anybody; the `TODO`
+/// in front of the step has the whole expression.
+fn expression_for_message(original: &str) -> String {
+    match original.char_indices().nth(MESSAGE_EXPRESSION_LIMIT) {
+        Some((end, _)) => format!(
+            "{}... (truncated, full expression in the TODO above)",
+            &original[..end]
+        ),
+        None => original.to_string(),
+    }
+}
+
+/// A `// TODO: <title>` comment followed by one `// - <note>` per note.
+fn push_todo(java: &mut String, pad: &str, title: &str, notes: &[&str]) {
+    for line in comment_lines(&format!("TODO: {title}")) {
+        java.push_str(&format!("{pad}// {line}\n"));
+    }
+    for note in notes {
+        for line in comment_lines(&format!("- {note}")) {
+            java.push_str(&format!("{pad}// {line}\n"));
+        }
+    }
+}
+
 /// `text` as the lines of a `//` comment, one comment line per text line.
 ///
 /// The text comes from the Mule XML (attribute values quoted in review
@@ -316,20 +490,87 @@ fn comment_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// `expr` as the Java argument of the step that uses it.
+///
+/// [`Expression::Unconverted`] comes out as a predicate that throws. That
+/// is its form as a choice condition, the one place it is written as an
+/// argument: Camel evaluates the conditions of a choice in order, so the
+/// branches in front of it behave as in Mule, and a message that gets as
+/// far as this condition fails there - neither this branch, nor a later
+/// one, nor the otherwise branch is taken on a guess. (A condition that
+/// never matches would hand such a message to a later branch without a
+/// sign that anything is wrong.) Steps that need a value never get here
+/// with it, see `emit_step_dsl`.
 fn expr_to_java(expr: &Expression) -> String {
     match expr {
         Expression::Constant(s) => format!("constant(\"{}\")", escape_java(s)),
+        Expression::Literal(s) => format!("constant({})", s),
         Expression::Simple(s) => format!("simple(\"{}\")", escape_java(s)),
         Expression::Header(s) => format!("header(\"{}\")", s),
         Expression::Property(s) => format!("exchangeProperty(\"{}\")", s),
         Expression::BeanRef(s) => format!("method(\"{}\")", s),
+        Expression::Unconverted { original, .. } => format!(
+            "exchange -> {{ throw new UnsupportedOperationException(\"{}\"); }}",
+            escape_java(&format!(
+                "choice condition not migrated: {}",
+                expression_for_message(original)
+            ))
+        ),
+        Expression::PropertyEquals {
+            name,
+            value,
+            negated,
+            ..
+        } => property_predicate(name, value, *negated),
     }
 }
 
+/// The Java predicate for "exchange property `name` equals `value`"
+/// (`negated`: does not equal), with Mule's equality: no type is converted.
+///
+/// It is a lambda on the property's Java value, not a Simple expression:
+/// Simple's `==` converts one side to the type of the other, so the string
+/// `"true"` would equal `true` and `"3"` would equal 3.
+///
+/// * a string: `"A".equals(value)` is true only for a `String` with that
+///   text (never for null);
+/// * a boolean: `Boolean.TRUE.equals(value)` is true only for a `Boolean`;
+/// * a number: `isNumber(value, 3)`, see [`IS_NUMBER_METHOD`];
+/// * null: the property is not set, or set to null.
+///
+/// "Does not equal" is the same test with `!` in front (`!= null` for
+/// null), so it is the exact opposite for every value.
+fn property_predicate(name: &str, value: &ComparedValue, negated: bool) -> String {
+    let property = format!("exchange.getProperty(\"{}\")", escape_java(name));
+    let not = if negated { "!" } else { "" };
+    match value {
+        ComparedValue::Text(text) => {
+            format!(
+                "exchange -> {not}\"{}\".equals({property})",
+                escape_java(text)
+            )
+        }
+        ComparedValue::Boolean(value) => {
+            let constant = if *value { "TRUE" } else { "FALSE" };
+            format!("exchange -> {not}Boolean.{constant}.equals({property})")
+        }
+        ComparedValue::Integer(number) => {
+            format!("exchange -> {not}isNumber({property}, {number})")
+        }
+        ComparedValue::Null => {
+            let operator = if negated { "!=" } else { "==" };
+            format!("exchange -> {property} {operator} null")
+        }
+    }
+}
+
+/// `s` as the content of a Java string literal. A line terminator (LF or
+/// CR) inside the quotes would end the literal for javac.
 fn escape_java(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn data_format_java(fmt: &DataFormat) -> &'static str {
@@ -1243,5 +1484,454 @@ mod tests {
             Some("false")
         );
         assert!(!pom.contains("quarkus.package.type"));
+    }
+
+    // ── Expressions that are not converted ──────────────────────────────
+
+    fn http_route(steps: Vec<RouteStep>) -> String {
+        generate_route_builder(
+            "OrdersRoute",
+            &CamelRoute {
+                id: "orders".into(),
+                source: RouteEndpoint::Uri("platform-http:/orders".into()),
+                steps,
+                on_exceptions: vec![],
+            },
+        )
+    }
+
+    fn unconverted(original: &str, reason: &str) -> Expression {
+        Expression::Unconverted {
+            original: original.into(),
+            reason: reason.into(),
+        }
+    }
+
+    fn set_body(text: &str) -> RouteStep {
+        RouteStep::SetBody {
+            expression: Expression::Constant(text.into()),
+        }
+    }
+
+    fn property_equals(name: &str, value: ComparedValue, negated: bool) -> Expression {
+        Expression::PropertyEquals {
+            original: "#[mule]".into(),
+            name: name.into(),
+            value,
+            negated,
+            review: vec![],
+        }
+    }
+
+    /// One `when` per condition, each with the body `x`.
+    fn choice_of(conditions: Vec<Expression>) -> RouteStep {
+        RouteStep::Choice {
+            whens: conditions
+                .into_iter()
+                .map(|condition| (condition, vec![set_body("x")]))
+                .collect(),
+            otherwise: None,
+        }
+    }
+
+    /// The branch stays where it is; its condition is a predicate that
+    /// throws, so a message that gets that far fails instead of being
+    /// routed by a guess. Branches in front of it work as before.
+    #[test]
+    fn unconverted_choice_condition_is_a_predicate_that_throws() {
+        let java = http_route(vec![RouteStep::Choice {
+            whens: vec![
+                (
+                    property_equals("type", ComparedValue::Text("A".into()), false),
+                    vec![set_body("a")],
+                ),
+                (
+                    unconverted("#[payload.type == 'B']", "the payload type is not known"),
+                    vec![set_body("b")],
+                ),
+            ],
+            otherwise: Some(vec![set_body("c")]),
+        }]);
+        assert!(
+            java.contains(
+                r#"
+            .choice()
+                .when(exchange -> "A".equals(exchange.getProperty("type")))
+                    .setBody(constant("a"))
+                // TODO: review this condition, it is not converted (Mule: #[payload.type == 'B'])
+                // - the payload type is not known
+                // - a message that reaches this condition fails here instead of taking a branch by guess; replace the predicate
+                .when(exchange -> { throw new UnsupportedOperationException("choice condition not migrated: #[payload.type == 'B']"); })
+                    .setBody(constant("b"))
+                .otherwise()
+                    .setBody(constant("c"))
+            .endChoice()
+            ;
+"#
+            ),
+            "{java}"
+        );
+    }
+
+    /// A value that is not converted: the route fails at that step. It is
+    /// neither set to the Mule expression as text nor skipped.
+    #[test]
+    fn unconverted_value_is_a_step_that_throws() {
+        let java = http_route(vec![
+            RouteStep::SetProperty {
+                name: "id".into(),
+                expression: unconverted("#[payload.id]", "the payload type is not known"),
+            },
+            RouteStep::SetBody {
+                expression: unconverted("#[now()]", "now() is a function"),
+            },
+            RouteStep::SetHeader {
+                name: "x-id".into(),
+                expression: unconverted("#[uuid()]", "uuid() is a function"),
+            },
+        ]);
+        assert!(
+            java.contains(
+                r#"
+            .routeId("orders")
+            // TODO: review this setProperty("id"), its value is not converted (Mule: #[payload.id])
+            // - the payload type is not known
+            // - the route fails at this step instead of going on with a wrong value; replace it with the converted step
+            .throwException(new UnsupportedOperationException("setProperty(\"id\") value not migrated: #[payload.id]"))
+            // TODO: review this setBody, its value is not converted (Mule: #[now()])
+            // - now() is a function
+            // - the route fails at this step instead of going on with a wrong value; replace it with the converted step
+            .throwException(new UnsupportedOperationException("setBody value not migrated: #[now()]"))
+            // TODO: review this setHeader("x-id"), its value is not converted (Mule: #[uuid()])
+            // - uuid() is a function
+            // - the route fails at this step instead of going on with a wrong value; replace it with the converted step
+            .throwException(new UnsupportedOperationException("setHeader(\"x-id\") value not migrated: #[uuid()]"))
+            ;
+"#
+            ),
+            "{java}"
+        );
+        assert!(!java.contains("simple(\"#["), "{java}");
+        assert!(!java.contains("constant(\"#["), "{java}");
+    }
+
+    /// The steps of a split whose expression is not converted stay in the
+    /// route, behind the step that fails.
+    #[test]
+    fn unconverted_split_expression_is_a_step_that_throws() {
+        let java = http_route(vec![RouteStep::Split {
+            expression: unconverted("#[payload.items]", "the payload type is not known"),
+            parallel: false,
+            aggregation_strategy: None,
+            steps: vec![set_body("item")],
+        }]);
+        assert!(
+            java.contains(
+                r#"
+            .routeId("orders")
+            // TODO: review this split, its expression is not converted (Mule: #[payload.items])
+            // - the payload type is not known
+            // - the route fails at this step instead of going on with a wrong value; replace it with the converted step
+            // - the steps of the split follow it and are not reached
+            .throwException(new UnsupportedOperationException("split expression not migrated: #[payload.items]"))
+            .setBody(constant("item"))
+            ;
+"#
+            ),
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn literal_is_written_as_a_java_literal_not_as_a_string() {
+        let java = http_route(vec![
+            RouteStep::SetProperty {
+                name: "count".into(),
+                expression: Expression::Literal("42".into()),
+            },
+            RouteStep::Choice {
+                whens: vec![(Expression::Literal("true".into()), vec![set_body("a")])],
+                otherwise: None,
+            },
+        ]);
+        assert!(
+            java.contains(
+                r#"
+            .setProperty("count", constant(42))
+            .choice()
+                .when(constant(true))
+                    .setBody(constant("a"))
+            .endChoice()
+"#
+            ),
+            "{java}"
+        );
+    }
+
+    /// The Mule expression is quoted in a comment and in a string literal;
+    /// it must not be able to leave either.
+    #[test]
+    fn unconverted_expression_cannot_break_out_of_comment_or_string() {
+        let original = "#[vars.dir == \"C:\\users\"]\r\n.stop()";
+        let java = http_route(vec![RouteStep::Choice {
+            whens: vec![(unconverted(original, "why"), vec![set_body("a")])],
+            otherwise: None,
+        }]);
+        assert!(
+            java.contains(
+                r#"
+                // TODO: review this condition, it is not converted (Mule: #[vars.dir == "C:\\users"]
+                // .stop())
+                // - why
+"#
+            ),
+            "{java}"
+        );
+        assert!(
+            java.contains(
+                r#"("choice condition not migrated: #[vars.dir == \"C:\\users\"]\r\n.stop()"); })"#
+            ),
+            "{java}"
+        );
+        for line in java.lines().map(str::trim) {
+            assert!(!line.starts_with(".stop()"), "{java}");
+        }
+    }
+
+    // ── Exact comparison of an exchange property ────────────────────────
+
+    /// Mule's `==` does not convert types, Simple's does. So the predicate
+    /// is Java on the value of the property: `equals` of a `String` or a
+    /// `Boolean` constant is true only for a value of that type, and `!=`
+    /// is the same test negated.
+    #[test]
+    fn property_comparison_is_a_java_predicate_that_does_not_convert_types() {
+        let java = http_route(vec![choice_of(vec![
+            property_equals("type", ComparedValue::Text("A".into()), false),
+            property_equals("type", ComparedValue::Text("A".into()), true),
+            property_equals("active", ComparedValue::Boolean(true), false),
+            property_equals("active", ComparedValue::Boolean(false), true),
+            property_equals("count", ComparedValue::Integer(3), false),
+            property_equals("count", ComparedValue::Integer(-1), true),
+            property_equals("id", ComparedValue::Null, false),
+            property_equals("id", ComparedValue::Null, true),
+        ])]);
+        let whens: Vec<&str> = java
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with(".when("))
+            .collect();
+        assert_eq!(
+            whens,
+            [
+                r#".when(exchange -> "A".equals(exchange.getProperty("type")))"#,
+                r#".when(exchange -> !"A".equals(exchange.getProperty("type")))"#,
+                r#".when(exchange -> Boolean.TRUE.equals(exchange.getProperty("active")))"#,
+                r#".when(exchange -> !Boolean.FALSE.equals(exchange.getProperty("active")))"#,
+                r#".when(exchange -> isNumber(exchange.getProperty("count"), 3))"#,
+                r#".when(exchange -> !isNumber(exchange.getProperty("count"), -1))"#,
+                r#".when(exchange -> exchange.getProperty("id") == null)"#,
+                r#".when(exchange -> exchange.getProperty("id") != null)"#,
+            ],
+            "{java}"
+        );
+        assert!(!java.contains("simple("), "{java}");
+        assert!(!java.contains("TODO"), "{java}");
+    }
+
+    /// A number equals a number of any Java type with the same value, and
+    /// nothing else. The method that decides it is part of the class that
+    /// calls it, and only of such a class.
+    #[test]
+    fn class_that_compares_a_number_gets_the_method_that_does_it() {
+        let number = || property_equals("count", ComparedValue::Integer(3), false);
+        let method = r#"
+            ;
+    }
+
+    // Whether value is a number equal to expected, as Mule compares numbers:
+    // by value, whatever the Java type (Integer 3, Long 3, Double 3.0 and
+    // BigDecimal 3.0 all equal 3), and never a String ("3") or a Boolean.
+    private static boolean isNumber(Object value, long expected) {
+        if (value instanceof java.math.BigDecimal decimal) {
+            return decimal.compareTo(java.math.BigDecimal.valueOf(expected)) == 0;
+        }
+        if (value instanceof java.math.BigInteger integer) {
+            return integer.equals(java.math.BigInteger.valueOf(expected));
+        }
+        return value instanceof Number number
+                && number.doubleValue() == expected
+                && number.longValue() == expected;
+    }
+}
+"#;
+
+        let direct = http_route(vec![choice_of(vec![number()])]);
+        assert!(direct.ends_with(method), "{direct}");
+
+        // Nested in a branch, in a split and in an exception clause.
+        let nested = http_route(vec![RouteStep::Choice {
+            whens: vec![(
+                Expression::Literal("true".into()),
+                vec![RouteStep::Split {
+                    expression: Expression::Simple("${body}".into()),
+                    parallel: false,
+                    aggregation_strategy: None,
+                    steps: vec![choice_of(vec![number()])],
+                }],
+            )],
+            otherwise: None,
+        }]);
+        assert!(nested.ends_with(method), "{nested}");
+
+        let otherwise = http_route(vec![RouteStep::Choice {
+            whens: vec![],
+            otherwise: Some(vec![choice_of(vec![number()])]),
+        }]);
+        assert!(otherwise.ends_with(method), "{otherwise}");
+
+        let handler = generate_route_builder(
+            "OrdersRoute",
+            &CamelRoute {
+                id: "orders".into(),
+                source: RouteEndpoint::Uri("platform-http:/orders".into()),
+                steps: vec![],
+                on_exceptions: vec![ExceptionHandler {
+                    exception_classes: vec!["java.lang.Exception".into()],
+                    handled: true,
+                    steps: vec![choice_of(vec![number()])],
+                }],
+            },
+        );
+        assert!(handler.ends_with(method), "{handler}");
+
+        let without = http_route(vec![choice_of(vec![
+            property_equals("type", ComparedValue::Text("A".into()), false),
+            property_equals("active", ComparedValue::Boolean(true), false),
+            property_equals("id", ComparedValue::Null, true),
+        ])]);
+        assert!(!without.contains("isNumber"), "{without}");
+        assert!(without.ends_with("            ;\n    }\n}\n"), "{without}");
+    }
+
+    /// A comparison that rests on an assumption is emitted all the same,
+    /// with what has to be checked in a TODO in front of it. The notes and
+    /// the Mule expression come from the Mule XML and stay in the comment.
+    #[test]
+    fn property_comparison_to_review_gets_a_todo_and_is_still_emitted() {
+        let java = http_route(vec![choice_of(vec![
+            Expression::PropertyEquals {
+                original: "#[vars.kind == 'A']".into(),
+                name: "kind".into(),
+                value: ComparedValue::Text("A".into()),
+                negated: false,
+                review: vec![
+                    "first note".into(),
+                    "second note */\r.stop() C:\\users".into(),
+                ],
+            },
+            property_equals("kind", ComparedValue::Text("B".into()), false),
+        ])]);
+        assert!(
+            java.contains(
+                r#"
+            .choice()
+                // TODO: review this condition (Mule: #[vars.kind == 'A'])
+                // - first note
+                // - second note */
+                // .stop() C:\\users
+                .when(exchange -> "A".equals(exchange.getProperty("kind")))
+                    .setBody(constant("x"))
+                .when(exchange -> "B".equals(exchange.getProperty("kind")))
+                    .setBody(constant("x"))
+            .endChoice()
+"#
+            ),
+            "{java}"
+        );
+    }
+
+    /// The text and the property name end up in Java string literals.
+    #[test]
+    fn property_comparison_escapes_what_it_puts_into_string_literals() {
+        let java = http_route(vec![choice_of(vec![property_equals(
+            "a\"b",
+            ComparedValue::Text("say \"hi\" C:\\users\n${x} {{y}}".into()),
+            false,
+        )])]);
+        assert!(
+            java.contains(
+                r#".when(exchange -> "say \"hi\" C:\\users\n${x} {{y}}".equals(exchange.getProperty("a\"b")))"#
+            ),
+            "{java}"
+        );
+    }
+
+    // ── Long expressions ────────────────────────────────────────────────
+
+    /// The Mule expression is quoted in the message of the exception. A
+    /// Java string constant holds at most 65535 bytes: with an expression
+    /// of 81 KB the route class did not compile ("constant string too
+    /// long"). The message gets the beginning of the expression, cut
+    /// between two characters, and says so; the TODO keeps all of it.
+    #[test]
+    fn long_expression_is_cut_in_the_exception_message_and_kept_in_the_todo() {
+        // Two bytes per character, so that a cut by bytes would show.
+        let original = format!("#[payload.name == '{}']", "\u{e9}".repeat(81_000));
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![(unconverted(&original, "why"), vec![set_body("a")])],
+                otherwise: None,
+            },
+            RouteStep::SetBody {
+                expression: unconverted(&original, "why"),
+            },
+        ]);
+
+        let cut: String = original.chars().take(200).collect();
+        let marker = "... (truncated, full expression in the TODO above)";
+        assert!(
+            java.contains(&format!(
+                r#".when(exchange -> {{ throw new UnsupportedOperationException("choice condition not migrated: {cut}{marker}"); }})"#
+            )),
+            "the condition is not cut as expected"
+        );
+        assert!(
+            java.contains(&format!(
+                r#".throwException(new UnsupportedOperationException("setBody value not migrated: {cut}{marker}"))"#
+            )),
+            "the step is not cut as expected"
+        );
+        // No line of code is anywhere near the limit of a string constant.
+        for line in java.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            assert!(
+                line.len() < 1000,
+                "{} bytes of code in one line",
+                line.len()
+            );
+        }
+        // Both TODO comments have the whole expression.
+        assert_eq!(
+            java.matches(&format!("(Mule: {original})")).count(),
+            2,
+            "the TODO does not keep the full expression"
+        );
+    }
+
+    /// An expression of up to 200 characters is quoted as it is.
+    #[test]
+    fn expression_of_200_characters_is_not_cut() {
+        let original = format!("#[{}]", "a".repeat(197));
+        assert_eq!(original.chars().count(), 200);
+        let java = http_route(vec![RouteStep::SetBody {
+            expression: unconverted(&original, "why"),
+        }]);
+        assert!(
+            java.contains(&format!(
+                r#".throwException(new UnsupportedOperationException("setBody value not migrated: {original}"))"#
+            )),
+            "{java}"
+        );
+        assert!(!java.contains("truncated"), "{java}");
     }
 }

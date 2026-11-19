@@ -86,14 +86,86 @@ pub enum RouteStep {
     RawDsl(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl RouteStep {
+    /// Whether the step needs a value (`setBody`, `setHeader`,
+    /// `setProperty`) or an expression (`split`) that is a Mule expression
+    /// which is not converted. Such a step is not emitted as that step: the
+    /// route throws there (see [`Expression::Unconverted`]), and whatever
+    /// describes the route has to say so.
+    pub fn is_unconverted(&self) -> bool {
+        matches!(
+            self,
+            RouteStep::SetBody { expression }
+                | RouteStep::SetHeader { expression, .. }
+                | RouteStep::SetProperty { expression, .. }
+                | RouteStep::Split { expression, .. }
+                if matches!(expression, Expression::Unconverted { .. })
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expression {
+    /// A string constant: `constant("text")`.
     Constant(String),
+    /// A constant that is not a string, written as the Java literal it is:
+    /// `constant(42)`, `constant(true)`.
+    Literal(String),
     Simple(String),
     Header(String),
     Property(String),
     /// Reference to a generated bean that produces the value.
     BeanRef(String),
+    /// A Mule expression that is not converted (see `docs/mapping/MATRIX.md`,
+    /// "Expressions"): `original` is the Mule attribute value, `reason` says
+    /// why it is left to a person.
+    ///
+    /// It is never emitted as an expression Camel would evaluate. The
+    /// emitter writes the step so that the route compiles and starts, says
+    /// in a `TODO` what is missing, and fails when the step is reached: a
+    /// choice condition becomes a predicate that throws, a step that needs
+    /// the value (`setBody`, `setProperty`, ...) becomes `throwException`.
+    Unconverted {
+        original: String,
+        reason: String,
+    },
+    /// A Mule condition `vars.name == value` / `vars.name != value` with a
+    /// literal value, as an exact comparison of the exchange property
+    /// `name`: Mule's `==` does not convert types, so the property equals
+    /// the value only if it holds a value of that type (see
+    /// [`ComparedValue`]); `negated` is `!=`, the exact opposite.
+    ///
+    /// The emitter writes it as a Java predicate on the property, not in
+    /// Simple, whose `==` converts one side to the type of the other.
+    ///
+    /// `review` holds what a person has to check before relying on it (for
+    /// example that the variable is also set from something that is not a
+    /// literal). The predicate is emitted either way; with a note the
+    /// emitter puts a `TODO` in front of it, quoting `original`, the Mule
+    /// expression as written.
+    PropertyEquals {
+        original: String,
+        name: String,
+        value: ComparedValue,
+        negated: bool,
+        review: Vec<String>,
+    },
+}
+
+/// The literal an exchange property is compared with in
+/// [`Expression::PropertyEquals`], and when the property equals it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComparedValue {
+    /// The property holds a `java.lang.String` with this text.
+    Text(String),
+    /// The property holds a `java.lang.Number` of any type with this
+    /// value: `Integer` 3, `Long` 3, `Double` 3.0 and `BigDecimal` 3.0 all
+    /// equal 3; the string `"3"` does not.
+    Integer(i32),
+    /// The property holds a `java.lang.Boolean` with this value.
+    Boolean(bool),
+    /// The property is not set, or set to null.
+    Null,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

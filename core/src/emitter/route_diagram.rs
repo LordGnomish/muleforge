@@ -99,7 +99,21 @@ fn sanitize_id(s: &str) -> String {
         .collect()
 }
 
+/// The label of a step in the diagram.
+///
+/// A step whose value is not converted is emitted as a step that throws
+/// (see `RouteStep::is_unconverted`), and an unconverted choice condition
+/// as a predicate that throws: the label says so.
 fn step_label(step: &RouteStep) -> String {
+    if step.is_unconverted() {
+        let what = match step {
+            RouteStep::SetBody { .. } => "setBody".to_string(),
+            RouteStep::SetHeader { name, .. } => format!("setHeader({name})"),
+            RouteStep::SetProperty { name, .. } => format!("setProperty({name})"),
+            _ => "split".to_string(),
+        };
+        return format!("NOT MIGRATED: {what} (fails here)");
+    }
     match step {
         RouteStep::SetBody { .. } => "setBody".into(),
         RouteStep::SetHeader { name, .. } => format!("setHeader({})", name),
@@ -122,7 +136,20 @@ fn step_label(step: &RouteStep) -> String {
             }
         }
         RouteStep::ProcessBean(b) => format!("bean({})", b),
-        RouteStep::Choice { whens, .. } => format!("choice({} branches)", whens.len()),
+        RouteStep::Choice { whens, .. } => {
+            let unconverted = whens
+                .iter()
+                .filter(|(condition, _)| matches!(condition, Expression::Unconverted { .. }))
+                .count();
+            if unconverted > 0 {
+                format!(
+                    "choice({} branches, {unconverted} NOT MIGRATED)",
+                    whens.len()
+                )
+            } else {
+                format!("choice({} branches)", whens.len())
+            }
+        }
         RouteStep::Split { parallel, .. } => {
             if *parallel {
                 "split(parallel)".into()
@@ -151,5 +178,77 @@ fn step_class(step: &RouteStep) -> &'static str {
         RouteStep::Choice { .. } | RouteStep::Split { .. } => "router",
         RouteStep::Transform { .. } | RouteStep::ProcessBean(_) => "transform",
         _ => "processor",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unconverted() -> Expression {
+        Expression::Unconverted {
+            original: "#[now()]".into(),
+            reason: "why".into(),
+        }
+    }
+
+    /// A step whose value is not converted is emitted as a step that
+    /// throws: the diagram must not label it as the step it would be.
+    #[test]
+    fn step_with_an_unconverted_value_is_labelled_as_not_migrated() {
+        assert_eq!(
+            step_label(&RouteStep::SetBody {
+                expression: unconverted()
+            }),
+            "NOT MIGRATED: setBody (fails here)"
+        );
+        assert_eq!(
+            step_label(&RouteStep::SetHeader {
+                name: "x-id".into(),
+                expression: unconverted()
+            }),
+            "NOT MIGRATED: setHeader(x-id) (fails here)"
+        );
+        assert_eq!(
+            step_label(&RouteStep::SetProperty {
+                name: "id".into(),
+                expression: unconverted()
+            }),
+            "NOT MIGRATED: setProperty(id) (fails here)"
+        );
+        assert_eq!(
+            step_label(&RouteStep::Split {
+                expression: unconverted(),
+                parallel: true,
+                aggregation_strategy: None,
+                steps: vec![],
+            }),
+            "NOT MIGRATED: split (fails here)"
+        );
+        assert_eq!(
+            step_label(&RouteStep::SetBody {
+                expression: Expression::Constant("text".into())
+            }),
+            "setBody"
+        );
+    }
+
+    #[test]
+    fn choice_label_counts_the_conditions_that_are_not_migrated() {
+        let choice = |conditions: Vec<Expression>| RouteStep::Choice {
+            whens: conditions.into_iter().map(|c| (c, vec![])).collect(),
+            otherwise: None,
+        };
+        assert_eq!(
+            step_label(&choice(vec![
+                Expression::Literal("true".into()),
+                unconverted()
+            ])),
+            "choice(2 branches, 1 NOT MIGRATED)"
+        );
+        assert_eq!(
+            step_label(&choice(vec![Expression::Literal("true".into())])),
+            "choice(1 branches)"
+        );
     }
 }
