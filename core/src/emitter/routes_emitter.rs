@@ -415,8 +415,30 @@ fn emit_unconverted_step(
     );
     java.push_str(&format!(
         "{pad}.throwException(new UnsupportedOperationException(\"{}\"))\n",
-        escape_java(&format!("{what} {part} not migrated: {original}"))
+        escape_java(&format!(
+            "{what} {part} not migrated: {}",
+            expression_for_message(original)
+        ))
     ));
+}
+
+/// How many characters of a Mule expression an exception message quotes.
+const MESSAGE_EXPRESSION_LIMIT: usize = 200;
+
+/// The Mule expression `original` as it is quoted in the message of the
+/// exception that an unconverted step or condition throws: all of it up to
+/// [`MESSAGE_EXPRESSION_LIMIT`] characters, else its beginning (cut between
+/// two characters) and a note. A Java string constant holds at most 65535
+/// bytes, and a message of that size would not help anybody; the `TODO`
+/// in front of the step has the whole expression.
+fn expression_for_message(original: &str) -> String {
+    match original.char_indices().nth(MESSAGE_EXPRESSION_LIMIT) {
+        Some((end, _)) => format!(
+            "{}... (truncated, full expression in the TODO above)",
+            &original[..end]
+        ),
+        None => original.to_string(),
+    }
 }
 
 /// A `// TODO: <title>` comment followed by one `// - <note>` per note.
@@ -489,7 +511,10 @@ fn expr_to_java(expr: &Expression) -> String {
         Expression::BeanRef(s) => format!("method(\"{}\")", s),
         Expression::Unconverted { original, .. } => format!(
             "exchange -> {{ throw new UnsupportedOperationException(\"{}\"); }}",
-            escape_java(&format!("choice condition not migrated: {original}"))
+            escape_java(&format!(
+                "choice condition not migrated: {}",
+                expression_for_message(original)
+            ))
         ),
         Expression::PropertyEquals {
             name,
