@@ -1841,4 +1841,72 @@ mod tests {
             "{java}"
         );
     }
+
+    // ── Long expressions ────────────────────────────────────────────────
+
+    /// The Mule expression is quoted in the message of the exception. A
+    /// Java string constant holds at most 65535 bytes: with an expression
+    /// of 81 KB the route class did not compile ("constant string too
+    /// long"). The message gets the beginning of the expression, cut
+    /// between two characters, and says so; the TODO keeps all of it.
+    #[test]
+    fn long_expression_is_cut_in_the_exception_message_and_kept_in_the_todo() {
+        // Two bytes per character, so that a cut by bytes would show.
+        let original = format!("#[payload.name == '{}']", "\u{e9}".repeat(81_000));
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![(unconverted(&original, "why"), vec![set_body("a")])],
+                otherwise: None,
+            },
+            RouteStep::SetBody {
+                expression: unconverted(&original, "why"),
+            },
+        ]);
+
+        let cut: String = original.chars().take(200).collect();
+        let marker = "... (truncated, full expression in the TODO above)";
+        assert!(
+            java.contains(&format!(
+                r#".when(exchange -> {{ throw new UnsupportedOperationException("choice condition not migrated: {cut}{marker}"); }})"#
+            )),
+            "the condition is not cut as expected"
+        );
+        assert!(
+            java.contains(&format!(
+                r#".throwException(new UnsupportedOperationException("setBody value not migrated: {cut}{marker}"))"#
+            )),
+            "the step is not cut as expected"
+        );
+        // No line of code is anywhere near the limit of a string constant.
+        for line in java.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            assert!(
+                line.len() < 1000,
+                "{} bytes of code in one line",
+                line.len()
+            );
+        }
+        // Both TODO comments have the whole expression.
+        assert_eq!(
+            java.matches(&format!("(Mule: {original})")).count(),
+            2,
+            "the TODO does not keep the full expression"
+        );
+    }
+
+    /// An expression of up to 200 characters is quoted as it is.
+    #[test]
+    fn expression_of_200_characters_is_not_cut() {
+        let original = format!("#[{}]", "a".repeat(197));
+        assert_eq!(original.chars().count(), 200);
+        let java = http_route(vec![RouteStep::SetBody {
+            expression: unconverted(&original, "why"),
+        }]);
+        assert!(
+            java.contains(&format!(
+                r#".throwException(new UnsupportedOperationException("setBody value not migrated: {original}"))"#
+            )),
+            "{java}"
+        );
+        assert!(!java.contains("truncated"), "{java}");
+    }
 }
