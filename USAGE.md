@@ -5,7 +5,7 @@
 ### Prerequisites
 
 - **Rust 1.75+** (for building the core engine)
-- **Node.js 20+** (for the CLI)
+- **Node.js 22.12+** (for the CLI)
 - **Git** (for repository operations)
 
 ### Build from source
