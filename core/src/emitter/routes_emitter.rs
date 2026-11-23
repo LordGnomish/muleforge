@@ -1565,7 +1565,7 @@ mod tests {
                     .setBody(constant("b"))
                 .otherwise()
                     .setBody(constant("c"))
-            .endChoice()
+            .end()
             ;
 "#
             ),
@@ -1661,7 +1661,7 @@ mod tests {
             .choice()
                 .when(constant(true))
                     .setBody(constant("a"))
-            .endChoice()
+            .end()
 "#
             ),
             "{java}"
@@ -1844,7 +1844,7 @@ mod tests {
                     .setBody(constant("x"))
                 .when(exchange -> "B".equals(exchange.getProperty("kind")))
                     .setBody(constant("x"))
-            .endChoice()
+            .end()
 "#
             ),
             "{java}"
@@ -1933,5 +1933,404 @@ mod tests {
             "{java}"
         );
         assert!(!java.contains("truncated"), "{java}");
+    }
+
+    // ── Where a choice ends ─────────────────────────────────────────────
+
+    fn when_is(name: &str, text: &str) -> Expression {
+        property_equals(name, ComparedValue::Text(text.into()), false)
+    }
+
+    fn log(message: &str) -> RouteStep {
+        RouteStep::Log {
+            level: LogLevel::Info,
+            message: message.into(),
+        }
+    }
+
+    /// The steps of the route as they are written: the text between the
+    /// `routeId` line and the `;`.
+    fn route_steps(java: &str) -> &str {
+        let start = java.find("            .routeId(").expect("routeId");
+        let start = start + java[start..].find('\n').expect("line end") + 1;
+        let end = java.find("            ;\n").expect("end of route");
+        &java[start..end]
+    }
+
+    /// `.end()` closes the choice, so the step after it is a step of the
+    /// route and runs whichever branch was taken. (`.endChoice()` on a
+    /// choice returns that choice: what follows it goes into the last
+    /// branch.)
+    #[test]
+    fn choice_is_closed_with_end_and_the_next_step_follows_the_choice() {
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![
+                    (when_is("k", "a"), vec![log("A")]),
+                    (when_is("k", "b"), vec![log("B")]),
+                ],
+                otherwise: Some(vec![log("O")]),
+            },
+            log("AFTER"),
+            set_body("end"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r#"            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .log(LoggingLevel.INFO, "A")
+                .when(exchange -> "b".equals(exchange.getProperty("k")))
+                    .log(LoggingLevel.INFO, "B")
+                .otherwise()
+                    .log(LoggingLevel.INFO, "O")
+            .end()
+            .log(LoggingLevel.INFO, "AFTER")
+            .setBody(constant("end"))
+"#,
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn choice_without_otherwise_is_closed_before_the_next_step() {
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![(when_is("k", "a"), vec![log("A")])],
+                otherwise: None,
+            },
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r#"            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .log(LoggingLevel.INFO, "A")
+            .end()
+            .log(LoggingLevel.INFO, "AFTER")
+"#,
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn choice_as_the_last_step_of_the_route_is_closed() {
+        let java = http_route(vec![RouteStep::Choice {
+            whens: vec![(when_is("k", "a"), vec![set_body("A")])],
+            otherwise: Some(vec![set_body("O")]),
+        }]);
+        assert!(
+            java.ends_with(
+                r#"
+            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .setBody(constant("A"))
+                .otherwise()
+                    .setBody(constant("O"))
+            .end()
+            ;
+    }
+}
+"#
+            ),
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn two_choices_in_a_row_are_closed_one_after_the_other() {
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![(when_is("k", "a"), vec![log("1A")])],
+                otherwise: Some(vec![log("1O")]),
+            },
+            RouteStep::Choice {
+                whens: vec![(when_is("j", "x"), vec![log("2X")])],
+                otherwise: Some(vec![log("2O")]),
+            },
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r#"            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .log(LoggingLevel.INFO, "1A")
+                .otherwise()
+                    .log(LoggingLevel.INFO, "1O")
+            .end()
+            .choice()
+                .when(exchange -> "x".equals(exchange.getProperty("j")))
+                    .log(LoggingLevel.INFO, "2X")
+                .otherwise()
+                    .log(LoggingLevel.INFO, "2O")
+            .end()
+            .log(LoggingLevel.INFO, "AFTER")
+"#,
+            "{java}"
+        );
+    }
+
+    /// A choice in a branch of another choice: `.end()` closes the inner
+    /// one and `.endChoice()` gives the outer one back, so the `otherwise`
+    /// after it is the outer choice's. (Without them it would be a second
+    /// `otherwise` of the inner choice, and the application does not start.)
+    #[test]
+    fn choice_nested_in_a_when_goes_back_to_the_outer_choice() {
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![(
+                    when_is("k", "a"),
+                    vec![RouteStep::Choice {
+                        whens: vec![(when_is("j", "x"), vec![log("AX")])],
+                        otherwise: Some(vec![log("AO")]),
+                    }],
+                )],
+                otherwise: Some(vec![log("O")]),
+            },
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r#"            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("j")))
+                            .log(LoggingLevel.INFO, "AX")
+                        .otherwise()
+                            .log(LoggingLevel.INFO, "AO")
+                    .end().endChoice()
+                .otherwise()
+                    .log(LoggingLevel.INFO, "O")
+            .end()
+            .log(LoggingLevel.INFO, "AFTER")
+"#,
+            "{java}"
+        );
+    }
+
+    /// The steps after the inner choice stay in the branch of the outer
+    /// choice that the inner one is in, a `when` or the `otherwise`.
+    #[test]
+    fn steps_after_a_nested_choice_stay_in_the_branch_of_the_outer_choice() {
+        let inner = || RouteStep::Choice {
+            whens: vec![(when_is("j", "x"), vec![log("X")])],
+            otherwise: None,
+        };
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![
+                    (when_is("k", "a"), vec![log("Apre"), inner(), log("Apost")]),
+                    (when_is("k", "b"), vec![log("B")]),
+                ],
+                otherwise: Some(vec![log("Opre"), inner(), log("Opost")]),
+            },
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r#"            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .log(LoggingLevel.INFO, "Apre")
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("j")))
+                            .log(LoggingLevel.INFO, "X")
+                    .end().endChoice()
+                    .log(LoggingLevel.INFO, "Apost")
+                .when(exchange -> "b".equals(exchange.getProperty("k")))
+                    .log(LoggingLevel.INFO, "B")
+                .otherwise()
+                    .log(LoggingLevel.INFO, "Opre")
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("j")))
+                            .log(LoggingLevel.INFO, "X")
+                    .end().endChoice()
+                    .log(LoggingLevel.INFO, "Opost")
+            .end()
+            .log(LoggingLevel.INFO, "AFTER")
+"#,
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn choices_three_levels_deep_are_each_closed_at_their_own_level() {
+        let java = http_route(vec![
+            RouteStep::Choice {
+                whens: vec![(
+                    when_is("k", "a"),
+                    vec![
+                        RouteStep::Choice {
+                            whens: vec![(
+                                when_is("j", "x"),
+                                vec![
+                                    RouteStep::Choice {
+                                        whens: vec![(when_is("i", "1"), vec![log("AX1")])],
+                                        otherwise: Some(vec![log("AXO")]),
+                                    },
+                                    log("AXpost"),
+                                ],
+                            )],
+                            otherwise: Some(vec![log("AO")]),
+                        },
+                        log("Apost"),
+                    ],
+                )],
+                otherwise: Some(vec![log("O")]),
+            },
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r#"            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("j")))
+                            .choice()
+                                .when(exchange -> "1".equals(exchange.getProperty("i")))
+                                    .log(LoggingLevel.INFO, "AX1")
+                                .otherwise()
+                                    .log(LoggingLevel.INFO, "AXO")
+                            .end().endChoice()
+                            .log(LoggingLevel.INFO, "AXpost")
+                        .otherwise()
+                            .log(LoggingLevel.INFO, "AO")
+                    .end().endChoice()
+                    .log(LoggingLevel.INFO, "Apost")
+                .otherwise()
+                    .log(LoggingLevel.INFO, "O")
+            .end()
+            .log(LoggingLevel.INFO, "AFTER")
+"#,
+            "{java}"
+        );
+    }
+
+    /// In an exception clause the choice is closed with `.end()` as in a
+    /// route: the step after it is a step of the clause, whose own
+    /// `.end()` follows. A nested choice goes back to its outer choice.
+    #[test]
+    fn choice_in_an_exception_clause_is_closed_before_the_next_step() {
+        let java = route_java(vec![handler(
+            &["java.lang.Exception"],
+            true,
+            vec![
+                RouteStep::Choice {
+                    whens: vec![(
+                        when_is("k", "a"),
+                        vec![RouteStep::Choice {
+                            whens: vec![(when_is("j", "x"), vec![log("EAX")])],
+                            otherwise: Some(vec![log("EAO")]),
+                        }],
+                    )],
+                    otherwise: Some(vec![log("EO")]),
+                },
+                log("EAFTER"),
+            ],
+        )]);
+        assert!(
+            java.contains(
+                r#"
+        onException(java.lang.Exception.class)
+            .handled(true)
+            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("j")))
+                            .log(LoggingLevel.INFO, "EAX")
+                        .otherwise()
+                            .log(LoggingLevel.INFO, "EAO")
+                    .end().endChoice()
+                .otherwise()
+                    .log(LoggingLevel.INFO, "EO")
+            .end()
+            .log(LoggingLevel.INFO, "EAFTER")
+            .end();
+"#
+            ),
+            "{java}"
+        );
+    }
+
+    /// A split is a block as well: after its `.end()` in a branch of a
+    /// choice, `.endChoice()` gives the choice back (`.when(...)` and
+    /// `.otherwise()` are methods of the choice only). A choice in a split
+    /// is closed with `.end()` alone: that goes back to the split, and
+    /// `.endChoice()` there would close the split to look for a choice.
+    #[test]
+    fn split_in_a_choice_branch_goes_back_to_the_choice() {
+        let java = http_route(vec![RouteStep::Choice {
+            whens: vec![(
+                when_is("k", "a"),
+                vec![RouteStep::Split {
+                    expression: Expression::Simple("${body}".into()),
+                    parallel: false,
+                    aggregation_strategy: None,
+                    steps: vec![
+                        RouteStep::Choice {
+                            whens: vec![(when_is("j", "x"), vec![log("ITEM X")])],
+                            otherwise: Some(vec![log("ITEM O")]),
+                        },
+                        log("ITEM"),
+                    ],
+                }],
+            )],
+            otherwise: Some(vec![log("O")]),
+        }]);
+        assert_eq!(
+            route_steps(&java),
+            r#"            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("k")))
+                    .split(simple("${body}"))
+                        .choice()
+                            .when(exchange -> "x".equals(exchange.getProperty("j")))
+                                .log(LoggingLevel.INFO, "ITEM X")
+                            .otherwise()
+                                .log(LoggingLevel.INFO, "ITEM O")
+                        .end()
+                        .log(LoggingLevel.INFO, "ITEM")
+                    .end().endChoice()
+                .otherwise()
+                    .log(LoggingLevel.INFO, "O")
+            .end()
+"#,
+            "{java}"
+        );
+    }
+
+    /// The steps of a split whose expression is not converted are written
+    /// in place of the split, in the branch the split was in: a choice
+    /// among them is a choice in that branch.
+    #[test]
+    fn choice_behind_an_unconverted_split_in_a_branch_goes_back_to_the_outer_choice() {
+        let java = http_route(vec![RouteStep::Choice {
+            whens: vec![(
+                when_is("k", "a"),
+                vec![RouteStep::Split {
+                    expression: unconverted("#[payload.items]", "why"),
+                    parallel: false,
+                    aggregation_strategy: None,
+                    steps: vec![RouteStep::Choice {
+                        whens: vec![(when_is("j", "x"), vec![log("X")])],
+                        otherwise: None,
+                    }],
+                }],
+            )],
+            otherwise: Some(vec![log("O")]),
+        }]);
+        assert!(
+            java.contains(
+                r#"
+                    .throwException(new UnsupportedOperationException("split expression not migrated: #[payload.items]"))
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("j")))
+                            .log(LoggingLevel.INFO, "X")
+                    .end().endChoice()
+                .otherwise()
+                    .log(LoggingLevel.INFO, "O")
+            .end()
+            ;
+"#
+            ),
+            "{java}"
+        );
     }
 }
