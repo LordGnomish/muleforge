@@ -24,7 +24,7 @@ public class RouterFlowRoute extends RouteBuilder {
                     .setBody(constant("Routed to handler B"))
                 .otherwise()
                     .setBody(constant("Default handler"))
-            .endChoice()
+            .end()
             ;
     }
 }

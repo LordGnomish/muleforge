@@ -45,7 +45,7 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 
 | Mule Element | Camel Equivalent | Status | Notes |
 |---|---|---|---|
-| `choice` | `choice()` | ⚠️ Partial | Every `when` and the `otherwise` are kept, in order. Auto (`DONE`) when every condition is one of the converted shapes under [Expressions](#expressions) and every variable it compares is only set from literals; otherwise the choice is flagged `MANUAL_REVIEW`: an unconverted condition fails when it is evaluated, a comparison of a variable that may hold something else is emitted with a `TODO` |
+| `choice` | `choice()` | ⚠️ Partial | Every `when` and the `otherwise` are kept, in order. Auto (`DONE`) when every condition is one of the converted shapes under [Expressions](#expressions) and every variable it compares is only set from literals; otherwise the choice is flagged `MANUAL_REVIEW`: an unconverted condition fails when it is evaluated, a comparison of a variable that may hold something else is emitted with a `TODO`. The choice is closed with `.end()`, so the steps after `</choice>` follow it for every message; a `choice` in a `when` or `otherwise` of another one is closed with `.end().endChoice()`, see [Where a `choice` ends](#where-a-choice-ends) |
 | `scatter-gather` | `multicast()` | ✅ Auto | |
 | `split` | `split()` | ✅ Auto | Parallel flag preserved |
 | `foreach` | `split()` | ✅ Auto | Sequential split |
@@ -54,6 +54,76 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 | `until-successful` | Error handler retry | ✅ Auto | maxRetries + delay |
 | `async` | `wireTap()` | ✅ Auto | Fire-and-forget |
 | `idempotent-message-validator` | `idempotentConsumer()` | ✅ Auto | |
+
+### Where a `choice` ends
+
+A Mule `<choice>` ends at `</choice>`: the processors of a `when` or of the
+`otherwise` run for the messages that take that branch, the processors after
+`</choice>` for every message. The emitted choice is closed with `.end()`,
+and the steps after it are steps of the route again:
+
+```java
+.choice()
+    .when(exchange -> "a".equals(exchange.getProperty("kind")))
+        .log(LoggingLevel.INFO, "a")
+    .otherwise()
+        .log(LoggingLevel.INFO, "another kind")
+.end()
+.log(LoggingLevel.INFO, "after the choice")
+```
+
+A `choice` in a `when` or in the `otherwise` of another choice is closed with
+`.end().endChoice()`: `.end()` closes the inner choice, `.endChoice()` gives
+the outer one back. What follows belongs to the outer choice: further steps of
+the same branch, the next `.when(...)`, the `.otherwise()`, its `.end()`.
+
+```java
+.choice()
+    .when(exchange -> "a".equals(exchange.getProperty("kind")))
+        .choice()
+            .when(exchange -> "x".equals(exchange.getProperty("size")))
+                .log(LoggingLevel.INFO, "a, x")
+            .otherwise()
+                .log(LoggingLevel.INFO, "a, another size")
+        .end().endChoice()
+        .log(LoggingLevel.INFO, "after the inner choice, still kind a")
+    .otherwise()
+        .log(LoggingLevel.INFO, "another kind")
+.end()
+.log(LoggingLevel.INFO, "after the outer choice")
+```
+
+The rule is the same at every depth and in an on-error scope
+(`onException(...)`): a choice among the steps of a route, of an exception
+clause or of a split is closed with `.end()`; a choice or a split (`split`,
+`foreach`) in a branch of a choice with `.end().endChoice()`.
+
+`.endChoice()` alone, which used to be emitted, does not close a choice: called
+on a choice it returns that choice (`ProcessorDefinition.endChoice()`, Camel
+4.18.0). The steps after `</choice>` went into the last branch (the
+`otherwise`, or the last `when` if there is none) and ran only for the
+messages that took it, and the `.when(...)` / `.otherwise()` of an outer choice
+were added to the inner one: a wrong branch, or no start at all when both have
+an `otherwise` ("Cannot add a 2nd otherwise to this choice"). `.endChoice()` is
+not written anywhere but behind the `.end()` of a block in a branch. Behind
+the `.end()` of a choice among the steps of a route or of an exception clause
+it compiles and the application does not start ("Cannot endChoice() to find
+current/parent choice DSL", run). In a split it would end the split to look
+for a choice (read in `ProcessorDefinition.endChoice()`, not run).
+
+Checked on an emitted application that was built and run (Quarkus 3.33.1,
+Camel 4.18.0), 55 HTTP routes: steps after a choice for each `when` and the
+`otherwise`, a choice without `otherwise`, a choice as the last step, two
+choices in a row (also inside a `when`), a choice in a `when` and in the
+`otherwise` of another one with and without steps around it, three levels
+deep, and a choice with a nested one in an `on-error-continue` scope. Every
+branch and every step after a choice writes its own log line; each request
+logged exactly the lines the Mule flow runs, once each. A `foreach` in a
+`when`, with a choice in it, was checked the same way for its closing calls
+after its expression was replaced by hand (it is not converted, see
+[Not covered](#not-covered)). The Mule side rests on the documentation of the
+Choice router (its example logs the reply after `</choice>`, "END OF CHOICE
+BLOCK", whichever route ran); no Mule runtime was used.
 
 ## Transforms
 
@@ -355,13 +425,6 @@ own next to the row of the built-in mapping; its id is shown on that row.
 * A variable is an exchange property (`setProperty`), as before. Camel 4.4+
   also has variables (`setVariable`, `${variable.name}`); the mapping was not
   changed to them.
-* A `choice` nested in a `when` of another `choice` is closed with
-  `.endChoice()` only, which does not go back to the outer choice. Seen on
-  Camel 4.18 while checking the comparisons, with an inner and an outer choice
-  that both have an `otherwise`: the application does not start ("Cannot add a
-  2nd otherwise to this choice ... you may need to end().endChoice() to go
-  back to parent choice"). Not fixed here; other shapes of nesting were not
-  tried.
 * What MEL (Mule 3) does for `flowVars.x == literal` with values of different
   types was not checked; such a comparison is always `MANUAL_REVIEW`.
 
@@ -374,7 +437,12 @@ own next to the row of the built-in mapping; its id is shown on that row.
   the rightValue type to the leftValue type".
 * Apache Camel, Choice EIP:
   <https://camel.apache.org/components/next/eips/choice-eip.html>. "The first
-  when clause that matches determines which route branch to follow."
+  when clause that matches determines which route branch to follow." On the
+  Java DSL ("Why can I not use otherwise in Java DSL?"): "you do by using
+  `.endChoice()`, which tells Camel to "pop the stack" and return to the scope
+  of the Choice EIP"; the Javadoc of `ProcessorDefinition.endChoice()` (Camel
+  4.18.0): "If you want to end the entire choice block, then use `end()`
+  instead."
 * Apache Camel, Set Property, Set Body and Set Variable EIPs:
   <https://camel.apache.org/components/next/eips/setProperty-eip.html>,
   <https://camel.apache.org/components/next/eips/setBody-eip.html>,

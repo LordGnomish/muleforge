@@ -992,7 +992,7 @@ async fn hello_world_example_choice_conditions_are_flagged_and_fail_loudly() {
             r#".setBody(constant("Routed to handler B"))"#,
             ".otherwise()",
             r#".setBody(constant("Default handler"))"#,
-            ".endChoice()",
+            ".end()",
             ";",
         ],
         "{java}"
@@ -1163,7 +1163,7 @@ async fn variable_comparison_does_not_convert_types_and_says_when_it_rests_on_an
                     .setBody(constant("when"))
                 .otherwise()
                     .setBody(constant("otherwise"))
-            .endChoice()
+            .end()
             ;
     }
 }
@@ -1184,7 +1184,7 @@ async fn variable_comparison_does_not_convert_types_and_says_when_it_rests_on_an
                     .setBody(constant("not the text"))
                 .when(exchange -> exchange.getProperty("retries") == null)
                     .setBody(constant("none"))
-            .endChoice()
+            .end()
             ;
     }
 
@@ -1210,7 +1210,7 @@ async fn variable_comparison_does_not_convert_types_and_says_when_it_rests_on_an
                     .setBody(constant("when"))
                 .otherwise()
                     .setBody(constant("otherwise"))
-            .endChoice()
+            .end()
 "#
         ),
         "{alias}"
@@ -1335,4 +1335,211 @@ async fn unresolved_property_placeholder_in_a_value_is_not_emitted_as_a_constant
         "{}",
         greeting.rationale
     );
+}
+
+/// A Mule `<choice>` ends at `</choice>`: what follows it runs whichever
+/// branch was taken, also when the choice is in a branch of another choice
+/// or in an on-error scope.
+///
+/// In the Camel Java DSL `.end()` closes a choice. A choice (or a split) in
+/// a branch of another choice is followed by `.endChoice()` as well, which
+/// gives the outer choice back for the steps, the `.when(...)` and the
+/// `.otherwise()` that come after it. The route used to get `.endChoice()`
+/// alone, which leaves the choice open: the steps after `</choice>` went
+/// into its last branch, and the `otherwise` of an outer choice became a
+/// second `otherwise` of the inner one ("Cannot add a 2nd otherwise to this
+/// choice", the application does not start).
+#[tokio::test]
+async fn choice_ends_where_the_mule_choice_ends_at_every_level_of_nesting() {
+    let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <flow name="nestedFlow">
+        <http:listener config-ref="HTTP_config" path="/nested" allowedMethods="GET" />
+        <set-variable variableName="kind" value="a" />
+        <set-variable variableName="size" value="x" />
+        <choice>
+            <when expression="#[vars.kind == 'a']">
+                <choice>
+                    <when expression="#[vars.size == 'x']">
+                        <logger level="INFO" message="a, x" />
+                    </when>
+                    <otherwise>
+                        <logger level="INFO" message="a, another size" />
+                    </otherwise>
+                </choice>
+                <logger level="INFO" message="after the choice in when" />
+            </when>
+            <when expression="#[vars.kind == 'b']">
+                <logger level="INFO" message="b" />
+            </when>
+            <otherwise>
+                <choice>
+                    <when expression="#[vars.size == 'x']">
+                        <choice>
+                            <when expression="#[vars.kind == 'c']">
+                                <logger level="INFO" message="c, x" />
+                            </when>
+                            <otherwise>
+                                <logger level="INFO" message="another kind, x" />
+                            </otherwise>
+                        </choice>
+                    </when>
+                </choice>
+                <logger level="INFO" message="after the choice in otherwise" />
+            </otherwise>
+        </choice>
+        <logger level="INFO" message="after the first choice" />
+        <choice>
+            <when expression="#[vars.size == 'x']">
+                <logger level="INFO" message="x" />
+            </when>
+        </choice>
+        <set-payload value="done" />
+    </flow>
+    <flow name="lastFlow">
+        <http:listener config-ref="HTTP_config" path="/last" allowedMethods="GET" />
+        <set-variable variableName="kind" value="a" />
+        <choice>
+            <when expression="#[vars.kind == 'a']">
+                <set-payload value="a" />
+            </when>
+            <otherwise>
+                <set-payload value="other" />
+            </otherwise>
+        </choice>
+        <error-handler>
+            <on-error-continue>
+                <choice>
+                    <when expression="#[vars.kind == 'a']">
+                        <logger level="INFO" message="a failed" />
+                    </when>
+                    <otherwise>
+                        <logger level="INFO" message="another kind failed" />
+                    </otherwise>
+                </choice>
+                <set-payload value="failed" />
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>"##;
+    let dir = make_project(xml);
+    let project = parser::parse_project(dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let rules =
+        mapper::load_rules(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mappings"))
+            .unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+    let route = |class: &str| {
+        std::fs::read_to_string(
+            out.path()
+                .join(format!("src/main/java/generated/routes/{class}.java")),
+        )
+        .unwrap()
+    };
+
+    let nested = route("NestedFlowRoute");
+    assert!(
+        nested.contains(
+            r#"
+            .routeId("nestedFlow")
+            .setProperty("kind", constant("a"))
+            .setProperty("size", constant("x"))
+            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("kind")))
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("size")))
+                            .log(LoggingLevel.INFO, "a, x")
+                        .otherwise()
+                            .log(LoggingLevel.INFO, "a, another size")
+                    .end().endChoice()
+                    .log(LoggingLevel.INFO, "after the choice in when")
+                .when(exchange -> "b".equals(exchange.getProperty("kind")))
+                    .log(LoggingLevel.INFO, "b")
+                .otherwise()
+                    .choice()
+                        .when(exchange -> "x".equals(exchange.getProperty("size")))
+                            .choice()
+                                .when(exchange -> "c".equals(exchange.getProperty("kind")))
+                                    .log(LoggingLevel.INFO, "c, x")
+                                .otherwise()
+                                    .log(LoggingLevel.INFO, "another kind, x")
+                            .end().endChoice()
+                    .end().endChoice()
+                    .log(LoggingLevel.INFO, "after the choice in otherwise")
+            .end()
+            .log(LoggingLevel.INFO, "after the first choice")
+            .choice()
+                .when(exchange -> "x".equals(exchange.getProperty("size")))
+                    .log(LoggingLevel.INFO, "x")
+            .end()
+            .setBody(constant("done"))
+            ;
+    }
+}
+"#
+        ),
+        "{nested}"
+    );
+
+    // A choice as the last step of the route, and one in an on-error scope
+    // with a step after it.
+    let last = route("LastFlowRoute");
+    assert!(
+        last.contains(
+            r#"
+        onException(java.lang.Exception.class)
+            .handled(true)
+            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("kind")))
+                    .log(LoggingLevel.INFO, "a failed")
+                .otherwise()
+                    .log(LoggingLevel.INFO, "another kind failed")
+            .end()
+            .setBody(constant("failed"))
+            .end();
+"#
+        ),
+        "{last}"
+    );
+    assert!(
+        last.contains(
+            r#"
+            .setProperty("kind", constant("a"))
+            .choice()
+                .when(exchange -> "a".equals(exchange.getProperty("kind")))
+                    .setBody(constant("a"))
+                .otherwise()
+                    .setBody(constant("other"))
+            .end()
+            ;
+    }
+}
+"#
+        ),
+        "{last}"
+    );
+
+    // `.endChoice()` is only written behind the `.end()` of a block in a
+    // branch of a choice; no choice is closed with it.
+    for java in [&nested, &last] {
+        for line in java.lines().filter(|l| l.contains(".endChoice()")) {
+            assert_eq!(line.trim(), ".end().endChoice()", "{java}");
+        }
+    }
+
+    // The closing calls change nothing in what is reported: every choice of
+    // these flows compares variables that are only set from literals.
+    let choices: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element == "choice")
+        .collect();
+    assert_eq!(choices.len(), 7, "{choices:?}");
+    for choice in choices {
+        assert_eq!(choice.status, report::DecisionStatus::Done, "{choice:?}");
+    }
 }
