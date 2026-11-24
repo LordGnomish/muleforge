@@ -3060,4 +3060,375 @@ mappings:
         assert_eq!(decisions[0].rule_id.as_deref(), Some("x-send"));
         assert_eq!(decisions[0].status, DecisionStatus::Done);
     }
+
+    // ── foreach, split, scatter-gather ──────────────────────────────────
+
+    fn foreach(attrs: &[(&str, &str)], children: Vec<MuleElement>) -> MuleElement {
+        let mut foreach = elem("", "foreach", attrs);
+        foreach.children = children;
+        foreach
+    }
+
+    fn logger(message: &str) -> MuleElement {
+        elem("", "logger", &[("message", message)])
+    }
+
+    /// The parts of the one split `steps` consists of: its expression,
+    /// whether it stops at the first failure, its steps and where it comes
+    /// from.
+    fn only_split(steps: Vec<RouteStep>) -> (Expression, bool, Vec<RouteStep>, SplitSource) {
+        match <[RouteStep; 1]>::try_from(steps) {
+            Ok(
+                [RouteStep::Split {
+                    expression,
+                    stop_on_exception,
+                    steps,
+                    source,
+                    ..
+                }],
+            ) => (expression, stop_on_exception, steps, source),
+            other => panic!("expected one Split step, got {other:?}"),
+        }
+    }
+
+    /// The decision for `element` itself: the last one, after the
+    /// decisions for the steps in it, and the only one for that element.
+    fn own_decision<'a>(decisions: &'a [MappingDecision], element: &str) -> &'a MappingDecision {
+        let last = decisions.last().expect("a decision");
+        assert_eq!(last.mule_element, element, "{decisions:?}");
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|d| d.mule_element == element)
+                .count(),
+            1,
+            "{decisions:?}"
+        );
+        last
+    }
+
+    /// A foreach over the payload (no `collection`, or `#[payload]`) or
+    /// over a variable is a split of the body or of the exchange property.
+    /// That iterates the same elements only if the value is a Java
+    /// collection, which the migrator does not know: never `DONE`.
+    #[test]
+    fn foreach_over_the_payload_or_a_variable_is_a_split_to_review() {
+        const BODY: &str = "assuming the body is a Java collection";
+        const PROPERTY: &str = "assuming the exchange property items holds a Java collection";
+        for (attrs, expected, assumed) in [
+            (vec![], "${body}", BODY),
+            (vec![("collection", "#[payload]")], "${body}", BODY),
+            (
+                vec![("collection", "#[vars.items]")],
+                "${exchangeProperty.items}",
+                PROPERTY,
+            ),
+            (
+                vec![("collection", "#[payload]"), ("batchSize", "1")],
+                "${body}",
+                BODY,
+            ),
+        ] {
+            for rules in shipped_and_builtin_rules() {
+                let (steps, decisions) =
+                    steps_and_decisions(&foreach(&attrs, vec![logger("item")]), &rules);
+                let (expression, stop_on_exception, steps, source) = only_split(steps);
+                assert_eq!(expression, simple(expected), "{attrs:?}");
+                assert!(stop_on_exception, "a foreach stops at the first failure");
+                assert_eq!(steps.len(), 1, "{steps:?}");
+                assert_eq!(source.element, "foreach");
+                assert_eq!(source.attribute, "collection");
+                assert_eq!(
+                    source.original.as_deref(),
+                    attrs
+                        .iter()
+                        .find(|(name, _)| *name == "collection")
+                        .map(|(_, value)| *value)
+                );
+                assert_eq!(source.review.len(), 1, "{:?}", source.review);
+                assert!(source.review[0].contains(assumed), "{:?}", source.review);
+
+                let decision = own_decision(&decisions, "foreach");
+                assert_eq!(decision.status, DecisionStatus::ManualReview);
+                assert!(
+                    decision.rationale.starts_with("foreach -> split; review: ")
+                        && decision.rationale.contains(assumed),
+                    "{}",
+                    decision.rationale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foreach_with_an_unconvertible_collection_is_flagged_and_keeps_its_steps() {
+        for collection in [
+            "#[payload.items]",
+            "#[payload.lines()]",
+            "#[1 to 3]",
+            "payload",
+        ] {
+            for rules in shipped_and_builtin_rules() {
+                let (steps, decisions) = steps_and_decisions(
+                    &foreach(
+                        &[("collection", collection)],
+                        vec![logger("item"), logger("again")],
+                    ),
+                    &rules,
+                );
+                let (expression, _, steps, source) = only_split(steps);
+                assert!(is_unconverted(&expression, collection), "{expression:?}");
+                assert_eq!(steps.len(), 2, "{steps:?}");
+                assert_eq!(source.original.as_deref(), Some(collection));
+                assert!(source.review.is_empty(), "{:?}", source.review);
+
+                let decision = own_decision(&decisions, "foreach");
+                assert_eq!(decision.status, DecisionStatus::ManualReview);
+                assert!(
+                    decision
+                        .rationale
+                        .contains(&format!("the collection {collection} is not converted"))
+                        && decision.rationale.contains("The route fails at this step"),
+                    "{}",
+                    decision.rationale
+                );
+            }
+        }
+    }
+
+    /// With a `batchSize` the steps get lists of elements. A split hands
+    /// over one element at a time: not converted, whatever the collection.
+    #[test]
+    fn foreach_with_a_batch_size_is_not_converted() {
+        for (attrs, original) in [
+            (
+                vec![("batchSize", "2")],
+                "payload (the default) with batchSize=\"2\"",
+            ),
+            (
+                vec![
+                    ("collection", "#[vars.items]"),
+                    ("batchSize", "${batch.size}"),
+                ],
+                "#[vars.items] with batchSize=\"${batch.size}\"",
+            ),
+        ] {
+            let (steps, decisions) =
+                steps_and_decisions(&foreach(&attrs, vec![logger("batch")]), &[]);
+            let (expression, _, steps, _) = only_split(steps);
+            match &expression {
+                Expression::Unconverted {
+                    original: kept,
+                    reason,
+                } => {
+                    assert_eq!(kept, original);
+                    assert!(reason.contains("batchSize"), "{reason}");
+                }
+                other => panic!("{attrs:?} must not be converted, got {other:?}"),
+            }
+            assert_eq!(steps.len(), 1);
+            let decision = own_decision(&decisions, "foreach");
+            assert_eq!(decision.status, DecisionStatus::ManualReview);
+            assert!(
+                decision.rationale.contains("batchSize"),
+                "{}",
+                decision.rationale
+            );
+        }
+
+        // The collection is not converted anyway: the batch size is one
+        // more thing to know about.
+        let (steps, _) = steps_and_decisions(
+            &foreach(
+                &[("collection", "#[payload.items]"), ("batchSize", "5")],
+                vec![logger("batch")],
+            ),
+            &[],
+        );
+        let (expression, _, _, source) = only_split(steps);
+        assert!(
+            is_unconverted(&expression, "#[payload.items]"),
+            "{expression:?}"
+        );
+        assert_eq!(source.review.len(), 1, "{:?}", source.review);
+        assert!(
+            source.review[0].contains("batchSize=\"5\""),
+            "{:?}",
+            source.review
+        );
+    }
+
+    /// What Camel's split does not do as Mule's foreach does, if the steps
+    /// in the foreach depend on it: a variable set in it is gone after each
+    /// element, and there is no `counter` and no `rootMessage`.
+    #[test]
+    fn foreach_says_what_its_steps_rely_on_that_a_split_does_not_do() {
+        let notes = |foreach: MuleElement| -> Vec<String> {
+            let (steps, decisions) = steps_and_decisions(&foreach, &[]);
+            let (_, _, _, source) = only_split(steps);
+            let decision = own_decision(&decisions, "foreach");
+            assert_eq!(decision.status, DecisionStatus::ManualReview);
+            for note in &source.review {
+                assert!(
+                    decision.rationale.contains(note.as_str()),
+                    "{note} is not in {}",
+                    decision.rationale
+                );
+            }
+            // The first note is the assumption about the collection.
+            source.review[1..].to_vec()
+        };
+
+        assert_eq!(
+            notes(foreach(&[], vec![logger("item #[payload]")])),
+            Vec::<String>::new()
+        );
+
+        let sets = notes(foreach(
+            &[],
+            vec![set_variable("seen", "yes"), logger("item")],
+        ));
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert!(
+            sets[0].starts_with("the steps set the variable seen: "),
+            "{sets:?}"
+        );
+
+        let mut branch = elem("", "when", &[("expression", "#[vars.kind == 'a']")]);
+        branch.children = vec![
+            set_variable("total", "#[vars.total]"),
+            set_variable("seen", "yes"),
+            elem("", "remove-variable", &[("variableName", "kind")]),
+            elem("http", "request", &[("target", "reply")]),
+            set_variable("seen", "again"),
+        ];
+        let nested = notes(foreach(&[], vec![choice(vec![branch])]));
+        assert_eq!(nested.len(), 1, "{nested:?}");
+        assert!(
+            nested[0].starts_with("the steps set the variables total, seen, kind, reply: "),
+            "{nested:?}"
+        );
+
+        let counts = notes(foreach(
+            &[],
+            vec![logger(
+                "item #[vars.counter] of #[vars.rootMessage.payload]",
+            )],
+        ));
+        assert_eq!(counts.len(), 2, "{counts:?}");
+        assert!(
+            counts[0].starts_with("the steps read vars.counter"),
+            "{counts:?}"
+        );
+        assert!(
+            counts[1].starts_with("the steps read vars.rootMessage"),
+            "{counts:?}"
+        );
+
+        // Renamed: the default names are ordinary variables then.
+        let renamed = notes(foreach(
+            &[
+                ("counterVariableName", "i"),
+                ("rootMessageVariableName", "root"),
+            ],
+            vec![
+                logger("#[vars.counter] #[vars.rootMessage] counter i"),
+                logger("#[vars['i']]"),
+            ],
+        ));
+        assert_eq!(renamed.len(), 1, "{renamed:?}");
+        assert!(
+            renamed[0].starts_with("the steps read vars.i"),
+            "{renamed:?}"
+        );
+
+        let calls = notes(foreach(
+            &[],
+            vec![
+                elem("", "flow-ref", &[("name", "perItem")]),
+                elem("", "flow-ref", &[("name", "audit")]),
+            ],
+        ));
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            calls[0].starts_with("the steps call perItem, audit (flow-ref)"),
+            "{calls:?}"
+        );
+    }
+
+    /// A scatter-gather sends the message to each of its routes; it does
+    /// not iterate anything. It used to be emitted as a split of
+    /// `simple("#[payload]")`.
+    #[test]
+    fn scatter_gather_is_not_emitted_as_a_split_and_fails_loudly() {
+        let mut route = elem("", "route", &[]);
+        route.children = vec![logger("one")];
+        let mut scatter = elem("", "scatter-gather", &[]);
+        scatter.children = vec![route];
+        for rules in shipped_and_builtin_rules() {
+            let (steps, decisions) = steps_and_decisions(&scatter, &rules);
+            assert!(
+                matches!(
+                    &steps[..],
+                    [RouteStep::RawDsl(todo), RouteStep::ThrowException { class, message }, ..]
+                        if todo.starts_with("TODO: review this scatter-gather, it is not migrated")
+                            && class == "UnsupportedOperationException"
+                            && message == "scatter-gather not migrated"
+                ),
+                "{steps:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| matches!(step, RouteStep::Split { .. })),
+                "{steps:?}"
+            );
+            let own: Vec<_> = decisions
+                .iter()
+                .filter(|d| d.mule_element == "scatter-gather")
+                .collect();
+            assert_eq!(own.len(), 1, "{decisions:?}");
+            assert_eq!(own[0].status, DecisionStatus::ManualReview);
+            assert!(
+                own[0].rationale.contains("The route fails at this step"),
+                "{}",
+                own[0].rationale
+            );
+        }
+    }
+
+    /// `<split expression="...">`: the expression is converted as the
+    /// collection of a foreach is, never passed on as written.
+    #[test]
+    fn split_expression_is_converted_like_a_collection() {
+        for (attrs, converted) in [
+            (vec![("expression", "#[payload]")], Some("${body}")),
+            (
+                vec![("expression", "#[vars.lines]")],
+                Some("${exchangeProperty.lines}"),
+            ),
+            (vec![("expression", "#[payload.items]")], None),
+            (vec![], None),
+        ] {
+            let mut split = elem("", "split", &attrs);
+            split.children = vec![logger("part")];
+            let (steps, decisions) = steps_and_decisions(&split, &[]);
+            let (expression, stop_on_exception, steps, source) = only_split(steps);
+            match converted {
+                Some(expected) => assert_eq!(expression, simple(expected)),
+                None => assert!(
+                    matches!(expression, Expression::Unconverted { .. }),
+                    "{expression:?}"
+                ),
+            }
+            assert!(!stop_on_exception);
+            assert_eq!(steps.len(), 1);
+            assert_eq!(source.element, "split");
+            assert_eq!(source.attribute, "expression");
+            assert_eq!(
+                own_decision(&decisions, "split").status,
+                DecisionStatus::ManualReview
+            );
+        }
+    }
 }

@@ -982,4 +982,70 @@ mod tests {
             reason_of(raw, convert_condition(raw));
         }
     }
+
+    // ── Collections (foreach) ───────────────────────────────────────────
+
+    /// The payload is the body, a variable is an exchange property. Camel's
+    /// split iterates a Java collection only, so both come with the
+    /// assumption they rest on.
+    #[test]
+    fn collection_that_is_the_payload_is_the_body_on_an_assumption() {
+        for raw in ["#[payload]", "#[message.payload]", "#[ payload ]"] {
+            let (expression, assumption) = convert_collection(raw);
+            assert_eq!(expression, Expression::Simple("${body}".into()), "{raw}");
+            let assumption = assumption.unwrap_or_else(|| panic!("{raw}: no assumption"));
+            assert!(
+                assumption.contains("assuming the body is a Java collection"),
+                "{raw}: {assumption}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_that_is_a_variable_is_the_exchange_property_on_an_assumption() {
+        for raw in ["#[vars.items]", "#[vars['items']]", "#[flowVars.items]"] {
+            let (expression, assumption) = convert_collection(raw);
+            assert_eq!(
+                expression,
+                Expression::Simple("${exchangeProperty.items}".into()),
+                "{raw}"
+            );
+            let assumption = assumption.unwrap_or_else(|| panic!("{raw}: no assumption"));
+            assert!(
+                assumption.contains("assuming the exchange property items holds a Java collection"),
+                "{raw}: {assumption}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_of_any_other_shape_is_not_converted() {
+        for (raw, why) in [
+            ("#[payload.items]", "reads a field of the payload"),
+            ("#[payload.lines()]", "reads a field of the payload"),
+            ("#[payload['items']]", "reads a field of the payload"),
+            ("#[vars.order.lines]", "reads into the value of a variable"),
+            ("#[attributes.queryParams.ids]", "reads message attributes"),
+            ("#[1 to 3]", "not one of the shapes"),
+            ("#[['a', 'b']]", "not one of the shapes"),
+            ("#[payload filter ($.active)]", "not one of the shapes"),
+            (
+                "#[output application/json --- payload.items]",
+                "not one of the shapes",
+            ),
+            ("#[sizeOf(payload)]", "not one of the shapes"),
+            ("#['a,b,c']", "not one of the shapes"),
+            ("#[42]", "not one of the shapes"),
+            ("#[null]", "not one of the shapes"),
+            ("payload", "not one complete #[...] expression"),
+            ("a,b,c", "not one complete #[...] expression"),
+            ("items of #[payload]", "not one complete #[...] expression"),
+            ("", "not one complete #[...] expression"),
+        ] {
+            let (expression, assumption) = convert_collection(raw);
+            assert_eq!(assumption, None, "{raw}");
+            let reason = reason_of(raw, expression);
+            assert!(reason.contains(why), "{raw}: {reason}");
+        }
+    }
 }

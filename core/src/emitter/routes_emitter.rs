@@ -1666,7 +1666,9 @@ mod tests {
         let java = http_route(vec![RouteStep::Split {
             expression: unconverted("#[payload.items]", "the payload type is not known"),
             parallel: false,
+            stop_on_exception: false,
             aggregation_strategy: None,
+            source: SplitSource::default(),
             steps: vec![set_body("item")],
         }]);
         assert!(
@@ -1820,7 +1822,9 @@ mod tests {
                 vec![RouteStep::Split {
                     expression: Expression::Simple("${body}".into()),
                     parallel: false,
+                    stop_on_exception: false,
                     aggregation_strategy: None,
+                    source: SplitSource::default(),
                     steps: vec![choice_of(vec![number()])],
                 }],
             )],
@@ -2307,7 +2311,9 @@ mod tests {
                 vec![RouteStep::Split {
                     expression: Expression::Simple("${body}".into()),
                     parallel: false,
+                    stop_on_exception: false,
                     aggregation_strategy: None,
+                    source: SplitSource::default(),
                     steps: vec![
                         RouteStep::Choice {
                             whens: vec![(when_is("j", "x"), vec![log("ITEM X")])],
@@ -2351,7 +2357,9 @@ mod tests {
                 vec![RouteStep::Split {
                     expression: unconverted("#[payload.items]", "why"),
                     parallel: false,
+                    stop_on_exception: false,
                     aggregation_strategy: None,
+                    source: SplitSource::default(),
                     steps: vec![RouteStep::Choice {
                         whens: vec![(when_is("j", "x"), vec![log("X")])],
                         otherwise: None,
@@ -2374,6 +2382,213 @@ mod tests {
             ;
 "#
             ),
+            "{java}"
+        );
+    }
+
+    // ── foreach ─────────────────────────────────────────────────────────
+
+    fn foreach_source(original: Option<&str>, review: &[&str]) -> SplitSource {
+        SplitSource {
+            element: "foreach".into(),
+            attribute: "collection".into(),
+            original: original.map(str::to_string),
+            review: review.iter().map(|note| note.to_string()).collect(),
+        }
+    }
+
+    fn foreach_split(
+        expression: Expression,
+        steps: Vec<RouteStep>,
+        source: SplitSource,
+    ) -> RouteStep {
+        RouteStep::Split {
+            expression,
+            parallel: false,
+            stop_on_exception: true,
+            aggregation_strategy: None,
+            steps,
+            source,
+        }
+    }
+
+    /// A foreach whose collection is converted on an assumption is a split
+    /// that says what was assumed, and what else has to be checked. It
+    /// stops at the first element that fails, as a foreach does.
+    #[test]
+    fn foreach_converted_on_an_assumption_is_a_split_with_a_todo() {
+        let java = http_route(vec![
+            foreach_split(
+                Expression::Simple("${exchangeProperty.items}".into()),
+                vec![set_body("item")],
+                foreach_source(
+                    Some("#[vars.items]"),
+                    &[
+                        "assuming the property holds a Java collection",
+                        "the steps set the variable seen",
+                    ],
+                ),
+            ),
+            foreach_split(
+                Expression::Simple("${body}".into()),
+                vec![log("ITEM")],
+                foreach_source(None, &["assuming the body is a Java collection"]),
+            ),
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r##"            // TODO: review this split (Mule: foreach collection="#[vars.items]")
+            // - assuming the property holds a Java collection
+            // - the steps set the variable seen
+            .split(simple("${exchangeProperty.items}")).stopOnException()
+                .setBody(constant("item"))
+            .end()
+            // TODO: review this split (Mule: foreach without collection)
+            // - assuming the body is a Java collection
+            .split(simple("${body}")).stopOnException()
+                .log(LoggingLevel.INFO, "ITEM")
+            .end()
+            .log(LoggingLevel.INFO, "AFTER")
+"##,
+            "{java}"
+        );
+    }
+
+    /// The steps of a foreach whose collection is not converted follow the
+    /// step that fails, where they are not reached: there is no split they
+    /// could be in, and they are not run once for the whole payload.
+    #[test]
+    fn unconverted_foreach_collection_is_a_step_that_throws() {
+        let java = http_route(vec![
+            foreach_split(
+                unconverted("#[payload.items]", "the payload type is not known"),
+                vec![set_body("item")],
+                foreach_source(
+                    Some("#[payload.items]"),
+                    &["the steps set the variable seen"],
+                ),
+            ),
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r##"            // TODO: review this foreach, its collection is not converted (Mule: #[payload.items])
+            // - the payload type is not known
+            // - the route fails at this step instead of going on with a wrong value; replace it with the converted step
+            // - the steps of the foreach follow it and are not reached
+            // - the steps set the variable seen
+            .throwException(new UnsupportedOperationException("foreach collection not migrated: #[payload.items]"))
+            .setBody(constant("item"))
+            .log(LoggingLevel.INFO, "AFTER")
+"##,
+            "{java}"
+        );
+        assert!(!java.contains(".split("), "{java}");
+    }
+
+    /// The collection is text from the Mule XML, in the comment, in the
+    /// exception message and in the TODO of a converted split.
+    #[test]
+    fn foreach_collection_cannot_break_out_of_comment_or_string() {
+        let original = "#[payload.dirs[\"C:\\users\"]]\r\n.stop()";
+        let failing = http_route(vec![foreach_split(
+            unconverted(original, "why"),
+            vec![set_body("item")],
+            foreach_source(Some(original), &[]),
+        )]);
+        assert!(
+            failing.contains(
+                r##"
+            // TODO: review this foreach, its collection is not converted (Mule: #[payload.dirs["C:\\users"]]
+            // .stop())
+            // - why
+"##
+            ),
+            "{failing}"
+        );
+        assert!(
+            failing.contains(
+                r##".throwException(new UnsupportedOperationException("foreach collection not migrated: #[payload.dirs[\"C:\\users\"]]\r\n.stop()"))"##
+            ),
+            "{failing}"
+        );
+
+        let converted = http_route(vec![foreach_split(
+            Expression::Simple("${body}".into()),
+            vec![set_body("item")],
+            foreach_source(Some(original), &["note\n.stop()"]),
+        )]);
+        assert!(
+            converted.contains(
+                r##"
+            // TODO: review this split (Mule: foreach collection="#[payload.dirs["C:\\users"]]
+            // .stop()")
+            // - note
+            // .stop()
+            .split(simple("${body}")).stopOnException()
+"##
+            ),
+            "{converted}"
+        );
+        for java in [&failing, &converted] {
+            for line in java.lines().map(str::trim) {
+                assert!(!line.starts_with(".stop()"), "{java}");
+            }
+        }
+    }
+
+    /// The exception message quotes the beginning of a long collection
+    /// expression, the TODO all of it.
+    #[test]
+    fn long_foreach_collection_is_cut_in_the_exception_message_only() {
+        let original = format!("#[payload.items filter ($.id == '{}')]", "x".repeat(300));
+        let java = http_route(vec![foreach_split(
+            unconverted(&original, "why"),
+            vec![],
+            foreach_source(Some(&original), &[]),
+        )]);
+        let cut: String = original.chars().take(200).collect();
+        assert!(
+            java.contains(&format!(
+                "(\"foreach collection not migrated: {cut}... (truncated, full expression in the TODO above)\"))"
+            )),
+            "{java}"
+        );
+        assert!(
+            java.contains(&format!("is not converted (Mule: {original})")),
+            "{java}"
+        );
+    }
+
+    /// Camel does not start a route with a split that has no steps
+    /// ("Definition has no children on Split"). A foreach of which no step
+    /// is migrated is written as its comments, without the split.
+    #[test]
+    fn split_without_a_migrated_step_is_not_written() {
+        let java = http_route(vec![
+            foreach_split(
+                Expression::Simple("${body}".into()),
+                vec![RouteStep::RawDsl("// TODO: manual mapping for x:op".into())],
+                foreach_source(None, &["assuming the body is a Java collection"]),
+            ),
+            foreach_split(
+                Expression::Simple("${body}".into()),
+                vec![],
+                foreach_source(Some("#[payload]"), &[]),
+            ),
+            log("AFTER"),
+        ]);
+        assert_eq!(
+            route_steps(&java),
+            r##"            // TODO: review this split (Mule: foreach without collection)
+            // - assuming the body is a Java collection
+            // - no step of the foreach is migrated, so the split is not written: Camel does not start a route with a split that has no steps
+            // // TODO: manual mapping for x:op
+            // TODO: review this split (Mule: foreach collection="#[payload]")
+            // - no step of the foreach is migrated, so the split is not written: Camel does not start a route with a split that has no steps
+            .log(LoggingLevel.INFO, "AFTER")
+"##,
             "{java}"
         );
     }
