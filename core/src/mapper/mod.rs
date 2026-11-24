@@ -626,9 +626,13 @@ fn map_processor(
             }
             vec![RouteStep::Choice { whens, otherwise }]
         }
-        ("", "scatter-gather") | ("", "split") => {
-            let expr = elem.attr("expression").unwrap_or("#[payload]").to_string();
-            let parallel = elem.attr("parallel").map(|v| v == "true").unwrap_or(false);
+        // A scatter-gather sends the message to each of its routes at the
+        // same time and collects what they return. It iterates nothing: a
+        // split of the payload (what it used to be emitted as) is another
+        // thing. It is not migrated; the route says so and fails there. The
+        // steps of its routes follow, as the steps of an unconverted
+        // foreach do.
+        ("", "scatter-gather") => {
             let steps: Vec<RouteStep> = elem
                 .children
                 .iter()
@@ -637,37 +641,35 @@ fn map_processor(
             record_decision(
                 decisions,
                 elem,
-                DecisionStatus::Done,
+                DecisionStatus::ManualReview,
                 rule_id,
-                "scatter-gather/split -> split",
+                "scatter-gather is not migrated: Mule sends the message to every route of a \
+                 scatter-gather at the same time and collects their results, which is not a \
+                 split of the payload (what used to be emitted for it). The route fails at this \
+                 step until it is replaced; the usual Camel form is a multicast with an \
+                 aggregation strategy",
             );
-            vec![RouteStep::Split {
-                expression: Expression::Simple(expr),
-                parallel,
-                aggregation_strategy: None,
-                steps,
-            }]
+            let mut out = vec![
+                RouteStep::RawDsl(
+                    "TODO: review this scatter-gather, it is not migrated\n\
+                     - Mule sends the message to every route of a scatter-gather at the same \
+                     time and collects their results; that is not a split of the payload, which \
+                     is what used to be emitted for it\n\
+                     - the route fails at this step instead of going on without the routes; the \
+                     usual Camel form is a multicast with an aggregation strategy\n\
+                     - the steps of its routes follow it and are not reached"
+                        .into(),
+                ),
+                RouteStep::ThrowException {
+                    class: "UnsupportedOperationException".into(),
+                    message: "scatter-gather not migrated".into(),
+                },
+            ];
+            out.extend(steps);
+            out
         }
-        ("", "foreach") => {
-            let expr = elem.attr("collection").unwrap_or("#[payload]").to_string();
-            let steps: Vec<RouteStep> = elem
-                .children
-                .iter()
-                .flat_map(|c| map_processor(c, app, rules, decisions, deps))
-                .collect();
-            record_decision(
-                decisions,
-                elem,
-                DecisionStatus::Done,
-                rule_id,
-                "foreach -> split",
-            );
-            vec![RouteStep::Split {
-                expression: Expression::Simple(expr),
-                parallel: false,
-                aggregation_strategy: None,
-                steps,
-            }]
+        ("", "foreach") | ("", "split") => {
+            map_iteration(elem, app, rules, decisions, deps, rule_id)
         }
         // A flow-ref runs its target as part of the calling flow, and what
         // the target does not handle itself goes to the caller's error
@@ -1265,6 +1267,184 @@ fn variable_review(app: App<'_>, name: &str) -> Option<String> {
         "converted assuming variable {name} holds a value this application set from a literal; \
          it is also set at: {places}. Check the comparison"
     ))
+}
+
+/// A Mule element that runs its steps for each element of a collection, as
+/// a Camel `split`: a `foreach` (over its `collection`, the payload if it
+/// has none) or a `split` (over its `expression`).
+///
+/// The expression is converted by [`crate::mel::convert_collection`]: the
+/// payload and a variable to the body and the exchange property, on the
+/// assumption that the value is a Java collection, which is what Camel's
+/// split iterates; nothing else. It is never handed to Camel as written
+/// (`simple("#[payload]")` is a constant for Simple: the steps ran once, for
+/// that text). So the element is never reported as done:
+///
+/// * converted on the assumption: the split is emitted, with the
+///   assumption and what [`foreach_differences`] finds in a `TODO`;
+/// * not converted: the split is [`Expression::Unconverted`], which the
+///   emitter writes as a step that throws, followed by the steps of the
+///   scope. A `foreach` with a `batchSize` is not converted either: Mule
+///   hands its steps lists of that many elements.
+///
+/// A `foreach` stops at the first element whose steps fail and hands the
+/// error to the error handler; the split gets `stopOnException()` for that.
+fn map_iteration(
+    elem: &MuleElement,
+    app: App<'_>,
+    rules: &[Rule],
+    decisions: &mut Vec<MappingDecision>,
+    deps: &mut Vec<MavenDependency>,
+    rule_id: Option<&str>,
+) -> Vec<RouteStep> {
+    let foreach = elem.name == "foreach";
+    let attribute = if foreach { "collection" } else { "expression" };
+    let original = elem.attr(attribute);
+    let steps: Vec<RouteStep> = elem
+        .children
+        .iter()
+        .flat_map(|c| map_processor(c, app, rules, decisions, deps))
+        .collect();
+
+    let (mut expression, assumption) = match original {
+        Some(raw) => crate::mel::convert_collection(raw),
+        // "collection: payload" is the documented default of a foreach.
+        None if foreach => crate::mel::convert_collection("#[payload]"),
+        None => (
+            Expression::Unconverted {
+                original: "(none)".into(),
+                reason: "the split has no expression: nothing says what it iterates".into(),
+            },
+            None,
+        ),
+    };
+    let mut review: Vec<String> = assumption.into_iter().collect();
+    if foreach {
+        if let Some(size) = elem.attr("batchSize").filter(|size| size.trim() != "1") {
+            let why = format!(
+                "the foreach has batchSize=\"{size}\": Mule hands the steps lists of that many \
+                 elements, Camel's split hands over one element at a time and has no option \
+                 that groups the elements of a collection"
+            );
+            if matches!(expression, Expression::Unconverted { .. }) {
+                review.push(why);
+            } else {
+                // The assumption about the collection does not matter any more.
+                review.clear();
+                expression = Expression::Unconverted {
+                    original: format!(
+                        "{} with batchSize=\"{size}\"",
+                        original.unwrap_or("payload (the default)")
+                    ),
+                    reason: why,
+                };
+            }
+        }
+        review.extend(foreach_differences(elem));
+    } else {
+        review.push(
+            "split is not an element of Mule 4: it is taken as a scope that runs its steps for \
+             each element of its expression. Check what it did in the application"
+                .to_string(),
+        );
+    }
+
+    let name = &elem.name;
+    let mut rationale = format!("{name} -> split; review: ");
+    match &expression {
+        Expression::Unconverted { original, reason } => {
+            rationale.push_str(&format!(
+                "the {attribute} {original} is not converted ({reason}). The route fails at \
+                 this step until it is replaced, and the steps of the {name} are not reached"
+            ));
+            for note in &review {
+                rationale.push_str(". ");
+                rationale.push_str(note);
+            }
+        }
+        _ => rationale.push_str(&review.join(". ")),
+    }
+    record_decision(
+        decisions,
+        elem,
+        DecisionStatus::ManualReview,
+        rule_id,
+        &rationale,
+    );
+
+    vec![RouteStep::Split {
+        expression,
+        parallel: !foreach && elem.attr("parallel") == Some("true"),
+        stop_on_exception: foreach,
+        aggregation_strategy: None,
+        steps,
+        source: SplitSource {
+            element: name.clone(),
+            attribute: attribute.to_string(),
+            original: original.map(str::to_string),
+            review,
+        },
+    }]
+}
+
+/// What the steps inside a `foreach` rely on that Camel's split does not
+/// do as Mule's foreach does, for the `TODO` and the report. The steps are
+/// emitted as they are; nothing is changed to make up for it.
+///
+/// * A variable set in the scope: Mule keeps it for the next element and
+///   after the scope. The split runs the steps on a copy of the exchange
+///   for each element, and a property set there is gone with the copy.
+/// * `vars.counter` and `vars.rootMessage` (or the names the foreach gives
+///   them): the split sets neither.
+/// * A `flow-ref` in the scope: what the flow sets or reads is not
+///   followed.
+///
+/// The payload after the scope needs no note: it is the payload from before
+/// the scope in Mule, and the body from before the split in Camel.
+fn foreach_differences(foreach: &MuleElement) -> Vec<String> {
+    let mut notes = Vec::new();
+    let set = variables::set_inside(foreach);
+    if !set.is_empty() {
+        notes.push(format!(
+            "the steps set the variable{} {}: Mule keeps a variable that is set inside a \
+             foreach for the next element and after the scope; Camel's split runs the steps on \
+             a copy of the exchange for each element, so the exchange property is set neither \
+             for the next element nor after the split",
+            if set.len() == 1 { "" } else { "s" },
+            set.join(", ")
+        ));
+    }
+    for (attribute, default, holds, camel) in [
+        (
+            "counterVariableName",
+            "counter",
+            "the number of the element it is at",
+            ". It sets CamelSplitIndex, which starts at 0",
+        ),
+        (
+            "rootMessageVariableName",
+            "rootMessage",
+            "the message as it was before the scope",
+            "",
+        ),
+    ] {
+        let name = foreach.attr(attribute).unwrap_or(default);
+        if variables::read_inside(foreach, name) {
+            notes.push(format!(
+                "the steps read vars.{name}, which Mule's foreach sets to {holds}: Camel's \
+                 split does not set an exchange property {name}{camel}"
+            ));
+        }
+    }
+    let called = variables::flow_refs_inside(foreach);
+    if !called.is_empty() {
+        notes.push(format!(
+            "the steps call {} (flow-ref): whether a variable is set there, or the counter or \
+             the root message of the foreach is read, was not looked at",
+            called.join(", ")
+        ));
+    }
+    notes
 }
 
 /// The decision for a step that sets a value (`set-payload`,

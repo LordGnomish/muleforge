@@ -173,6 +173,82 @@ impl Scan<'_> {
     }
 }
 
+/// The variables the steps inside `scope` set or remove (`set-variable`,
+/// `remove-variable`, a `target`, ...), by name, each once, in document
+/// order. `scope` itself is not looked at.
+pub(super) fn set_inside(scope: &MuleElement) -> Vec<String> {
+    fn collect(element: &MuleElement, names: &mut Vec<String>) {
+        let mut attributes: Vec<(&String, &String)> = element.attributes.iter().collect();
+        attributes.sort();
+        for (key, value) in attributes {
+            if names_a_variable(key) && !names.contains(value) {
+                names.push(value.clone());
+            }
+        }
+        for child in &element.children {
+            collect(child, names);
+        }
+    }
+    let mut names = Vec::new();
+    for child in &scope.children {
+        collect(child, &mut names);
+    }
+    names
+}
+
+/// Whether a step inside `scope` reads variable `name` in an attribute or
+/// in its text: `vars.name`, `vars['name']`, `flowVars.name`.
+pub(super) fn read_inside(scope: &MuleElement, name: &str) -> bool {
+    fn reads(value: &str, name: &str) -> bool {
+        const SELECTORS: [&str; 6] = ["vars.", "Vars.", "vars['", "Vars['", "vars[\"", "Vars[\""];
+        let is_identifier_char = |c: char| c.is_alphanumeric() || c == '_';
+        !name.is_empty()
+            && value.match_indices(name).any(|(start, _)| {
+                let after = value[start + name.len()..].chars().next();
+                SELECTORS
+                    .iter()
+                    .any(|selector| value[..start].ends_with(selector))
+                    && !after.is_some_and(is_identifier_char)
+            })
+    }
+    fn element_reads(element: &MuleElement, name: &str) -> bool {
+        element.attributes.values().any(|value| reads(value, name))
+            || element
+                .text
+                .as_deref()
+                .is_some_and(|text| reads(text, name))
+            || element
+                .children
+                .iter()
+                .any(|child| element_reads(child, name))
+    }
+    scope
+        .children
+        .iter()
+        .any(|child| element_reads(child, name))
+}
+
+/// The flows the steps inside `scope` call with a `flow-ref`, by name, each
+/// once, in document order.
+pub(super) fn flow_refs_inside(scope: &MuleElement) -> Vec<String> {
+    fn collect(element: &MuleElement, names: &mut Vec<String>) {
+        if element.namespace.is_empty() && element.name == "flow-ref" {
+            let name = element.attr("name").unwrap_or("").to_string();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for child in &element.children {
+            collect(child, names);
+        }
+    }
+    let mut names = Vec::new();
+    for child in &scope.children {
+        collect(child, &mut names);
+    }
+    names
+}
+
 /// Whether the children of `element` are emitted as steps that run on the
 /// exchange of the route, where Mule runs them on the event of the flow.
 fn keeps_the_exchange(element: &MuleElement) -> bool {

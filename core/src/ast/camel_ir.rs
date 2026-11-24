@@ -70,8 +70,15 @@ pub enum RouteStep {
     Split {
         expression: Expression,
         parallel: bool,
+        /// Whether the split stops at the first element whose steps fail
+        /// (`stopOnException()`), as a Mule `foreach` does. Without it Camel
+        /// runs the steps for every element and fails afterwards.
+        stop_on_exception: bool,
         aggregation_strategy: Option<String>,
         steps: Vec<RouteStep>,
+        /// The Mule element the split is, and what has to be reviewed
+        /// about it.
+        source: SplitSource,
     },
     Unmarshal(DataFormat),
     Marshal(DataFormat),
@@ -104,6 +111,56 @@ impl RouteStep {
     }
 }
 
+/// What a [`RouteStep::Split`] is in the Mule application: the element, the
+/// attribute that says what it iterates, and what a person has to check
+/// before relying on the split. The emitter names the element in the
+/// comments and messages about the split, and writes the notes in a `TODO`
+/// in front of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitSource {
+    /// The Mule element: `foreach`, `split`.
+    pub element: String,
+    /// The attribute with the expression: `collection` of a `foreach`.
+    pub attribute: String,
+    /// That attribute as it is written. `None` if the element does not
+    /// have it: a `foreach` then iterates the payload.
+    pub original: Option<String>,
+    /// What the split rests on (the assumption its expression is converted
+    /// on) and what the steps in it rely on that a Camel split does not do
+    /// as the Mule element does.
+    pub review: Vec<String>,
+}
+
+impl SplitSource {
+    /// The Mule element, `split` if it is not known.
+    pub fn element_name(&self) -> &str {
+        if self.element.is_empty() {
+            "split"
+        } else {
+            &self.element
+        }
+    }
+
+    /// The attribute with the expression, `expression` if it is not known.
+    pub fn attribute_name(&self) -> &str {
+        if self.attribute.is_empty() {
+            "expression"
+        } else {
+            &self.attribute
+        }
+    }
+
+    /// The element as it is written in the Mule application:
+    /// `foreach collection="#[vars.items]"`, `foreach without collection`.
+    pub fn describe(&self) -> String {
+        let (element, attribute) = (self.element_name(), self.attribute_name());
+        match &self.original {
+            Some(original) => format!("{element} {attribute}=\"{original}\""),
+            None => format!("{element} without {attribute}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expression {
     /// A string constant: `constant("text")`.
@@ -124,7 +181,9 @@ pub enum Expression {
     /// emitter writes the step so that the route compiles and starts, says
     /// in a `TODO` what is missing, and fails when the step is reached: a
     /// choice condition becomes a predicate that throws, a step that needs
-    /// the value (`setBody`, `setProperty`, ...) becomes `throwException`.
+    /// the value (`setBody`, `setProperty`, ...) becomes `throwException`,
+    /// and so does a split whose collection it is: the steps of the split
+    /// follow that step, where they are not reached.
     Unconverted {
         original: String,
         reason: String,

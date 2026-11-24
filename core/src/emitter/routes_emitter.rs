@@ -281,15 +281,23 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize, scope: Scop
         RouteStep::SetProperty { name, expression } => {
             Some((format!("setProperty(\"{name}\")"), "value", expression))
         }
-        RouteStep::Split { expression, .. } => {
-            Some(("split".to_string(), "expression", expression))
-        }
+        // A split is named as the Mule element it is: "foreach collection
+        // not migrated".
+        RouteStep::Split {
+            expression, source, ..
+        } => Some((
+            source.element_name().to_string(),
+            source.attribute_name(),
+            expression,
+        )),
         _ => None,
     };
     if let Some((what, part, Expression::Unconverted { original, reason })) = needs_value {
         let mut notes = vec![reason.as_str(), UNCONVERTED_STEP_FAILS];
-        if matches!(step, RouteStep::Split { .. }) {
-            notes.push("the steps of the split follow it and are not reached");
+        let steps_follow = format!("the steps of the {what} follow it and are not reached");
+        if let RouteStep::Split { source, .. } = step {
+            notes.push(&steps_follow);
+            notes.extend(source.review.iter().map(String::as_str));
         }
         emit_unconverted_step(java, &pad, &what, part, original, &notes);
         if let RouteStep::Split { steps, .. } = step {
@@ -380,15 +388,53 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize, scope: Scop
             }
             java.push_str(&block_end(&pad, scope));
         }
+        // What has to be reviewed about the split (the assumption its
+        // expression is converted on, what its steps rely on) is a TODO in
+        // front of it.
+        //
+        // A split without a step that is written (no steps, or comments
+        // only) is not written: Camel does not start a route with such a
+        // split ("Definition has no children on Split"). Nothing would run
+        // for an element anyway, and the body after a split is the body
+        // from before it.
         RouteStep::Split {
             expression,
             parallel,
+            stop_on_exception,
             steps,
+            source,
             ..
         } => {
+            let written = steps.iter().any(writes_dsl);
+            let not_written = format!(
+                "no step of the {} is migrated, so the split is not written: Camel does not \
+                 start a route with a split that has no steps",
+                source.element_name()
+            );
+            let mut notes: Vec<&str> = source.review.iter().map(String::as_str).collect();
+            if !written {
+                notes.push(&not_written);
+            }
+            if !notes.is_empty() {
+                push_todo(
+                    java,
+                    &pad,
+                    &format!("review this split (Mule: {})", source.describe()),
+                    &notes,
+                );
+            }
+            if !written {
+                for s in steps {
+                    emit_step_dsl(java, s, indent, scope);
+                }
+                return;
+            }
             java.push_str(&format!("{}.split({})", pad, expr_to_java(expression)));
             if *parallel {
                 java.push_str(".parallelProcessing()");
+            }
+            if *stop_on_exception {
+                java.push_str(".stopOnException()");
             }
             java.push('\n');
             for s in steps {
@@ -422,6 +468,18 @@ fn emit_step_dsl(java: &mut String, step: &RouteStep, indent: usize, scope: Scop
                 java.push_str(&format!("{}// {}\n", pad, line));
             }
         }
+    }
+}
+
+/// Whether a step is written as Java DSL: not a comment, and not a split
+/// that is left out because none of its steps is written.
+fn writes_dsl(step: &RouteStep) -> bool {
+    match step {
+        RouteStep::RawDsl(_) => false,
+        RouteStep::Split {
+            expression, steps, ..
+        } => matches!(expression, Expression::Unconverted { .. }) || steps.iter().any(writes_dsl),
+        _ => true,
     }
 }
 

@@ -110,11 +110,18 @@ fn describe_step(step: &RouteStep) -> String {
             }
             format!("Choice router ({} branches{notes})", whens.len())
         }
-        RouteStep::Split { parallel, .. } => {
-            if *parallel {
-                "Parallel split".into()
+        RouteStep::Split {
+            parallel, source, ..
+        } => {
+            let kind = if *parallel { "Parallel split" } else { "Split" };
+            if source.review.is_empty() {
+                kind.into()
             } else {
-                "Split".into()
+                format!(
+                    "{kind} (to review: converted on an assumption or not the same as the Mule \
+                     {}, see the TODO in the route class)",
+                    source.element_name()
+                )
             }
         }
         RouteStep::Marshal(fmt) => format!("Marshal ({:?})", fmt),
