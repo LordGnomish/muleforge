@@ -128,7 +128,17 @@ fn describe_step(step: &RouteStep) -> String {
         RouteStep::Unmarshal(fmt) => format!("Unmarshal ({:?})", fmt),
         RouteStep::Transform { bean_ref } => format!("Transform via `{}`", bean_ref),
         RouteStep::ThrowException { class, .. } => format!("Throw `{}`", class),
-        RouteStep::RawDsl(dsl) => format!("Custom: {}", dsl.chars().take(60).collect::<String>()),
+        // The first line: a comment of several lines (the TODO of a
+        // scatter-gather) would break the list of steps.
+        RouteStep::RawDsl(dsl) => format!(
+            "Custom: {}",
+            dsl.lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect::<String>()
+        ),
     }
 }
 
@@ -284,5 +294,21 @@ mod tests {
         );
         assert_eq!(describe_step(&split(false, &[])), "Split");
         assert_eq!(describe_step(&split(true, &[])), "Parallel split");
+    }
+
+    /// A comment step of several lines is named by its first line: the
+    /// rest would start new lines in the numbered list of steps.
+    #[test]
+    fn comment_step_is_described_by_its_first_line() {
+        assert_eq!(
+            describe_step(&RouteStep::RawDsl(
+                "TODO: review this scatter-gather, it is not migrated\n- why".into()
+            )),
+            "Custom: TODO: review this scatter-gather, it is not migrated"
+        );
+        assert_eq!(
+            describe_step(&RouteStep::RawDsl("// DataWeave: %dw 2.0".into())),
+            "Custom: // DataWeave: %dw 2.0"
+        );
     }
 }
