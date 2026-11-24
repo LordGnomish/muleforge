@@ -220,7 +220,9 @@ mod tests {
             step_label(&RouteStep::Split {
                 expression: unconverted(),
                 parallel: true,
+                stop_on_exception: false,
                 aggregation_strategy: None,
+                source: SplitSource::default(),
                 steps: vec![],
             }),
             "NOT MIGRATED: split (fails here)"

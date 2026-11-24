@@ -1543,3 +1543,228 @@ async fn choice_ends_where_the_mule_choice_ends_at_every_level_of_nesting() {
         assert_eq!(choice.status, report::DecisionStatus::Done, "{choice:?}");
     }
 }
+
+/// A Mule `foreach` iterates its `collection` (the payload if there is
+/// none). Its expression used to be handed to Camel as written,
+/// `.split(simple("#[payload.items]"))`: Simple takes that as plain text, so
+/// the steps ran once, for the text of the Mule expression, and the foreach
+/// was reported as done. A scatter-gather was emitted the same way.
+///
+/// The payload and a variable are converted to the body and the exchange
+/// property, which is the same collection only if the value is a Java
+/// collection: the split is emitted with a TODO that says so, and the
+/// foreach is flagged. Anything else is not converted: the route fails at
+/// that step, the steps of the foreach follow it unreached, and the pages
+/// about the flow say that it is not migrated.
+#[tokio::test]
+async fn foreach_collection_is_converted_on_an_assumption_or_fails_loudly() {
+    let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core">
+    <flow name="loopFlow">
+        <http:listener config-ref="HTTP_config" path="/loop" allowedMethods="POST" />
+        <set-variable variableName="items" value="#[payload]" />
+        <foreach>
+            <logger level="INFO" message="each of the payload" />
+        </foreach>
+        <foreach collection="#[vars.items]">
+            <set-variable variableName="seen" value="yes" />
+            <logger level="INFO" message="item #[vars.counter]" />
+        </foreach>
+        <logger level="INFO" message="after the loops" />
+    </flow>
+    <flow name="fieldFlow">
+        <http:listener config-ref="HTTP_config" path="/field" allowedMethods="POST" />
+        <foreach collection="#[payload.items]">
+            <logger level="INFO" message="each item" />
+        </foreach>
+        <foreach batchSize="2">
+            <logger level="INFO" message="each batch" />
+        </foreach>
+        <logger level="INFO" message="after the field loop" />
+    </flow>
+    <flow name="scatterFlow">
+        <http:listener config-ref="HTTP_config" path="/scatter" allowedMethods="POST" />
+        <scatter-gather>
+            <route>
+                <logger level="INFO" message="one" />
+            </route>
+            <route>
+                <logger level="INFO" message="two" />
+            </route>
+        </scatter-gather>
+    </flow>
+</mule>"##;
+    let dir = make_project(xml);
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rules = mapper::load_rules(&manifest_dir.join("../mappings")).unwrap();
+    let project = parser::parse_project(dir.path()).unwrap();
+    let normalized = parser::normalize(project).unwrap();
+    let (camel_ir, decisions) = mapper::map_project(&normalized, &rules, None)
+        .await
+        .unwrap();
+    let out = TempDir::new().unwrap();
+    emitter::emit_project(&camel_ir, out.path()).unwrap();
+    let route = |class: &str| {
+        std::fs::read_to_string(
+            out.path()
+                .join(format!("src/main/java/generated/routes/{class}.java")),
+        )
+        .unwrap()
+    };
+    // The code of the route: from `from(...)` to the `;` that ends it.
+    fn route_code(java: &str) -> Vec<&str> {
+        code_lines(java)
+            .into_iter()
+            .skip_while(|line| !line.starts_with("from("))
+            .take_while(|line| *line != "}")
+            .collect()
+    }
+
+    let (loop_java, field_java, scatter_java) = (
+        route("LoopFlowRoute"),
+        route("FieldFlowRoute"),
+        route("ScatterFlowRoute"),
+    );
+    for java in [&loop_java, &field_java, &scatter_java] {
+        assert!(!java.contains("simple(\"#["), "{java}");
+        assert!(!java.contains("#[payload]\")"), "{java}");
+    }
+
+    assert_eq!(
+        route_code(&loop_java),
+        [
+            r#"from("platform-http:/loop?httpMethodRestrict=POST")"#,
+            r#".routeId("loopFlow")"#,
+            r#".setProperty("items", simple("${body}"))"#,
+            r#".split(simple("${body}")).stopOnException()"#,
+            r#".log(LoggingLevel.INFO, "each of the payload")"#,
+            ".end()",
+            r#".split(simple("${exchangeProperty.items}")).stopOnException()"#,
+            r#".setProperty("seen", constant("yes"))"#,
+            r#".log(LoggingLevel.INFO, "item ${exchangeProperty.counter}")"#,
+            ".end()",
+            r#".log(LoggingLevel.INFO, "after the loops")"#,
+            ";",
+        ],
+        "{loop_java}"
+    );
+    for todo in [
+        "// TODO: review this split (Mule: foreach without collection)",
+        "// - converted assuming the body is a Java collection",
+        r##"// TODO: review this split (Mule: foreach collection="#[vars.items]")"##,
+        "// - converted assuming the exchange property items holds a Java collection",
+        "// - the steps set the variable seen: ",
+        "// - the steps read vars.counter",
+    ] {
+        assert!(loop_java.contains(todo), "{todo} is not in {loop_java}");
+    }
+
+    assert_eq!(
+        route_code(&field_java),
+        [
+            r#"from("platform-http:/field?httpMethodRestrict=POST")"#,
+            r#".routeId("fieldFlow")"#,
+            r##".throwException(new UnsupportedOperationException("foreach collection not migrated: #[payload.items]"))"##,
+            r#".log(LoggingLevel.INFO, "each item")"#,
+            r#".throwException(new UnsupportedOperationException("foreach collection not migrated: payload (the default) with batchSize=\"2\""))"#,
+            r#".log(LoggingLevel.INFO, "each batch")"#,
+            r#".log(LoggingLevel.INFO, "after the field loop")"#,
+            ";",
+        ],
+        "{field_java}"
+    );
+    assert!(
+        field_java.contains(
+            "// TODO: review this foreach, its collection is not converted (Mule: #[payload.items])"
+        ) && field_java.contains("// - the steps of the foreach follow it and are not reached"),
+        "{field_java}"
+    );
+
+    assert_eq!(
+        route_code(&scatter_java)[2..],
+        [
+            r#".throwException(new UnsupportedOperationException("scatter-gather not migrated"))"#,
+            ";",
+        ],
+        "{scatter_java}"
+    );
+    assert!(
+        scatter_java.contains("// TODO: review this scatter-gather, it is not migrated"),
+        "{scatter_java}"
+    );
+
+    // One row for each foreach and for the scatter-gather, none of them done.
+    let rows: Vec<_> = decisions
+        .iter()
+        .filter(|d| d.mule_element == "foreach" || d.mule_element == "scatter-gather")
+        .collect();
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    for row in &rows {
+        assert_eq!(row.status, report::DecisionStatus::ManualReview, "{row:?}");
+    }
+    assert!(
+        rows[0]
+            .rationale
+            .contains("assuming the body is a Java collection"),
+        "{}",
+        rows[0].rationale
+    );
+    assert!(
+        rows[1]
+            .rationale
+            .contains("the steps set the variable seen")
+            && rows[1].rationale.contains("the steps read vars.counter"),
+        "{}",
+        rows[1].rationale
+    );
+    assert!(
+        rows[2]
+            .rationale
+            .contains("the collection #[payload.items] is not converted"),
+        "{}",
+        rows[2].rationale
+    );
+    assert!(
+        rows[3].rationale.contains("batchSize"),
+        "{}",
+        rows[3].rationale
+    );
+
+    // The page of the flow and the diagram say what the route does.
+    let acquired = muleforge_core::git::AcquiredInput {
+        working_dir: dir.path().to_path_buf(),
+        source_description: "test project".to_string(),
+        source_commit: None,
+        is_temporary: false,
+    };
+    let migration_report = report::build(&decisions, &acquired);
+    docgen::flow_pages::generate(&camel_ir, &migration_report, &out.path().join("docs")).unwrap();
+    emitter::route_diagram::generate(&camel_ir, out.path()).unwrap();
+    let page = |flow: &str| {
+        std::fs::read_to_string(out.path().join(format!("docs/flows/{flow}.md"))).unwrap()
+    };
+    let field_page = page("fieldflow");
+    assert_eq!(
+        field_page
+            .matches(
+                "**Not migrated:** split - its value is a Mule expression that is not converted, \
+                 the route fails at this step (see the TODO in the route class)"
+            )
+            .count(),
+        2,
+        "{field_page}"
+    );
+    let loop_page = page("loopflow");
+    assert_eq!(
+        loop_page.matches("Split (to review: ").count(),
+        2,
+        "{loop_page}"
+    );
+    let diagram = std::fs::read_to_string(out.path().join("docs/route-diagram.md")).unwrap();
+    assert_eq!(
+        diagram.matches("NOT MIGRATED: split (fails here)").count(),
+        2,
+        "{diagram}"
+    );
+}

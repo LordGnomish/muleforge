@@ -110,25 +110,42 @@ fn describe_step(step: &RouteStep) -> String {
             }
             format!("Choice router ({} branches{notes})", whens.len())
         }
-        RouteStep::Split { parallel, .. } => {
-            if *parallel {
-                "Parallel split".into()
+        RouteStep::Split {
+            parallel, source, ..
+        } => {
+            let kind = if *parallel { "Parallel split" } else { "Split" };
+            if source.review.is_empty() {
+                kind.into()
             } else {
-                "Split".into()
+                format!(
+                    "{kind} (to review: converted on an assumption or not the same as the Mule \
+                     {}, see the TODO in the route class)",
+                    source.element_name()
+                )
             }
         }
         RouteStep::Marshal(fmt) => format!("Marshal ({:?})", fmt),
         RouteStep::Unmarshal(fmt) => format!("Unmarshal ({:?})", fmt),
         RouteStep::Transform { bean_ref } => format!("Transform via `{}`", bean_ref),
         RouteStep::ThrowException { class, .. } => format!("Throw `{}`", class),
-        RouteStep::RawDsl(dsl) => format!("Custom: {}", dsl.chars().take(60).collect::<String>()),
+        // The first line: a comment of several lines (the TODO of a
+        // scatter-gather) would break the list of steps.
+        RouteStep::RawDsl(dsl) => format!(
+            "Custom: {}",
+            dsl.lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect::<String>()
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::camel_ir::{ComparedValue, Expression};
+    use crate::ast::camel_ir::{ComparedValue, Expression, SplitSource};
 
     fn unconverted() -> Expression {
         Expression::Unconverted {
@@ -172,7 +189,9 @@ mod tests {
                 RouteStep::Split {
                     expression: unconverted(),
                     parallel: false,
+                    stop_on_exception: false,
                     aggregation_strategy: None,
+                    source: SplitSource::default(),
                     steps: vec![],
                 },
                 "split".to_string(),
@@ -248,6 +267,48 @@ mod tests {
             "Choice router (2 branches; **not migrated: 1 of 2 conditions** - a message that \
              reaches one of them fails there; to review: 1 of 2 conditions, converted on an \
              assumption; see the TODO in the route class)"
+        );
+    }
+
+    /// A split that is converted on an assumption is in the route, with a
+    /// TODO: the page says that it is to review.
+    #[test]
+    fn split_to_review_says_so() {
+        let split = |parallel: bool, review: &[&str]| RouteStep::Split {
+            expression: Expression::Simple("${body}".into()),
+            parallel,
+            stop_on_exception: true,
+            aggregation_strategy: None,
+            steps: vec![],
+            source: SplitSource {
+                element: "foreach".into(),
+                attribute: "collection".into(),
+                original: None,
+                review: review.iter().map(|note| note.to_string()).collect(),
+            },
+        };
+        assert_eq!(
+            describe_step(&split(false, &["assumed"])),
+            "Split (to review: converted on an assumption or not the same as the Mule foreach, \
+             see the TODO in the route class)"
+        );
+        assert_eq!(describe_step(&split(false, &[])), "Split");
+        assert_eq!(describe_step(&split(true, &[])), "Parallel split");
+    }
+
+    /// A comment step of several lines is named by its first line: the
+    /// rest would start new lines in the numbered list of steps.
+    #[test]
+    fn comment_step_is_described_by_its_first_line() {
+        assert_eq!(
+            describe_step(&RouteStep::RawDsl(
+                "TODO: review this scatter-gather, it is not migrated\n- why".into()
+            )),
+            "Custom: TODO: review this scatter-gather, it is not migrated"
+        );
+        assert_eq!(
+            describe_step(&RouteStep::RawDsl("// DataWeave: %dw 2.0".into())),
+            "Custom: // DataWeave: %dw 2.0"
         );
     }
 }

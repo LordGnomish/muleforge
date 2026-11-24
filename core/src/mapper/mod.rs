@@ -626,9 +626,13 @@ fn map_processor(
             }
             vec![RouteStep::Choice { whens, otherwise }]
         }
-        ("", "scatter-gather") | ("", "split") => {
-            let expr = elem.attr("expression").unwrap_or("#[payload]").to_string();
-            let parallel = elem.attr("parallel").map(|v| v == "true").unwrap_or(false);
+        // A scatter-gather sends the message to each of its routes at the
+        // same time and collects what they return. It iterates nothing: a
+        // split of the payload (what it used to be emitted as) is another
+        // thing. It is not migrated; the route says so and fails there. The
+        // steps of its routes follow, as the steps of an unconverted
+        // foreach do.
+        ("", "scatter-gather") => {
             let steps: Vec<RouteStep> = elem
                 .children
                 .iter()
@@ -637,37 +641,35 @@ fn map_processor(
             record_decision(
                 decisions,
                 elem,
-                DecisionStatus::Done,
+                DecisionStatus::ManualReview,
                 rule_id,
-                "scatter-gather/split -> split",
+                "scatter-gather is not migrated: Mule sends the message to every route of a \
+                 scatter-gather at the same time and collects their results, which is not a \
+                 split of the payload (what used to be emitted for it). The route fails at this \
+                 step until it is replaced; the usual Camel form is a multicast with an \
+                 aggregation strategy",
             );
-            vec![RouteStep::Split {
-                expression: Expression::Simple(expr),
-                parallel,
-                aggregation_strategy: None,
-                steps,
-            }]
+            let mut out = vec![
+                RouteStep::RawDsl(
+                    "TODO: review this scatter-gather, it is not migrated\n\
+                     - Mule sends the message to every route of a scatter-gather at the same \
+                     time and collects their results; that is not a split of the payload, which \
+                     is what used to be emitted for it\n\
+                     - the route fails at this step instead of going on without the routes; the \
+                     usual Camel form is a multicast with an aggregation strategy\n\
+                     - the steps of its routes follow it and are not reached"
+                        .into(),
+                ),
+                RouteStep::ThrowException {
+                    class: "UnsupportedOperationException".into(),
+                    message: "scatter-gather not migrated".into(),
+                },
+            ];
+            out.extend(steps);
+            out
         }
-        ("", "foreach") => {
-            let expr = elem.attr("collection").unwrap_or("#[payload]").to_string();
-            let steps: Vec<RouteStep> = elem
-                .children
-                .iter()
-                .flat_map(|c| map_processor(c, app, rules, decisions, deps))
-                .collect();
-            record_decision(
-                decisions,
-                elem,
-                DecisionStatus::Done,
-                rule_id,
-                "foreach -> split",
-            );
-            vec![RouteStep::Split {
-                expression: Expression::Simple(expr),
-                parallel: false,
-                aggregation_strategy: None,
-                steps,
-            }]
+        ("", "foreach") | ("", "split") => {
+            map_iteration(elem, app, rules, decisions, deps, rule_id)
         }
         // A flow-ref runs its target as part of the calling flow, and what
         // the target does not handle itself goes to the caller's error
@@ -1265,6 +1267,184 @@ fn variable_review(app: App<'_>, name: &str) -> Option<String> {
         "converted assuming variable {name} holds a value this application set from a literal; \
          it is also set at: {places}. Check the comparison"
     ))
+}
+
+/// A Mule element that runs its steps for each element of a collection, as
+/// a Camel `split`: a `foreach` (over its `collection`, the payload if it
+/// has none) or a `split` (over its `expression`).
+///
+/// The expression is converted by [`crate::mel::convert_collection`]: the
+/// payload and a variable to the body and the exchange property, on the
+/// assumption that the value is a Java collection, which is what Camel's
+/// split iterates; nothing else. It is never handed to Camel as written
+/// (`simple("#[payload]")` is a constant for Simple: the steps ran once, for
+/// that text). So the element is never reported as done:
+///
+/// * converted on the assumption: the split is emitted, with the
+///   assumption and what [`foreach_differences`] finds in a `TODO`;
+/// * not converted: the split is [`Expression::Unconverted`], which the
+///   emitter writes as a step that throws, followed by the steps of the
+///   scope. A `foreach` with a `batchSize` is not converted either: Mule
+///   hands its steps lists of that many elements.
+///
+/// A `foreach` stops at the first element whose steps fail and hands the
+/// error to the error handler; the split gets `stopOnException()` for that.
+fn map_iteration(
+    elem: &MuleElement,
+    app: App<'_>,
+    rules: &[Rule],
+    decisions: &mut Vec<MappingDecision>,
+    deps: &mut Vec<MavenDependency>,
+    rule_id: Option<&str>,
+) -> Vec<RouteStep> {
+    let foreach = elem.name == "foreach";
+    let attribute = if foreach { "collection" } else { "expression" };
+    let original = elem.attr(attribute);
+    let steps: Vec<RouteStep> = elem
+        .children
+        .iter()
+        .flat_map(|c| map_processor(c, app, rules, decisions, deps))
+        .collect();
+
+    let (mut expression, assumption) = match original {
+        Some(raw) => crate::mel::convert_collection(raw),
+        // "collection: payload" is the documented default of a foreach.
+        None if foreach => crate::mel::convert_collection("#[payload]"),
+        None => (
+            Expression::Unconverted {
+                original: "(none)".into(),
+                reason: "the split has no expression: nothing says what it iterates".into(),
+            },
+            None,
+        ),
+    };
+    let mut review: Vec<String> = assumption.into_iter().collect();
+    if foreach {
+        if let Some(size) = elem.attr("batchSize").filter(|size| size.trim() != "1") {
+            let why = format!(
+                "the foreach has batchSize=\"{size}\": Mule hands the steps lists of that many \
+                 elements, Camel's split hands over one element at a time and has no option \
+                 that groups the elements of a collection"
+            );
+            if matches!(expression, Expression::Unconverted { .. }) {
+                review.push(why);
+            } else {
+                // The assumption about the collection does not matter any more.
+                review.clear();
+                expression = Expression::Unconverted {
+                    original: format!(
+                        "{} with batchSize=\"{size}\"",
+                        original.unwrap_or("payload (the default)")
+                    ),
+                    reason: why,
+                };
+            }
+        }
+        review.extend(foreach_differences(elem));
+    } else {
+        review.push(
+            "split is not an element of Mule 4: it is taken as a scope that runs its steps for \
+             each element of its expression. Check what it did in the application"
+                .to_string(),
+        );
+    }
+
+    let name = &elem.name;
+    let mut rationale = format!("{name} -> split; review: ");
+    match &expression {
+        Expression::Unconverted { original, reason } => {
+            rationale.push_str(&format!(
+                "the {attribute} {original} is not converted ({reason}). The route fails at \
+                 this step until it is replaced, and the steps of the {name} are not reached"
+            ));
+            for note in &review {
+                rationale.push_str(". ");
+                rationale.push_str(note);
+            }
+        }
+        _ => rationale.push_str(&review.join(". ")),
+    }
+    record_decision(
+        decisions,
+        elem,
+        DecisionStatus::ManualReview,
+        rule_id,
+        &rationale,
+    );
+
+    vec![RouteStep::Split {
+        expression,
+        parallel: !foreach && elem.attr("parallel") == Some("true"),
+        stop_on_exception: foreach,
+        aggregation_strategy: None,
+        steps,
+        source: SplitSource {
+            element: name.clone(),
+            attribute: attribute.to_string(),
+            original: original.map(str::to_string),
+            review,
+        },
+    }]
+}
+
+/// What the steps inside a `foreach` rely on that Camel's split does not
+/// do as Mule's foreach does, for the `TODO` and the report. The steps are
+/// emitted as they are; nothing is changed to make up for it.
+///
+/// * A variable set in the scope: Mule keeps it for the next element and
+///   after the scope. The split runs the steps on a copy of the exchange
+///   for each element, and a property set there is gone with the copy.
+/// * `vars.counter` and `vars.rootMessage` (or the names the foreach gives
+///   them): the split sets neither.
+/// * A `flow-ref` in the scope: what the flow sets or reads is not
+///   followed.
+///
+/// The payload after the scope needs no note: it is the payload from before
+/// the scope in Mule, and the body from before the split in Camel.
+fn foreach_differences(foreach: &MuleElement) -> Vec<String> {
+    let mut notes = Vec::new();
+    let set = variables::set_inside(foreach);
+    if !set.is_empty() {
+        notes.push(format!(
+            "the steps set the variable{} {}: Mule keeps a variable that is set inside a \
+             foreach for the next element and after the scope; Camel's split runs the steps on \
+             a copy of the exchange for each element, so the exchange property is set neither \
+             for the next element nor after the split",
+            if set.len() == 1 { "" } else { "s" },
+            set.join(", ")
+        ));
+    }
+    for (attribute, default, holds, camel) in [
+        (
+            "counterVariableName",
+            "counter",
+            "the number of the element it is at",
+            ". It sets CamelSplitIndex, which starts at 0",
+        ),
+        (
+            "rootMessageVariableName",
+            "rootMessage",
+            "the message as it was before the scope",
+            "",
+        ),
+    ] {
+        let name = foreach.attr(attribute).unwrap_or(default);
+        if variables::read_inside(foreach, name) {
+            notes.push(format!(
+                "the steps read vars.{name}, which Mule's foreach sets to {holds}: Camel's \
+                 split does not set an exchange property {name}{camel}"
+            ));
+        }
+    }
+    let called = variables::flow_refs_inside(foreach);
+    if !called.is_empty() {
+        notes.push(format!(
+            "the steps call {} (flow-ref): whether a variable is set there, or the counter or \
+             the root message of the foreach is read, was not looked at",
+            called.join(", ")
+        ));
+    }
+    notes
 }
 
 /// The decision for a step that sets a value (`set-payload`,
@@ -3059,5 +3239,376 @@ mappings:
         assert_eq!(decisions.len(), 1, "{decisions:?}");
         assert_eq!(decisions[0].rule_id.as_deref(), Some("x-send"));
         assert_eq!(decisions[0].status, DecisionStatus::Done);
+    }
+
+    // ── foreach, split, scatter-gather ──────────────────────────────────
+
+    fn foreach(attrs: &[(&str, &str)], children: Vec<MuleElement>) -> MuleElement {
+        let mut foreach = elem("", "foreach", attrs);
+        foreach.children = children;
+        foreach
+    }
+
+    fn logger(message: &str) -> MuleElement {
+        elem("", "logger", &[("message", message)])
+    }
+
+    /// The parts of the one split `steps` consists of: its expression,
+    /// whether it stops at the first failure, its steps and where it comes
+    /// from.
+    fn only_split(steps: Vec<RouteStep>) -> (Expression, bool, Vec<RouteStep>, SplitSource) {
+        match <[RouteStep; 1]>::try_from(steps) {
+            Ok(
+                [RouteStep::Split {
+                    expression,
+                    stop_on_exception,
+                    steps,
+                    source,
+                    ..
+                }],
+            ) => (expression, stop_on_exception, steps, source),
+            other => panic!("expected one Split step, got {other:?}"),
+        }
+    }
+
+    /// The decision for `element` itself: the last one, after the
+    /// decisions for the steps in it, and the only one for that element.
+    fn own_decision<'a>(decisions: &'a [MappingDecision], element: &str) -> &'a MappingDecision {
+        let last = decisions.last().expect("a decision");
+        assert_eq!(last.mule_element, element, "{decisions:?}");
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|d| d.mule_element == element)
+                .count(),
+            1,
+            "{decisions:?}"
+        );
+        last
+    }
+
+    /// A foreach over the payload (no `collection`, or `#[payload]`) or
+    /// over a variable is a split of the body or of the exchange property.
+    /// That iterates the same elements only if the value is a Java
+    /// collection, which the migrator does not know: never `DONE`.
+    #[test]
+    fn foreach_over_the_payload_or_a_variable_is_a_split_to_review() {
+        const BODY: &str = "assuming the body is a Java collection";
+        const PROPERTY: &str = "assuming the exchange property items holds a Java collection";
+        for (attrs, expected, assumed) in [
+            (vec![], "${body}", BODY),
+            (vec![("collection", "#[payload]")], "${body}", BODY),
+            (
+                vec![("collection", "#[vars.items]")],
+                "${exchangeProperty.items}",
+                PROPERTY,
+            ),
+            (
+                vec![("collection", "#[payload]"), ("batchSize", "1")],
+                "${body}",
+                BODY,
+            ),
+        ] {
+            for rules in shipped_and_builtin_rules() {
+                let (steps, decisions) =
+                    steps_and_decisions(&foreach(&attrs, vec![logger("item")]), &rules);
+                let (expression, stop_on_exception, steps, source) = only_split(steps);
+                assert_eq!(expression, simple(expected), "{attrs:?}");
+                assert!(stop_on_exception, "a foreach stops at the first failure");
+                assert_eq!(steps.len(), 1, "{steps:?}");
+                assert_eq!(source.element, "foreach");
+                assert_eq!(source.attribute, "collection");
+                assert_eq!(
+                    source.original.as_deref(),
+                    attrs
+                        .iter()
+                        .find(|(name, _)| *name == "collection")
+                        .map(|(_, value)| *value)
+                );
+                assert_eq!(source.review.len(), 1, "{:?}", source.review);
+                assert!(source.review[0].contains(assumed), "{:?}", source.review);
+
+                let decision = own_decision(&decisions, "foreach");
+                assert_eq!(decision.status, DecisionStatus::ManualReview);
+                assert!(
+                    decision.rationale.starts_with("foreach -> split; review: ")
+                        && decision.rationale.contains(assumed),
+                    "{}",
+                    decision.rationale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foreach_with_an_unconvertible_collection_is_flagged_and_keeps_its_steps() {
+        for collection in [
+            "#[payload.items]",
+            "#[payload.lines()]",
+            "#[1 to 3]",
+            "payload",
+        ] {
+            for rules in shipped_and_builtin_rules() {
+                let (steps, decisions) = steps_and_decisions(
+                    &foreach(
+                        &[("collection", collection)],
+                        vec![logger("item"), logger("again")],
+                    ),
+                    &rules,
+                );
+                let (expression, _, steps, source) = only_split(steps);
+                assert!(is_unconverted(&expression, collection), "{expression:?}");
+                assert_eq!(steps.len(), 2, "{steps:?}");
+                assert_eq!(source.original.as_deref(), Some(collection));
+                assert!(source.review.is_empty(), "{:?}", source.review);
+
+                let decision = own_decision(&decisions, "foreach");
+                assert_eq!(decision.status, DecisionStatus::ManualReview);
+                assert!(
+                    decision
+                        .rationale
+                        .contains(&format!("the collection {collection} is not converted"))
+                        && decision.rationale.contains("The route fails at this step"),
+                    "{}",
+                    decision.rationale
+                );
+            }
+        }
+    }
+
+    /// With a `batchSize` the steps get lists of elements. A split hands
+    /// over one element at a time: not converted, whatever the collection.
+    #[test]
+    fn foreach_with_a_batch_size_is_not_converted() {
+        for (attrs, original) in [
+            (
+                vec![("batchSize", "2")],
+                "payload (the default) with batchSize=\"2\"",
+            ),
+            (
+                vec![
+                    ("collection", "#[vars.items]"),
+                    ("batchSize", "${batch.size}"),
+                ],
+                "#[vars.items] with batchSize=\"${batch.size}\"",
+            ),
+        ] {
+            let (steps, decisions) =
+                steps_and_decisions(&foreach(&attrs, vec![logger("batch")]), &[]);
+            let (expression, _, steps, _) = only_split(steps);
+            match &expression {
+                Expression::Unconverted {
+                    original: kept,
+                    reason,
+                } => {
+                    assert_eq!(kept, original);
+                    assert!(reason.contains("batchSize"), "{reason}");
+                }
+                other => panic!("{attrs:?} must not be converted, got {other:?}"),
+            }
+            assert_eq!(steps.len(), 1);
+            let decision = own_decision(&decisions, "foreach");
+            assert_eq!(decision.status, DecisionStatus::ManualReview);
+            assert!(
+                decision.rationale.contains("batchSize"),
+                "{}",
+                decision.rationale
+            );
+        }
+
+        // The collection is not converted anyway: the batch size is one
+        // more thing to know about.
+        let (steps, _) = steps_and_decisions(
+            &foreach(
+                &[("collection", "#[payload.items]"), ("batchSize", "5")],
+                vec![logger("batch")],
+            ),
+            &[],
+        );
+        let (expression, _, _, source) = only_split(steps);
+        assert!(
+            is_unconverted(&expression, "#[payload.items]"),
+            "{expression:?}"
+        );
+        assert_eq!(source.review.len(), 1, "{:?}", source.review);
+        assert!(
+            source.review[0].contains("batchSize=\"5\""),
+            "{:?}",
+            source.review
+        );
+    }
+
+    /// What Camel's split does not do as Mule's foreach does, if the steps
+    /// in the foreach depend on it: a variable set in it is gone after each
+    /// element, and there is no `counter` and no `rootMessage`.
+    #[test]
+    fn foreach_says_what_its_steps_rely_on_that_a_split_does_not_do() {
+        let notes = |foreach: MuleElement| -> Vec<String> {
+            let (steps, decisions) = steps_and_decisions(&foreach, &[]);
+            let (_, _, _, source) = only_split(steps);
+            let decision = own_decision(&decisions, "foreach");
+            assert_eq!(decision.status, DecisionStatus::ManualReview);
+            for note in &source.review {
+                assert!(
+                    decision.rationale.contains(note.as_str()),
+                    "{note} is not in {}",
+                    decision.rationale
+                );
+            }
+            // The first note is the assumption about the collection.
+            source.review[1..].to_vec()
+        };
+
+        assert_eq!(
+            notes(foreach(&[], vec![logger("item #[payload]")])),
+            Vec::<String>::new()
+        );
+
+        let sets = notes(foreach(
+            &[],
+            vec![set_variable("seen", "yes"), logger("item")],
+        ));
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert!(
+            sets[0].starts_with("the steps set the variable seen: "),
+            "{sets:?}"
+        );
+
+        let mut branch = elem("", "when", &[("expression", "#[vars.kind == 'a']")]);
+        branch.children = vec![
+            set_variable("total", "#[vars.total]"),
+            set_variable("seen", "yes"),
+            elem("", "remove-variable", &[("variableName", "kind")]),
+            elem("http", "request", &[("target", "reply")]),
+            set_variable("seen", "again"),
+        ];
+        let nested = notes(foreach(&[], vec![choice(vec![branch])]));
+        assert_eq!(nested.len(), 1, "{nested:?}");
+        assert!(
+            nested[0].starts_with("the steps set the variables total, seen, kind, reply: "),
+            "{nested:?}"
+        );
+
+        let counts = notes(foreach(
+            &[],
+            vec![logger(
+                "item #[vars.counter] of #[vars.rootMessage.payload]",
+            )],
+        ));
+        assert_eq!(counts.len(), 2, "{counts:?}");
+        assert!(
+            counts[0].starts_with("the steps read vars.counter"),
+            "{counts:?}"
+        );
+        assert!(
+            counts[1].starts_with("the steps read vars.rootMessage"),
+            "{counts:?}"
+        );
+
+        // Renamed: the default names are ordinary variables then.
+        let renamed = notes(foreach(
+            &[
+                ("counterVariableName", "i"),
+                ("rootMessageVariableName", "root"),
+            ],
+            vec![
+                logger("#[vars.counter] #[vars.rootMessage] counter i"),
+                logger("#[vars['i']]"),
+            ],
+        ));
+        assert_eq!(renamed.len(), 1, "{renamed:?}");
+        assert!(
+            renamed[0].starts_with("the steps read vars.i"),
+            "{renamed:?}"
+        );
+
+        let calls = notes(foreach(
+            &[],
+            vec![
+                elem("", "flow-ref", &[("name", "perItem")]),
+                elem("", "flow-ref", &[("name", "audit")]),
+            ],
+        ));
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            calls[0].starts_with("the steps call perItem, audit (flow-ref)"),
+            "{calls:?}"
+        );
+    }
+
+    /// A scatter-gather sends the message to each of its routes; it does
+    /// not iterate anything. It used to be emitted as a split of
+    /// `simple("#[payload]")`.
+    #[test]
+    fn scatter_gather_is_not_emitted_as_a_split_and_fails_loudly() {
+        let mut route = elem("", "route", &[]);
+        route.children = vec![logger("one")];
+        let mut scatter = elem("", "scatter-gather", &[]);
+        scatter.children = vec![route];
+        for rules in shipped_and_builtin_rules() {
+            let (steps, decisions) = steps_and_decisions(&scatter, &rules);
+            assert!(
+                matches!(
+                    &steps[..],
+                    [RouteStep::RawDsl(todo), RouteStep::ThrowException { class, message }, ..]
+                        if todo.starts_with("TODO: review this scatter-gather, it is not migrated")
+                            && class == "UnsupportedOperationException"
+                            && message == "scatter-gather not migrated"
+                ),
+                "{steps:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| matches!(step, RouteStep::Split { .. })),
+                "{steps:?}"
+            );
+            let own: Vec<_> = decisions
+                .iter()
+                .filter(|d| d.mule_element == "scatter-gather")
+                .collect();
+            assert_eq!(own.len(), 1, "{decisions:?}");
+            assert_eq!(own[0].status, DecisionStatus::ManualReview);
+            assert!(
+                own[0].rationale.contains("The route fails at this step"),
+                "{}",
+                own[0].rationale
+            );
+        }
+    }
+
+    /// `<split expression="...">`: the expression is converted as the
+    /// collection of a foreach is, never passed on as written.
+    #[test]
+    fn split_expression_is_converted_like_a_collection() {
+        for (attrs, converted) in [
+            (vec![("expression", "#[payload]")], Some("${body}")),
+            (
+                vec![("expression", "#[vars.lines]")],
+                Some("${exchangeProperty.lines}"),
+            ),
+            (vec![("expression", "#[payload.items]")], None),
+            (vec![], None),
+        ] {
+            let mut split = elem("", "split", &attrs);
+            split.children = vec![logger("part")];
+            let (steps, decisions) = steps_and_decisions(&split, &[]);
+            let (expression, stop_on_exception, steps, source) = only_split(steps);
+            match converted {
+                Some(expected) => assert_eq!(expression, simple(expected)),
+                None => assert!(
+                    matches!(expression, Expression::Unconverted { .. }),
+                    "{expression:?}"
+                ),
+            }
+            assert!(!stop_on_exception);
+            assert_eq!(steps.len(), 1);
+            assert_eq!(source.element, "split");
+            assert_eq!(source.attribute, "expression");
+            assert_eq!(
+                own_decision(&decisions, "split").status,
+                DecisionStatus::ManualReview
+            );
+        }
     }
 }

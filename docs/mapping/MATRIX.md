@@ -46,9 +46,9 @@ This document shows the full mapping coverage between Mule 4 elements and Apache
 | Mule Element | Camel Equivalent | Status | Notes |
 |---|---|---|---|
 | `choice` | `choice()` | ⚠️ Partial | Every `when` and the `otherwise` are kept, in order. Auto (`DONE`) when every condition is one of the converted shapes under [Expressions](#expressions) and every variable it compares is only set from literals; otherwise the choice is flagged `MANUAL_REVIEW`: an unconverted condition fails when it is evaluated, a comparison of a variable that may hold something else is emitted with a `TODO`. The choice is closed with `.end()`, so the steps after `</choice>` follow it for every message; a `choice` in a `when` or `otherwise` of another one is closed with `.end().endChoice()`, see [Where a `choice` ends](#where-a-choice-ends) |
-| `scatter-gather` | `multicast()` | ✅ Auto | |
-| `split` | `split()` | ✅ Auto | Parallel flag preserved |
-| `foreach` | `split()` | ✅ Auto | Sequential split |
+| `scatter-gather` | not migrated | ❌ Manual | Emitted as a step that throws `UnsupportedOperationException("scatter-gather not migrated")` with a `TODO`, `MANUAL_REVIEW`. It used to be emitted as a split of `simple("#[payload]")` without steps, with which the application does not start. See [Collections](#collections-foreach-collection-split-expression) |
+| `split` | `split()` | ⚠️ Partial | Its `expression` is converted like the collection of a `foreach`; always `MANUAL_REVIEW` (`split` is not an element of Mule 4). Parallel flag preserved |
+| `foreach` | `split().stopOnException()` | ⚠️ Partial | Never `DONE`. Without `collection`, or with `#[payload]` / `#[vars.x]`: a split of the body / the exchange property, on the assumption that it is a Java collection (`TODO`, `MANUAL_REVIEW`). Any other collection, and a `batchSize` other than `1`: a step that throws. See [Collections](#collections-foreach-collection-split-expression) |
 | `first-successful` | Failover LB | ✅ Auto | Via mapping YAML |
 | `round-robin` | Round-robin LB | ✅ Auto | Via mapping YAML |
 | `until-successful` | Error handler retry | ✅ Auto | maxRetries + delay |
@@ -143,15 +143,17 @@ BLOCK", whichever route ran); no Mule runtime was used.
 ## Expressions
 
 How a Mule expression (`#[...]`, DataWeave in Mule 4) is converted where it
-decides what the route does: the `expression` of a choice `<when>` and the
-`value` of `set-variable` / `set-payload`.
+decides what the route does: the `expression` of a choice `<when>`, the
+`value` of `set-variable` / `set-payload` and the `collection` of a `foreach`.
 
 The rule: an expression is reported `DONE` only if the Camel expression reads
 the same value and gives the same result **whatever the payload and the values
 of the variables are**. Anything else is `MANUAL_REVIEW`, with the Mule
 expression kept in a `TODO` in the generated route. No expression is ever
-passed on to Camel as it was written (`simple("#[...]")` does not parse:
-"Unexpected token # at location 0", and the application does not start).
+passed on to Camel as it was written (as a predicate `simple("#[...]")` does
+not parse: "Unexpected token # at location 0", and the application does not
+start; as the expression of a split it is a constant, and the steps run once
+for that text).
 
 `MANUAL_REVIEW` comes in two forms. An expression that is **not converted** is
 emitted as a step or predicate that throws (see "What an unconverted expression
@@ -194,6 +196,97 @@ comparison is `DONE`").
 | `#[vars.n > 3]` and `<`, `>=`, `<=` | not converted | `MANUAL_REVIEW` | Ordering depends on the types of the two values (number or text), which are not known |
 | `#[vars.flag]`, `#[payload]` (a value as the condition) | not converted | `MANUAL_REVIEW` | Mule expects a Boolean; Camel takes every value except `null`, `false`, `"false"` and `""` as true |
 | `and` / `or` / `not`, function calls (`#[isEmpty(payload)]`), `~=`, a decimal (`1.5`) or an integer that is not a Java `int`, a string literal with a quote, `\`, `$` or a brace, anything else, a `<when>` without `expression` | not converted | `MANUAL_REVIEW` | Not converted yet, or no Camel predicate that is the same for every value |
+
+### Collections (`foreach collection`, `split expression`)
+
+A `foreach` is a Camel `split`. What it iterates is its `collection`, the
+payload if it has none (`mel::convert_collection`):
+
+| Mule | Camel | Status | Why |
+|---|---|---|---|
+| `<foreach>` without `collection`, `collection="#[payload]"`, `#[message.payload]` | `.split(simple("${body}")).stopOnException()` | `MANUAL_REVIEW` (converted on an assumption) | The same elements only if the body is a Java collection when the split is reached, see below |
+| `collection="#[vars.items]"`, `#[vars['items']]`, `#[flowVars.items]` | `.split(simple("${exchangeProperty.items}")).stopOnException()` | `MANUAL_REVIEW` (converted on an assumption) | The same elements only if the exchange property holds a Java collection |
+| `#[payload.items]`, `#[payload.lines()]`, `#[vars.order.lines]`, `#[attributes...]`, ranges and list literals (`#[1 to 3]`, `#[['a', 'b']]`), function calls, DataWeave scripts, a literal, text that is not one `#[...]` expression | not converted: a step that throws | `MANUAL_REVIEW` | Field access into the payload, attributes and the value of a variable for the reasons below; the rest has no Camel expression that is the same for every value |
+| any collection with a `batchSize` other than `1` | not converted: a step that throws | `MANUAL_REVIEW` | Mule hands the steps lists of that many elements. Camel's split hands over one element at a time; `SplitDefinition` (Camel 4.18.0) has no option that groups the elements of a collection |
+
+No `foreach` is `DONE`. There is no collection expression that Camel's split
+iterates like Mule for every value:
+
+* Mule's For Each "can process any collection, including lists and arrays.
+  The collection can be any supported content type, such as
+  `application/json`, `application/java`, or `application/xml`".
+* Camel's split iterates a Java `Iterable`, `Iterator` or array. Run on Camel
+  4.18.0 with the emitted `split(simple("${body}"))`: an `ArrayList` and a
+  `String[]` of a, b, c give three elements; the body of an HTTP request
+  (`["a","b","c"]`, `application/json`, which arrives as
+  `org.apache.camel.converter.stream.ByteArrayInputStreamCache`) is handed to
+  the steps once, as the whole document; the `String` `a,b,c` is cut at its
+  commas into three elements; a `java.util.Map` gives its entries (`k1=v1`).
+  With `split(simple("${exchangeProperty.items}"))`: a property set by
+  `set-variable value="#[payload]"` holds that stream (one element), a
+  property that is not set gives no element at all.
+
+So the conversion is right exactly when the value is a Java collection (the
+result of a `sql:` select, for example), and the migrator does not know what
+the value is. The split is emitted with the assumption in a `TODO`:
+
+```java
+// TODO: review this split (Mule: foreach collection="#[vars.items]")
+// - converted assuming the exchange property items holds a Java collection (a java.util.Collection or another Iterable, an Iterator or an array) when the split is reached. Camel's split does not read a value as Mule does. Anything else is handed to the steps in one piece (...), except a String, which is cut at its commas, and a java.util.Map, of which the steps get the entries; nothing is iterated if the property is not set
+.split(simple("${exchangeProperty.items}")).stopOnException()
+    .log(LoggingLevel.INFO, "item")
+.end()
+```
+
+(`Mule: foreach without collection` if there is none.)
+
+A collection that is not converted, see "What an unconverted expression is
+emitted as":
+
+```java
+// TODO: review this foreach, its collection is not converted (Mule: #[payload.items])
+// - <reason>
+// - the route fails at this step instead of going on with a wrong value; replace it with the converted step
+// - the steps of the foreach follow it and are not reached
+.throwException(new UnsupportedOperationException("foreach collection not migrated: #[payload.items]"))
+.log(LoggingLevel.INFO, "item")
+```
+
+What used to be emitted, `.split(simple("#[payload.items]"))`, starts and
+answers: Simple takes text without `${...}` as a constant. Run on Camel
+4.18.0, the steps ran once, with the text `#[payload.items]` as the element,
+and the request got HTTP 200; the foreach was reported `DONE`.
+
+#### What a split does differently from a foreach
+
+Checked on the emitted routes (Camel 4.18.0) against the MuleSoft page of the
+For Each scope:
+
+| | Mule (documentation) | Camel split (run) | What the migration does |
+|---|---|---|---|
+| Payload after the scope | "For Each does not modify the current payload. The output payload is the same as the input." | The body after `.end()` is the body from before the split, also when a step in the split sets the body | Nothing to do |
+| An element whose steps fail | "the For Each scope stops processing that collection and invokes the error handler" | Without `stopOnException()` the steps run for every element and the exchange fails afterwards; with it the split stops at the first one | `stopOnException()` on the split of a `foreach`. An `onException` clause of the route then runs once and its result is the reply (checked with an `on-error-continue` without `type`). The exception that leaves the split is a `CamelExchangeException` ("Multicast processing failed for number 0") with the original as its cause |
+| A variable set in the scope | "New variables or modifications to existing variables that take place when processing one element are visible during the processing of another element. These changes to variables continue to be available outside the For Each scope." | The steps run on a copy of the exchange for each element: a property set for one element is not set for the next one, nor after the split (a `choice` on it after the scope took `otherwise`) | Not bridged. The steps are emitted as they are; the `TODO` and the report name the variables the steps set (`set-variable`, `remove-variable`, a `target`, ...). A `choice` on such a variable is `MANUAL_REVIEW` as well, see "When a comparison is `DONE`" |
+| `vars.counter`, `vars.rootMessage` | `counterVariableName` (default `counter`): "Name of the variable that stores the number of messages over which it iterates"; `rootMessageVariableName` (default `rootMessage`): "the complete, non-split message" | Neither property is set. The split sets `CamelSplitIndex` (0, 1, 2 for three elements) and `CamelSplitSize` | Not bridged. If a step in the scope reads `vars.counter` / `vars.rootMessage` (or the names the foreach gives them), the `TODO` and the report say so. A logger with `#[vars.counter]` logs an empty value |
+| `batchSize` | "Partitions the collection into sub-collections of the specified size" | No such option for a collection | Not converted: a step that throws, see the table above |
+
+A `flow-ref` in the scope is named in the `TODO` as well: what the flow it
+calls sets or reads is not followed.
+
+A split none of whose steps is written (a `foreach` of elements that are not
+migrated, which are comments) is left out, with a `TODO`: Camel does not start
+a route with a split without steps ("Definition has no children on Split").
+
+`scatter-gather` sends the message to each of its routes and collects the
+results; it iterates nothing. It was emitted as a split of
+`simple("#[payload]")` whose steps were comments, and the application did not
+start (the error above). It is now a step that throws
+`UnsupportedOperationException("scatter-gather not migrated")` with a `TODO`,
+`MANUAL_REVIEW`; its routes are not mapped.
+
+`<split expression="...">` is converted like a collection, without
+`stopOnException()` and always `MANUAL_REVIEW`: it is not an element of Mule 4,
+and what it did in the application has to be checked.
 
 ### Why field access into the payload is not converted
 
@@ -387,6 +480,13 @@ not do something else than the Mule flow without a sign of it.
   condition on it takes the wrong branch, a reply carries the text `#[...]`.
   The steps behind it are still emitted.
 
+* **`foreach` collection**: the split is replaced by a step that throws
+  `UnsupportedOperationException("foreach collection not migrated: ...")`
+  (same `TODO`, same cut of a long expression). The steps of the scope are
+  emitted behind it, as steps of the route (or of the branch the foreach is
+  in): they are not reached, so they do not run once for the whole payload,
+  and there is no split with a made-up expression for them to be in.
+
 The exception is one like any other. If the route has an `onException` clause
 that takes every exception (a Mule `on-error-continue` / `on-error-propagate`
 without `type`, or with `ANY`), that clause handles the "not migrated"
@@ -400,7 +500,10 @@ The generated documentation follows: `docs/flows/<flow>.md` lists such a step
 as "**Not migrated:** set message body - ... the route fails at this step" and
 a choice with the number of its conditions that are not migrated or converted
 on an assumption; the route diagram labels the step
-`NOT MIGRATED: setBody (fails here)`.
+`NOT MIGRATED: setBody (fails here)`. A foreach whose collection is not
+converted is "**Not migrated:** split - ..." and
+`NOT MIGRATED: split (fails here)`; one that is converted on an assumption is
+"Split (to review: ...)" on the page of its flow.
 
 The generated smoke test of such a route (`testRoute...Returns200`) fails
 until the expression is replaced. That is intended: the route is not migrated
@@ -413,14 +516,25 @@ an assumption (see "When a comparison is `DONE`"), otherwise `MANUAL_REVIEW`
 with the unconverted conditions and the reasons, and with the conditions that
 are converted on an assumption and the assignments they are about. A
 `set-variable` / `set-payload` is one row, `MANUAL_REVIEW` if its value is not
-converted. A mapping rule without `camel_uri` (`set-payload`, `set-variable`,
+converted. A `foreach` is one row, always `MANUAL_REVIEW`: with the assumption
+its split rests on, or with the collection that is not converted and why, and
+with what its steps rely on that a split does not do. A mapping rule without `camel_uri` (`set-payload`, `set-variable`,
 `choice-router`, `transform-message`, ...) no longer adds a `DONE` row of its
 own next to the row of the built-in mapping; its id is shown on that row.
 
 ### Not covered
 
-* `split` / `foreach` expressions are not converted yet and are still emitted
-  as `simple("#[...]")`.
+* `foreach`: no collection is converted without an assumption. A foreach
+  over a value that is known to be a Java collection (after a database
+  select, say) is not recognised as such and is `MANUAL_REVIEW` like the
+  others. Ranges and list literals (`#[1 to 3]`, `#[['a', 'b']]`), field
+  access (`#[payload.items]`) and `batchSize` are not converted.
+* `foreach`: a variable set in the scope is not carried to the next element
+  or out of the split, and `counter` / `rootMessage` are not set; both are
+  reported, not bridged. A flow called from the scope with `flow-ref` is not
+  searched for either.
+* `scatter-gather` is not migrated (a step that throws); its routes are not
+  mapped. `parallel-foreach` has no mapping.
 * `mimeType` / `encoding` of `set-payload` and `set-variable` are ignored.
 * A variable is an exchange property (`setProperty`), as before. Camel 4.4+
   also has variables (`setVariable`, `${variable.name}`); the mapping was not
@@ -452,6 +566,17 @@ own next to the row of the built-in mapping; its id is shown on that row.
   first expression that evaluates to `true` triggers that route's execution
   and the others are not checked"; its example is
   `#[vars.language == 'Spanish']`.
+* MuleSoft, For Each scope:
+  <https://docs.mulesoft.com/mule-runtime/latest/for-each-scope-concept>
+  (read 2026-11-24; quoted under "Collections"). Its reference table:
+  `collection`, default `payload`, "An expression that returns a Java
+  collection, object array, map, or DOM nodes"; `batchSize`, default `1`. The
+  page does not say what the elements of a map are, what happens with a
+  collection that is null or a string, or where `counter` starts.
+* Apache Camel, Split EIP:
+  <https://camel.apache.org/components/next/eips/split-eip.html>; the options
+  of the Java DSL were read from `org.apache.camel.model.SplitDefinition` of
+  Camel 4.18.0 (`javap`).
 * MuleSoft, Set Payload transformer:
   <https://docs.mulesoft.com/mule-runtime/latest/set-payload-transformer-reference>.
   The value "Accepts a literal string or DataWeave expression".
@@ -466,6 +591,22 @@ a literal", both unconverted forms, the cut exception message, an unresolved
 and a resolved property placeholder) were compiled into Camel Quarkus
 applications (Quarkus 3.33.1, Camel 4.18.0) and called over HTTP. The Mule
 side rests on the documentation; no Mule runtime was used.
+
+So was what is said under "Collections": a Mule application with one
+sub-flow per `foreach` shape (no collection, `#[payload]`, `#[vars.items]`,
+`#[payload.items]`, `#[1 to 3]`, `batchSize="2"`, a `set-variable` in the
+scope, a logger of `vars.counter`, a `set-payload` in the scope, a step that
+fails in the scope, a scope without a migrated step), a flow with a foreach
+and an `on-error-continue`, and a `scatter-gather` was migrated before and
+after the change, built with `mvn package` and called over HTTP. One
+hand-written class was added to the emitted project: routes that put an
+`ArrayList`, a `String[]`, a `Map` or a `String` into the body or the property
+`items` and call the emitted sub-flow routes through `direct:`, the route
+that the scopes call per element (it logs the body and the split
+properties), and two splits with and without `stopOnException()`. The
+emitted routes were not changed. Not checked: an `onException` clause for a
+specific exception class when the failure comes out of a split wrapped in a
+`CamelExchangeException`.
 
 ## Error Handling
 

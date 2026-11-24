@@ -7,9 +7,10 @@
 //!
 //! * [`mel_to_simple`] / [`interpolate_mel`]: lenient, for text that is
 //!   only displayed (logger messages).
-//! * [`convert_value`] / [`convert_condition`]: strict, for what decides
-//!   what a route does (set-variable and set-payload values, choice
-//!   conditions). They convert the shapes that mean the same in Camel
+//! * [`convert_value`] / [`convert_condition`] / [`convert_collection`]:
+//!   strict, for what decides what a route does (set-variable and
+//!   set-payload values, choice conditions, what a foreach iterates). They
+//!   convert the shapes that mean the same in Camel
 //!   whatever the values are, and return [`Expression::Unconverted`] with
 //!   the reason for everything else. `docs/mapping/MATRIX.md`
 //!   ("Expressions") has the table and the reasons.
@@ -50,6 +51,17 @@ const WHY_TWO_VARIABLES: &str = "it compares two variables: Mule's == is true on
      values have the same type and are equal, and there is no simple Camel predicate that is \
      exactly that for any two Java values (Simple's == converts one side to the type of the \
      other)";
+const WHY_OTHER_COLLECTION: &str = "it is not one of the shapes that are converted: payload or \
+     vars.name";
+/// What Camel's split iterates.
+const JAVA_COLLECTION: &str = "a Java collection (a java.util.Collection or another Iterable, \
+     an Iterator or an array)";
+/// What Camel's split does with a value that is not a Java collection,
+/// where Mule iterates the elements of the value it reads.
+const NOT_A_JAVA_COLLECTION: &str = "Camel's split does not read a value as Mule does. \
+     Anything else is handed to the steps in one piece (an HTTP request body, which arrives as \
+     a stream: a JSON or XML document is not read), except a String, which is cut at its \
+     commas, and a java.util.Map, of which the steps get the entries";
 /// The note on a comparison written with `flowVars`.
 const REVIEW_MEL: &str = "it is written with flowVars, the Mule 3 (MEL) syntax: the predicate \
      compares without converting types, as Mule 4 does; what MEL's == does with values of \
@@ -176,6 +188,55 @@ pub fn convert_condition(raw: &str) -> Expression {
         } else {
             Vec::new()
         },
+    }
+}
+
+/// What a `foreach` iterates, its `collection`, as the expression of a
+/// Camel `split`: the converted expression and the assumption it rests on.
+///
+/// * `#[payload]`: the message body, `${body}`;
+/// * `#[vars.name]`: the exchange property `name`,
+///   `${exchangeProperty.name}`.
+///
+/// Neither is the same for every value. Mule iterates the elements of the
+/// value it reads (a JSON array as well as a Java list); Camel's split
+/// iterates a Java `Iterable`, `Iterator` or array, and takes anything else
+/// as one element (or cuts it at commas, a String). So both come with the
+/// assumption that the value is a Java collection, for the `TODO` and the
+/// report; there is no shape that is converted without one.
+///
+/// Everything else is [`Expression::Unconverted`], without assumption:
+/// field access into the payload or a variable, attributes, function
+/// calls, ranges and list literals, DataWeave scripts, literals, text that
+/// is not one `#[...]` expression.
+pub fn convert_collection(raw: &str) -> (Expression, Option<String>) {
+    let Some(inner) = whole_expression(raw) else {
+        return (unconverted(raw, WHY_EMBEDDED), None);
+    };
+    match parse_operand(inner) {
+        Some(Operand::Payload) => (
+            Expression::Simple("${body}".into()),
+            Some(format!(
+                "converted assuming the body is {JAVA_COLLECTION} when the split is reached. \
+                 {NOT_A_JAVA_COLLECTION}"
+            )),
+        ),
+        Some(Operand::Variable(name)) => (
+            Expression::Simple(exchange_property(&name)),
+            Some(format!(
+                "converted assuming the exchange property {name} holds {JAVA_COLLECTION} when \
+                 the split is reached. {NOT_A_JAVA_COLLECTION}; nothing is iterated if the \
+                 property is not set"
+            )),
+        ),
+        Some(_) => (unconverted(raw, WHY_OTHER_COLLECTION), None),
+        None => (
+            unconverted(
+                raw,
+                why_not_an_operand(inner).unwrap_or(WHY_OTHER_COLLECTION),
+            ),
+            None,
+        ),
     }
 }
 
@@ -980,6 +1041,72 @@ mod tests {
             "",
         ] {
             reason_of(raw, convert_condition(raw));
+        }
+    }
+
+    // ── Collections (foreach) ───────────────────────────────────────────
+
+    /// The payload is the body, a variable is an exchange property. Camel's
+    /// split iterates a Java collection only, so both come with the
+    /// assumption they rest on.
+    #[test]
+    fn collection_that_is_the_payload_is_the_body_on_an_assumption() {
+        for raw in ["#[payload]", "#[message.payload]", "#[ payload ]"] {
+            let (expression, assumption) = convert_collection(raw);
+            assert_eq!(expression, Expression::Simple("${body}".into()), "{raw}");
+            let assumption = assumption.unwrap_or_else(|| panic!("{raw}: no assumption"));
+            assert!(
+                assumption.contains("assuming the body is a Java collection"),
+                "{raw}: {assumption}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_that_is_a_variable_is_the_exchange_property_on_an_assumption() {
+        for raw in ["#[vars.items]", "#[vars['items']]", "#[flowVars.items]"] {
+            let (expression, assumption) = convert_collection(raw);
+            assert_eq!(
+                expression,
+                Expression::Simple("${exchangeProperty.items}".into()),
+                "{raw}"
+            );
+            let assumption = assumption.unwrap_or_else(|| panic!("{raw}: no assumption"));
+            assert!(
+                assumption.contains("assuming the exchange property items holds a Java collection"),
+                "{raw}: {assumption}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_of_any_other_shape_is_not_converted() {
+        for (raw, why) in [
+            ("#[payload.items]", "reads a field of the payload"),
+            ("#[payload.lines()]", "reads a field of the payload"),
+            ("#[payload['items']]", "reads a field of the payload"),
+            ("#[vars.order.lines]", "reads into the value of a variable"),
+            ("#[attributes.queryParams.ids]", "reads message attributes"),
+            ("#[1 to 3]", "not one of the shapes"),
+            ("#[['a', 'b']]", "not one of the shapes"),
+            ("#[payload filter ($.active)]", "not one of the shapes"),
+            (
+                "#[output application/json --- payload.items]",
+                "not one of the shapes",
+            ),
+            ("#[sizeOf(payload)]", "not one of the shapes"),
+            ("#['a,b,c']", "not one of the shapes"),
+            ("#[42]", "not one of the shapes"),
+            ("#[null]", "not one of the shapes"),
+            ("payload", "not one complete #[...] expression"),
+            ("a,b,c", "not one complete #[...] expression"),
+            ("items of #[payload]", "not one complete #[...] expression"),
+            ("", "not one complete #[...] expression"),
+        ] {
+            let (expression, assumption) = convert_collection(raw);
+            assert_eq!(assumption, None, "{raw}");
+            let reason = reason_of(raw, expression);
+            assert!(reason.contains(why), "{raw}: {reason}");
         }
     }
 }
