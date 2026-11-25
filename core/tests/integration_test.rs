@@ -1768,3 +1768,52 @@ async fn foreach_collection_is_converted_on_an_assumption_or_fails_loudly() {
         "{diagram}"
     );
 }
+
+/// Every rule `mapper::load_rules` reads from `mappings/*.yaml` has a row in
+/// the "Mapping rules" table of `docs/mapping/MATRIX.md`, and that table has
+/// no row for a rule that does not exist: a mapping cannot be added, renamed
+/// or removed without the matrix saying what it does.
+///
+/// The test only checks that the row is there. What the row says has to be
+/// measured on a migrated application, as described at the top of the matrix.
+#[test]
+fn every_mapping_rule_has_a_row_in_the_mapping_matrix() {
+    use std::collections::BTreeSet;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let rules = mapper::load_rules(&root.join("mappings")).unwrap();
+    let loaded: BTreeSet<&str> = rules.iter().map(|rule| rule.id.as_str()).collect();
+    assert!(!loaded.is_empty(), "no rule was loaded from mappings/");
+    assert_eq!(
+        loaded.len(),
+        rules.len(),
+        "two rules in mappings/ have the same id"
+    );
+
+    let matrix = std::fs::read_to_string(root.join("docs/mapping/MATRIX.md")).unwrap();
+    let table = matrix
+        .split("\n## Mapping rules\n")
+        .nth(1)
+        .expect("docs/mapping/MATRIX.md has no \"## Mapping rules\" section");
+    let table = table.split("\n## ").next().unwrap();
+    // A row of the table starts with the rule id in backticks: | `db-select` | ...
+    let documented: BTreeSet<&str> = table
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|rest| rest.split('`').next())
+        .collect();
+
+    let missing: Vec<&&str> = loaded.difference(&documented).collect();
+    assert!(
+        missing.is_empty(),
+        "rules in mappings/*.yaml without a row in the \"Mapping rules\" table of \
+         docs/mapping/MATRIX.md: {missing:?}. Migrate an application that uses the element, \
+         look at what is emitted and add the row"
+    );
+    let stale: Vec<&&str> = documented.difference(&loaded).collect();
+    assert!(
+        stale.is_empty(),
+        "rows in the \"Mapping rules\" table of docs/mapping/MATRIX.md for rules that are not \
+         in mappings/*.yaml: {stale:?}"
+    );
+}

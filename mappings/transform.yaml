@@ -19,7 +19,7 @@ mappings:
     mule_ns: ""
     mule_name: remove-variable
     camel_component: removeProperty
-    notes: "Mule remove-variable maps to Camel removeProperty"
+    notes: "Not migrated: flagged MANUAL_REVIEW, nothing is emitted (the exchange property keeps its value). The Camel step is removeProperty"
 
   - id: transform-message
     mule_ns: ee
@@ -31,7 +31,7 @@ mappings:
     mule_ns: ""
     mule_name: foreach
     camel_component: split
-    notes: "Mule foreach maps to Camel split EIP"
+    notes: "Mule foreach becomes a Camel split on a stated assumption, or a step that throws; always MANUAL_REVIEW (docs/mapping/MATRIX.md, Collections)"
 
   - id: parse-template
     mule_ns: ""
@@ -40,4 +40,4 @@ mappings:
     maven_deps:
       - group_id: org.apache.camel.quarkus
         artifact_id: camel-quarkus-freemarker
-    notes: "Mule parse-template maps to Camel Freemarker component"
+    notes: "Not migrated: flagged MANUAL_REVIEW, nothing is emitted; this rule only adds the Freemarker dependency. The usual Camel form is the Freemarker component"

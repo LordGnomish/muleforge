@@ -7,22 +7,22 @@ mappings:
     mule_ns: batch
     mule_name: job
     camel_component: split
-    notes: "Mule batch:job maps to Camel split + parallel processing + aggregation strategy. Complex — usually needs manual review."
+    notes: "Not migrated: flagged MANUAL_REVIEW, nothing is emitted for the job or for what is in it. The usual Camel form is a split with parallel processing and an aggregation strategy"
 
   - id: batch-step
     mule_ns: batch
     mule_name: step
     camel_component: pipeline
-    notes: "Mule batch:step maps to a Camel pipeline stage within the split"
+    notes: "Not reached: a batch:job is not migrated and what is in it is not mapped. The usual Camel form is a pipeline stage within the split"
 
   - id: batch-aggregator
     mule_ns: batch
     mule_name: aggregator
     camel_component: aggregate
-    notes: "Mule batch:aggregator maps to Camel aggregate EIP"
+    notes: "Not reached: a batch:job is not migrated and what is in it is not mapped. The usual Camel form is the aggregate EIP"
 
   - id: until-successful
     mule_ns: ""
     mule_name: until-successful
     camel_component: loop
-    notes: "Mule until-successful maps to Camel loop with conditional break + error handler retry"
+    notes: "Not migrated: flagged MANUAL_REVIEW, nothing is emitted. The usual Camel form is an error handler with redelivery, or a loop with a conditional break"
