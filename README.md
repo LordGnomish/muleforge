@@ -121,46 +121,51 @@ my-quarkus-repo/
 
 ## Migration Scope
 
-MuleForge is a migration **assistant**, not a magic converter. Here is what to expect:
+MuleForge is a migration **assistant**, not a magic converter, and at this stage most of what it emits needs work before it runs. What follows is measured, not estimated: 98 probe applications, each with one Mule element or one variant of it, were migrated on `main`; for each, the migration report, the emitted route, the build of the emitted project and the start of the application were checked. [docs/mapping/MATRIX.md](./docs/mapping/MATRIX.md) has the row for every element, how it was measured, and the list of known defects.
 
-### Fully Automated (~60-65% of typical Mule apps)
+| Class of the probe | Probes | What it means |
+|---|---|---|
+| Converted | 14 | A Camel endpoint or step with the values of the Mule element, reported `DONE`. The emitted project built and the application started |
+| Converted, to review | 3 | Emitted and working on an assumption that is stated in the route and in the report (`MANUAL_REVIEW`) |
+| Wrong, reported `DONE` | 16 | A defect: the application starts, but the step is not what the Mule element says and fails, or works on something else, when it is reached |
+| Breaks the build or startup | 29 | A defect: reported `DONE`, and the emitted project does not build or the application does not start |
+| Not migrated - fails loudly | 5 | `MANUAL_REVIEW`; the route fails at that step instead of going on with a wrong result |
+| Not migrated - flagged only | 31 | `MANUAL_REVIEW`; a `// TODO` comment, and the route goes on without the step |
 
-| Category | Mule Elements | Camel Equivalent |
-|----------|--------------|------------------|
-| HTTP | listener, request | platform-http, http |
-| Messaging | Kafka consumer/publish, JMS listener/publish, AMQP | kafka, jms, amqp |
-| Database | DB select/insert/update/delete, stored procedures | sql, sql-stored |
-| File I/O | File/SFTP/FTP listener, read, write | file, sftp, ftp |
-| Scheduling | Fixed frequency, cron | timer, quartz |
-| Email | IMAP, POP3, SMTP | mail |
-| Salesforce | Query, CRUD, upsert, subscribe | salesforce |
-| SOAP | Web Service Consumer | cxf-soap |
-| Routing | Choice, scatter-gather, round-robin, first-successful | choice, multicast, loadBalance |
-| Flow control | Split, foreach, flow-ref, until-successful, try/catch | split, direct, doTry |
-| Transforms | Set-payload, set-variable, set-attribute, logger | setBody, setProperty, setHeader, log |
-| Error handling | on-error-propagate, on-error-continue, raise-error | onException, throwException |
-| Async | Async scope, VM queues | wireTap, seda |
+These are counts of probes, not a share of a typical Mule application: the probes weigh every element the same, and no percentage of "automated" migration is derived from them.
 
-### LLM-Assisted (~15-20% additional)
+### By category
 
-DataWeave expressions are converted using a three-tier approach:
+| Category | Converted | Emitted, but wrong or breaking (reported `DONE`) | Flagged `MANUAL_REVIEW` (to review, or not migrated) |
+|---|---|---|---|
+| HTTP | `http:listener` with `allowedMethods` | `http:listener` without `allowedMethods` (does not start), `http:request` | |
+| Messaging | Kafka `consumer`, `listener`, `message-listener` with a `topic`, `publish` | JMS `listener` (does not start), `publish`, `consume`; AMQP `listener`, `publish`; VM `listener`, `publish`, `consume` (do not start) | `kafka:message-listener` of Kafka connector 4.x (no `topic` attribute), Anypoint MQ |
+| Database | | `db:select`, `insert`, `update`, `delete`, `stored-procedure` (do not start; the SQL is not carried over) | |
+| File I/O | | `file:listener`, `file:write`, `file:read`; SFTP and FTP `listener` (do not start), `write`, `read` | |
+| Scheduling | | `scheduler` (fixed frequency: the timer fires once; cron: ignored) | |
+| Email | | `email:listener-imap`, `email:listener-pop3`, `email:send` (do not start) | |
+| Salesforce | | `query`, `create`, `update`, `delete`, `upsert`, `subscribe-topic` (do not start) | `subscribe-topic-listener` |
+| SOAP | | `wsc:consume`, `ws:consumer` (do not start) | |
+| Object Store | | `os:store`, `os:retrieve` (do not start) | |
+| Routing | `choice` whose conditions are all converted | | `choice` with other conditions (to review, or failing at the unconverted condition), `scatter-gather` (fails loudly), `first-successful`, `round-robin`, `until-successful`, `async`, `parallel-foreach`, `idempotent-message-validator`, `batch:job` |
+| Iteration | | | `foreach`, `split`: a Camel `split` on a stated assumption (to review), or a step that fails loudly |
+| Flow control | `flow-ref` to a sub-flow | | `flow-ref` to a flow (fails loudly), `try` |
+| Core processors | `set-payload` and `set-variable` with a literal or one of the converted expressions, `logger` | `logger` with `#[payload.field]` in its message (does not start) | `set-payload` / `set-variable` with any other expression (fail loudly), `set-attribute`, `remove-variable`, `remove-attribute`, `parse-template` |
+| Error handling | `on-error-continue` / `on-error-propagate` for every error (no `type`, or `ANY`) | | An on-error scope with a known `type` (to review) or with any other `type` (commented out), `error-handler ref`, `raise-error`, `validation:is-true` |
+| DataWeave | | | `ee:transform`: a comment, and the payload goes on unchanged |
+| Other | | | SAP (`sap:sync-rfc`: there is no SAP rule), custom Java (`java:invoke-static`) |
 
-1. **Pattern matching** (no LLM needed) — identity passthrough, field mapping, type coercion, string concatenation, filter, map, null coalescing
-2. **LLM conversion** (Claude, OpenAI, or Ollama) — complex transforms are sent to an LLM which produces Java Processor beans
-3. **Structured stubs** (fallback) — if no LLM is configured, generates TODO stubs with the original DataWeave preserved in Javadoc
+### DataWeave and LLM
 
-### Requires Manual Review (~15-25%)
+An `ee:transform` is not converted: the route gets a comment, the element is flagged `MANUAL_REVIEW`, and no bean is written for a script in `<ee:message><ee:set-payload>`. The repository has a DataWeave pattern matcher and LLM providers (Claude, OpenAI, Ollama) meant to produce Java beans. Their result was **not measured**: no LLM provider was available, and a request to the core binary with an `llm` block gave the same output as one without.
 
-- Custom Java components (Mule-specific Java classes)
-- SAP connectors (mapping exists but complex configuration needs manual validation)
-- Anypoint MQ (no direct Camel equivalent — consider Kafka or AMQP)
-- MUnit tests (test framework is completely different — generated smoke tests replace them)
-- API autodiscovery / API Manager integration (platform-specific)
-- Complex MEL expressions (legacy Mule 3 artifact)
-- Mule domain projects (shared connector configs)
-- CloudHub-specific features (persistent queues, worker management)
+### The migration report
 
-Every element is classified in `MIGRATION_REPORT.md` as `DONE`, `MANUAL_REVIEW`, or `SKIPPED` with a rationale and link to the source XML.
+`MIGRATION_REPORT.md` has a row for every element that was mapped: `Done` or `ManualReview`, the rule id and a rationale. As measured: its `File` and `Flow` columns are empty and its `Line` column is not a line number; the processors inside a scope that is not migrated (`try`, `async`, `batch:job`, ...) have no row; no probe produced a `Skipped` row; and `Done` does not mean that the element works (45 of the 59 probes with a `DONE` class are in one of the two defect classes).
+
+### Not measured
+
+Mule domain projects, API autodiscovery and API Manager integration, CloudHub features, MEL expressions of Mule 3 other than `flowVars.x`, and every connector that is not in the tables of the matrix. Custom Java classes are copied to the output with a `TODO` comment, MUnit suites become JUnit classes whose tests only call `fail(...)`, and API specifications are copied.
 
 ## Features
 
