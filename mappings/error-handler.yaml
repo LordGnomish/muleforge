@@ -19,4 +19,4 @@ mappings:
     mule_ns: ""
     mule_name: try
     camel_component: doTry
-    notes: "Mule try scope maps to Camel doTry/doCatch/doFinally"
+    notes: "Not migrated: flagged MANUAL_REVIEW, nothing is emitted for the scope, its processors or its error handler. The usual Camel form is doTry/doCatch/doFinally"

@@ -13,16 +13,16 @@ mappings:
     mule_ns: ""
     mule_name: scatter-gather
     camel_component: multicast
-    notes: "Mule scatter-gather maps to Camel multicast with parallel processing"
+    notes: "Not migrated: emitted as a step that throws and flagged MANUAL_REVIEW. The usual Camel form is a multicast with an aggregation strategy"
 
   - id: first-successful
     mule_ns: ""
     mule_name: first-successful
     camel_component: failover
-    notes: "Mule first-successful maps to Camel failover load balancer"
+    notes: "Not migrated: flagged MANUAL_REVIEW, nothing is emitted. The usual Camel form is a failover load balancer"
 
   - id: round-robin
     mule_ns: ""
     mule_name: round-robin
     camel_component: loadBalance
-    notes: "Mule round-robin maps to Camel round-robin load balancer"
+    notes: "Not migrated: flagged MANUAL_REVIEW, nothing is emitted. The usual Camel form is a round-robin load balancer"
