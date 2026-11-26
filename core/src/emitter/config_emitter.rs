@@ -38,14 +38,7 @@ pub fn emit(ir: &CamelProject, output_dir: &Path) -> Result<()> {
     }
 
     // Detect needed component configs from routes
-    let route_uris: Vec<String> = ir
-        .routes
-        .iter()
-        .map(|r| match &r.source {
-            crate::ast::camel_ir::RouteEndpoint::Uri(u) => u.clone(),
-            crate::ast::camel_ir::RouteEndpoint::Direct(d) => format!("direct:{}", d),
-        })
-        .collect();
+    let route_uris: Vec<String> = ir.routes.iter().map(|r| r.source.uri()).collect();
 
     if route_uris.iter().any(|u| u.starts_with("kafka:")) {
         props.push_str("# Kafka\n");

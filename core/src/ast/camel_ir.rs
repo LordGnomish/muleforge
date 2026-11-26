@@ -39,6 +39,37 @@ pub enum RouteEndpoint {
     /// emitted without error handler, so that its failures are handled by
     /// the route that called it.
     Direct(String),
+    /// The source of a flow that is not migrated: there is no Camel endpoint
+    /// that is known to be the Mule source (a mapping rule names an endpoint
+    /// and the element does not have every value the endpoint needs).
+    ///
+    /// A route cannot fail at its source the way it fails at a step that is
+    /// not migrated, and an endpoint with a value missing does not start.
+    /// So the route consumes from `direct:<placeholder>`, which nothing
+    /// sends to: the application builds and starts, the steps of the flow
+    /// are in the route and do not run, and a `TODO` in front of `from(...)`
+    /// says what the source is and what is missing.
+    Unmigrated {
+        /// The Mule element that is the source of the flow:
+        /// `sftp:listener`.
+        element: String,
+        /// Name of the `direct:` endpoint the route consumes from instead.
+        /// No other route of the project consumes from it.
+        placeholder: String,
+        /// Why the source is not migrated, one note per line of the `TODO`.
+        notes: Vec<String>,
+    },
+}
+
+impl RouteEndpoint {
+    /// The URI the route consumes from, as it is written in `from(...)`.
+    pub fn uri(&self) -> String {
+        match self {
+            RouteEndpoint::Uri(uri) => uri.clone(),
+            RouteEndpoint::Direct(name) => format!("direct:{name}"),
+            RouteEndpoint::Unmigrated { placeholder, .. } => format!("direct:{placeholder}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
