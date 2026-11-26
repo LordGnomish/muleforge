@@ -127,10 +127,12 @@ MuleForge is a migration **assistant**, not a magic converter, and at this stage
 |---|---|---|
 | Converted | 14 | A Camel endpoint or step with the values of the Mule element, reported `DONE`. The emitted project built and the application started |
 | Converted, to review | 3 | Emitted and working on an assumption that is stated in the route and in the report (`MANUAL_REVIEW`) |
-| Wrong, reported `DONE` | 16 | A defect: the application starts, but the step is not what the Mule element says and fails, or works on something else, when it is reached |
-| Breaks the build or startup | 29 | A defect: reported `DONE`, and the emitted project does not build or the application does not start |
-| Not migrated - fails loudly | 5 | `MANUAL_REVIEW`; the route fails at that step instead of going on with a wrong result |
-| Not migrated - flagged only | 31 | `MANUAL_REVIEW`; a `// TODO` comment, and the route goes on without the step |
+| Wrong, reported `DONE` | 5 | A defect: the application starts, but the step is not what the Mule element says and fails, or works on something else, when it is reached |
+| Breaks the build or startup | 11 | A defect: reported `DONE`, and the emitted project does not build or the application does not start |
+| Not migrated - fails loudly | 25 | `MANUAL_REVIEW`; the route fails at that step instead of going on with a wrong result |
+| Not migrated - flagged only | 40 | `MANUAL_REVIEW`; a `// TODO` comment, and the route goes on without the step (for a source: the route consumes from a `direct:` endpoint that nothing sends to) |
+
+All 98 emitted projects build. 29 of the probes in the two "not migrated" classes are there because the value their mapping rule needs is not an attribute of the element (the statement of a `db:select`, the host and port of a connector config, ...) and is not read yet: such an element is flagged with what is missing, instead of being emitted with a placeholder in its endpoint.
 
 These are counts of probes, not a share of a typical Mule application: the probes weigh every element the same, and no percentage of "automated" migration is derived from them.
 
@@ -138,14 +140,14 @@ These are counts of probes, not a share of a typical Mule application: the probe
 
 | Category | Converted | Emitted, but wrong or breaking (reported `DONE`) | Flagged `MANUAL_REVIEW` (to review, or not migrated) |
 |---|---|---|---|
-| HTTP | `http:listener` with `allowedMethods` | `http:listener` without `allowedMethods` (does not start), `http:request` | |
-| Messaging | Kafka `consumer`, `listener`, `message-listener` with a `topic`, `publish` | JMS `listener` (does not start), `publish`, `consume`; AMQP `listener`, `publish`; VM `listener`, `publish`, `consume` (do not start) | `kafka:message-listener` of Kafka connector 4.x (no `topic` attribute), Anypoint MQ |
-| Database | | `db:select`, `insert`, `update`, `delete`, `stored-procedure` (do not start; the SQL is not carried over) | |
-| File I/O | | `file:listener`, `file:write`, `file:read`; SFTP and FTP `listener` (do not start), `write`, `read` | |
-| Scheduling | | `scheduler` (fixed frequency: the timer fires once; cron: ignored) | |
-| Email | | `email:listener-imap`, `email:listener-pop3`, `email:send` (do not start) | |
-| Salesforce | | `query`, `create`, `update`, `delete`, `upsert`, `subscribe-topic` (do not start) | `subscribe-topic-listener` |
-| SOAP | | `wsc:consume`, `ws:consumer` (do not start) | |
+| HTTP | `http:listener` with `allowedMethods` | | `http:listener` without `allowedMethods` (source not migrated), `http:request` (fails loudly: the rule needs a `url` and a `path`) |
+| Messaging | Kafka `consumer`, `listener`, `message-listener` with a `topic`, `publish` | JMS `listener` (does not start), `publish`, `consume`; VM `listener`, `publish`, `consume` (do not start) | AMQP `listener` (source not migrated), `publish` (fails loudly); `kafka:message-listener` of Kafka connector 4.x (no `topic` attribute), Anypoint MQ |
+| Database | | | `db:select`, `insert`, `update`, `delete`, `stored-procedure` (fail loudly: the SQL is not read) |
+| File I/O | | `file:listener` with `recursive`, `file:write` | `file:listener` without `recursive`, SFTP and FTP `listener` (source not migrated); `file:read`, SFTP and FTP `write`, `read` (fail loudly) |
+| Scheduling | | | `scheduler` (source not migrated: neither a fixed frequency nor a cron expression is read) |
+| Email | | | `email:listener-imap`, `email:listener-pop3` (source not migrated), `email:send` (fails loudly) |
+| Salesforce | | `create`, `update`, `subscribe-topic` (do not start) | `query`, `delete`, `upsert` (fail loudly), `subscribe-topic-listener` |
+| SOAP | | | `wsc:consume`, `ws:consumer` (fail loudly) |
 | Object Store | | `os:store`, `os:retrieve` (do not start) | |
 | Routing | `choice` whose conditions are all converted | | `choice` with other conditions (to review, or failing at the unconverted condition), `scatter-gather` (fails loudly), `first-successful`, `round-robin`, `until-successful`, `async`, `parallel-foreach`, `idempotent-message-validator`, `batch:job` |
 | Iteration | | | `foreach`, `split`: a Camel `split` on a stated assumption (to review), or a step that fails loudly |
@@ -161,7 +163,7 @@ An `ee:transform` is not converted: the route gets a comment, the element is fla
 
 ### The migration report
 
-`MIGRATION_REPORT.md` has a row for every element that was mapped: `Done` or `ManualReview`, the rule id and a rationale. As measured: its `File` and `Flow` columns are empty and its `Line` column is not a line number; the processors inside a scope that is not migrated (`try`, `async`, `batch:job`, ...) have no row; no probe produced a `Skipped` row; and `Done` does not mean that the element works (45 of the 59 probes with a `DONE` class are in one of the two defect classes).
+`MIGRATION_REPORT.md` has a row for every element that was mapped: `Done` or `ManualReview`, the rule id and a rationale. As measured: its `File` and `Flow` columns are empty and its `Line` column is not a line number; the processors inside a scope that is not migrated (`try`, `async`, `batch:job`, ...) have no row; no probe produced a `Skipped` row; and `Done` does not mean that the element works (16 of the 30 probes with a `DONE` class are in one of the two defect classes).
 
 ### Not measured
 

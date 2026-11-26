@@ -4,12 +4,14 @@ What the migrator emits for each Mule 4 element. The tables are **measured,
 not read from the mapping rules**: for every row a probe application with that
 element was migrated with the core binary, and the row says what came out
 ([How this was measured](#how-this-was-measured)). The defects this turned up
-are listed under [Known defects](#known-defects). They are documented here,
-not fixed.
+are listed under [Known defects](#known-defects). They are documented here;
+the one that has been fixed since says so.
 
-[Where a `choice` ends](#where-a-choice-ends), [Expressions](#expressions)
+[Where a `choice` ends](#where-a-choice-ends), [Expressions](#expressions),
+[A rule placeholder without a value](#a-rule-placeholder-without-a-value)
 and the text under [Error Handling](#error-handling) go into the detail of
-`choice`, `foreach`, expressions and on-error scopes; the tables link to them.
+`choice`, `foreach`, expressions, connector rules and on-error scopes; the
+tables link to them.
 
 ## Classes
 
@@ -20,15 +22,15 @@ row in `MIGRATION_REPORT.md` (written there as `Done` / `ManualReview`).
 |---|---|---|
 | **Converted** | `DONE` | A Camel endpoint or step with the values of the Mule element. The emitted project was built, the application started and, for a processor, a request went through the step |
 | **Converted, to review** | `MANUAL_REVIEW` | Emitted and working, on an assumption that is stated in a `TODO` in the route and in the report |
-| **Wrong, reported `DONE`** | `DONE` | A defect. An endpoint or step is emitted and the application starts, but it is not what the Mule element says: a `{placeholder}` of the rule's URI template is left in the URI, a value of the element or of its connector config is missing, or the step does something else. It fails, or works on something else, when it is reached. Neither the report nor the route says so |
+| **Wrong, reported `DONE`** | `DONE` | A defect. An endpoint or step is emitted and the application starts, but it is not what the Mule element says: a value of the element or of its connector config is missing, or the step does something else. It fails, or works on something else, when it is reached. Neither the report nor the route says so |
 | **Breaks the build or startup** | `DONE` | A defect. With this element in the application the emitted project does not build, or the application does not start |
 | **Not migrated - fails loudly** | `MANUAL_REVIEW` | The route fails when it reaches the step, instead of going on with a wrong result |
 | **Not migrated - flagged only** | `MANUAL_REVIEW` | A `// TODO` comment in the route, or the report row alone, and nothing executable: the route goes on without the step. If the element is a scope, the processors in it are not emitted and have no row of their own in the report |
 | **Not measured** | | No probe was written or run for it. Nothing is claimed |
 
 A `DONE` row in a migration report therefore does not mean that the element
-works: of the 98 probes, 59 are in a class whose report status is `DONE`, and
-45 of those are in one of the two defect classes.
+works: of the 98 probes, 30 are in a class whose report status is `DONE`, and
+16 of those are in one of the two defect classes.
 
 ## Sources (Flow Entry Points)
 
@@ -37,20 +39,20 @@ The first child of a `<flow>` is taken as its source.
 | Mule element | What is emitted | Class | Notes |
 |---|---|---|---|
 | `http:listener` with `allowedMethods` | `from("platform-http:/orders?httpMethodRestrict=POST")` | Converted | `POST` was answered with 200, `GET` with 405. Host and port of the `http:listener-config` are not carried over: `quarkus.http.port=8080` whatever the config says |
-| `http:listener` without `allowedMethods` | `from("platform-http:/orders?httpMethodRestrict={allowedMethods}")` | Breaks the build or startup | The generated smoke test does not compile (`.when().{allowedmethods}("/orders")`), so `mvn package` and `mvn test` fail. With the tests left out (`-Dmaven.test.skip=true`) the application does not start: `No enum constant org.apache.camel.component.platform.http.spi.Method.{ALLOWEDMETHODS}` |
+| `http:listener` without `allowedMethods` | a `TODO` and `from("direct:http-listener-probeFlow")` | Not migrated - flagged only | Rule `http-listener` has the option in its URI template (`...?httpMethodRestrict={allowedMethods}`), and the listener has no such attribute: the source is not migrated, see [A rule placeholder without a value](#a-rule-placeholder-without-a-value). Built and started; `POST` and `GET /orders` were answered with 404 |
 | `kafka:consumer`, `kafka:listener` | `from("kafka:orders.raw?brokers=localhost:19092&groupId=orders-group")` | Converted | Topic and `groupId` from the element, `brokers` from the `bootstrapServers` attribute of its config. Started; not run against a broker |
 | `kafka:message-listener` with a `topic` attribute | the same endpoint | Converted | Built-in mapping, no rule |
 | `kafka:message-listener` without `topic` | `from("direct:kafka-message-listener")` | Not migrated - flagged only | Kafka connector 4.x keeps topic patterns, group ID and bootstrap servers on the `consumer-config` connection, which is not read. The steps of the flow are emitted behind a `direct:` endpoint that nothing sends to |
 | `jms:listener` | `from("jms:queue:orders.in")` | Breaks the build or startup | `Failed to start route: probeFlow because: connectionFactory must be specified`. The emitted `pom.xml` has `camel-quarkus-jms` and no JMS client; `application.properties` gets `quarkus.artemis.*` keys, and no Artemis extension is in the `pom.xml`. A topic listener (`<jms:topic-consumer/>`) is emitted as `jms:queue:` as well |
-| `amqp:listener` | `from("amqp:queue:{destination}")` | Wrong, reported `DONE` | The rule reads an attribute `destination`; the probe has the connector's `queueName`, which is not read. The application started (and logged that it cannot connect to `amqp://localhost:5672`); not run against a broker |
+| `amqp:listener` | a `TODO` and `from("direct:amqp-listener-probeFlow")` | Not migrated - flagged only | Rule `amqp-listener` reads an attribute `destination`; the probe has the connector's `queueName`, which is not read. Built and started |
 | `file:listener` with `recursive` | `from("file:in?recursive=false")` | Wrong, reported `DONE` | `directory` is copied as it is. The `workingDir` of the `file:config` is not read and is nowhere in the emitted project: the application created and polled `in` under the working directory of the JVM |
-| `file:listener` without `recursive` | `from("file:in?recursive={recursive}")` | Breaks the build or startup | `Cannot convert the String value: {recursive} to type: boolean` |
-| `sftp:listener` | `from("sftp:{host}:{port}/inbox")` | Breaks the build or startup | Host and port are on the `sftp:connection` of the config, which the rule does not read: `host must be specified and not empty` |
-| `ftp:listener` | `from("ftp://{host}:{port}/inbox")` | Breaks the build or startup | As `sftp:listener` |
-| `scheduler` with `<fixed-frequency frequency="5000"/>` | `from("timer:scheduler?period={frequency}")` | Wrong, reported `DONE` | `frequency` is an attribute of `<fixed-frequency>` in the `<scheduling-strategy>`, not of `<scheduler>`. The application started; the timer fired once and not again in the next 21 s |
-| `scheduler` with `<cron expression="..."/>` | the same `timer:` endpoint | Wrong, reported `DONE` | The cron expression is not read; no `quartz:` endpoint is emitted. The row in the report is that of rule `scheduler-fixed`; rule `scheduler-cron`, written for an element `scheduling-strategy:cron-scheduler`, did not match |
-| `email:listener-imap` | `from("imap://{host}:{port}")` | Breaks the build or startup | `Failed to resolve endpoint: imap://%7Bhost%7D:%7Bport%7D due to: host must be specified and not empty` |
-| `email:listener-pop3` | `from("pop3://{host}:{port}")` | Breaks the build or startup | As `email:listener-imap` |
+| `file:listener` without `recursive` | a `TODO` and `from("direct:file-listener-probeFlow")` | Not migrated - flagged only | Rule `file-listener` has `recursive={recursive}` in its URI template, and the listener has no such attribute. Built and started |
+| `sftp:listener` | a `TODO` and `from("direct:sftp-listener-probeFlow")` | Not migrated - flagged only | Host and port are on the `sftp:connection` of the config, which the rule does not read; the `TODO` quotes the endpoint as `sftp:<host>:<port>/inbox`. Built and started |
+| `ftp:listener` | a `TODO` and `from("direct:ftp-listener-probeFlow")` | Not migrated - flagged only | As `sftp:listener` |
+| `scheduler` with `<fixed-frequency frequency="5000"/>` | a `TODO` and `from("direct:scheduler-probeFlow")` | Not migrated - flagged only | `frequency` is an attribute of `<fixed-frequency>` in the `<scheduling-strategy>`, not of `<scheduler>`: rule `scheduler-fixed` has no value for `period={frequency}`, and no timer is emitted. Built and started |
+| `scheduler` with `<cron expression="..."/>` | the same `TODO` and `direct:` endpoint | Not migrated - flagged only | The cron expression is not read; no `quartz:` endpoint is emitted. The row in the report is that of rule `scheduler-fixed`; rule `scheduler-cron`, written for an element `scheduling-strategy:cron-scheduler`, did not match |
+| `email:listener-imap` | a `TODO` and `from("direct:email-listener-imap-probeFlow")` | Not migrated - flagged only | Host and port are on the connection of the config, which the rule does not read. Built and started |
+| `email:listener-pop3` | a `TODO` and `from("direct:email-listener-pop3-probeFlow")` | Not migrated - flagged only | As `email:listener-imap` |
 | `vm:listener` | `from("seda:work")` | Breaks the build or startup | `No endpoint could be found for: seda://work`: the rule adds no dependency and `camel-quarkus-seda` is not in the emitted `pom.xml` |
 | `salesforce:subscribe-topic` | `from("salesforce:subscribe?topicName=AccountUpdates")` | Breaks the build or startup | `Failed to resolve endpoint ... topicName must be supplied for subscribe/pubsub operations` |
 | `salesforce:subscribe-topic-listener` | `from("direct:salesforce-subscribe-topic-listener")` | Not migrated - flagged only | `Unknown source`, no rule |
@@ -77,33 +79,124 @@ The first child of a `<flow>` is taken as its source.
 ## Connector operations
 
 Each of these has a rule with a `camel_uri` template. Such a rule is the whole
-mapping: the placeholders that are attributes of the element are filled in,
-the others stay in the URI as they are, and the element is reported `DONE`
-either way.
+mapping: the placeholders of the template are filled with the attributes of
+the element, and the element is reported `DONE`. If the element has no value
+for one of them it is not migrated: the step throws and the element is
+`MANUAL_REVIEW`, see
+[A rule placeholder without a value](#a-rule-placeholder-without-a-value).
+"A step that throws" below is that step, with its `TODO`; each of these
+probes was built and started, and the request was answered with 500 after
+the `logger` in front of the step had written its line.
 
 | Mule element | What is emitted | Class | Notes |
 |---|---|---|---|
-| `http:request` | `.to("http:{url}/api/orders?httpMethod=POST")`; with a `url` attribute `.to("http:http://localhost:18099/api/orders{path}?httpMethod=GET")` | Wrong, reported `DONE` | Host and port of the `http:request-config` are not read. In a flow with an `http:listener` the step failed in both probes: `Invalid url: /probe/probe. If you are forwarding/bridging http endpoints, then enable the bridgeEndpoint option on the endpoint` |
-| `db:select`, `db:insert`, `db:update`, `db:delete` | `.to("sql:{query}?dataSource=default")` | Breaks the build or startup | The statement is in the `<db:sql>` child, not in an attribute `query`: it is not in the route, and `<db:input-parameters>` are not read. The application does not start: `No type converter available to convert from type: java.lang.String to the required type: javax.sql.DataSource`. No JDBC driver and no data source are in the emitted `pom.xml` and `application.properties` |
-| `db:stored-procedure` | `.to("sql-stored:{procedureName}?dataSource=default")` | Breaks the build or startup | As `db:select` |
+| `http:request` | a step that throws: `http:request not migrated: missing attribute url (rule http-request)`; with a `url` attribute and no `path`, `... missing attribute path ...` | Not migrated - fails loudly | Rule `http-request` names `http:{url}{path}?httpMethod={method}`, and neither probe has both a `url` and a `path`. Host and port of the `http:request-config` are not read |
+| `db:select`, `db:insert`, `db:update`, `db:delete` | a step that throws: `db:select not migrated: missing attribute query (rule db-select)` | Not migrated - fails loudly | The statement is in the `<db:sql>` child, not in an attribute `query`; `<db:input-parameters>` are not read. No JDBC driver and no data source are in the emitted `pom.xml` and `application.properties` |
+| `db:stored-procedure` | a step that throws: `db:stored-procedure not migrated: missing attribute procedureName (rule db-stored-procedure)` | Not migrated - fails loudly | As `db:select` |
 | `kafka:publish` | `.to("kafka:orders.out?brokers=localhost:19092")` | Converted | Topic from the element, `brokers` from its config. Started; not run against a broker (without one the request did not return within 40 s) |
 | `jms:publish` | `.to("jms:queue:orders.out")` | Wrong, reported `DONE` | The application starts; the step fails with `Failed to create Producer for endpoint: jms://queue:orders.out. Reason: ... connectionFactory must be specified` (no JMS client in the `pom.xml`, see `jms:listener`) |
 | `jms:consume` | `.to("jms:queue:orders.replies?receiveTimeout=10000")` | Wrong, reported `DONE` | A producer step like that of `jms:publish`, and it fails in the same way |
-| `amqp:publish` | `.to("amqp:queue:{destination}")` | Wrong, reported `DONE` | `exchangeName` is not read. The request failed on the connection (`Connection refused: localhost/127.0.0.1:5672`); not run against a broker |
+| `amqp:publish` | a step that throws: `amqp:publish not migrated: missing attribute destination (rule amqp-publish)` | Not migrated - fails loudly | The rule reads an attribute `destination`; the probe has `exchangeName`, which is not read |
 | `file:write` | `.to("file:out/result.txt")` | Wrong, reported `DONE` | Camel takes the path as a directory: the body was written to `out/result.txt/<message id>` under the working directory of the JVM. `workingDir` of the `file:config` is not read |
-| `file:read` | `.to("file:{directory}")` | Wrong, reported `DONE` | A producer step: the application created a directory named `{directory}` and tried to write the message into it (`Cannot write null body to file: {directory}/<message id>`). Nothing is read; `path` is not used |
-| `sftp:write`, `ftp:write` | `.to("sftp:{host}:{port}/outbox/result.txt")`, `.to("ftp://{host}:{port}/outbox/result.txt")` | Wrong, reported `DONE` | The application starts; the step fails with `Failed to create Producer for endpoint: sftp://%7Bhost%7D:%7Bport%7D/outbox/result.txt. Reason: ... host must be specified and not empty` |
-| `sftp:read`, `ftp:read` | `.to("sftp:{host}:{port}/{directory}")`, `.to("ftp://{host}:{port}/{directory}")` | Wrong, reported `DONE` | A producer step, and it fails like the write |
-| `email:send` | `.to("smtp://{host}:{port}")` | Breaks the build or startup | `host must be specified and not empty`. Recipients, subject and body of the element are not read |
-| `salesforce:query` | `.to("salesforce:query?sObjectQuery={query}")` | Breaks the build or startup | `Failed to start component salesforce because of loginUrl must be specified`: nothing of the `salesforce:sfdc-config` is carried over. The SOQL text is in a child element and is not read. Not measured with a configured login |
-| `salesforce:create`, `salesforce:update` | `.to("salesforce:createSObject?sObjectName=Account")`, `.to("salesforce:updateSObject?sObjectName=Account")` | Breaks the build or startup | As `salesforce:query`; `type` is carried over |
-| `salesforce:delete`, `salesforce:upsert` | `.to("salesforce:deleteSObject?sObjectName={type}")`, `.to("salesforce:upsertSObject?sObjectName={type}&sObjectIdName=Ext_Id__c")` | Breaks the build or startup | As `salesforce:query`. The probes have no `type` attribute (`upsert` has `objectType`) |
-| `wsc:consume` | `.to("cxf://{address}?serviceClass={serviceClass}&wsdlURL={wsdlLocation}")` | Breaks the build or startup | Address and WSDL are on the `wsc:connection` of the config, which is not read: `No type converter available to convert from type: java.lang.String to the required type: java.lang.Class` |
-| `ws:consumer` | `.to("cxf://{address}?wsdlURL={wsdlLocation}")` | Breaks the build or startup | `serviceClass must be specified` |
+| `file:read` | a step that throws: `file:read not migrated: missing attribute directory (rule file-read)` | Not migrated - fails loudly | Rule `file-read` reads an attribute `directory`; the probe has `path`, which is not used. With a `directory` the rule gives `.to("file:...")`, a producer step (read in the mapper, not probed) |
+| `sftp:write`, `ftp:write` | a step that throws: `sftp:write not migrated: missing attributes host, port (rule sftp-write)` | Not migrated - fails loudly | Host and port are on the connection of the config, which the rule does not read; the `TODO` quotes the endpoint as `sftp:<host>:<port>/outbox/result.txt` |
+| `sftp:read`, `ftp:read` | a step that throws: `sftp:read not migrated: missing attributes host, port, directory (rule sftp-read)` | Not migrated - fails loudly | As the write; the probes have a `path`, the rules read `directory` |
+| `email:send` | a step that throws: `email:send not migrated: missing attributes host, port (rule email-send)` | Not migrated - fails loudly | Host and port are on the connection of the config. Recipients, subject and body of the element are not read |
+| `salesforce:query` | a step that throws: `salesforce:query not migrated: missing attribute query (rule sfdc-query)` | Not migrated - fails loudly | The SOQL text is in a child element and is not read. With the Salesforce extension in the `pom.xml` and no `salesforce:` endpoint in a route the application starts |
+| `salesforce:create`, `salesforce:update` | `.to("salesforce:createSObject?sObjectName=Account")`, `.to("salesforce:updateSObject?sObjectName=Account")` | Breaks the build or startup | `Failed to start component salesforce because of loginUrl must be specified`: nothing of the `salesforce:sfdc-config` is carried over; `type` is. Not measured with a configured login |
+| `salesforce:delete`, `salesforce:upsert` | a step that throws: `salesforce:delete not migrated: missing attribute type (rule sfdc-delete)` | Not migrated - fails loudly | The probes have no `type` attribute (`upsert` has `objectType`) |
+| `wsc:consume` | a step that throws: `wsc:consume not migrated: missing attributes address, serviceClass, wsdlLocation (rule wsc-consume)` | Not migrated - fails loudly | Address and WSDL are on the `wsc:connection` of the config, which is not read |
+| `ws:consumer` | a step that throws: `ws:consumer not migrated: missing attributes address, wsdlLocation (rule ws-consumer)` | Not migrated - fails loudly | |
 | `os:store`, `os:retrieve` | `.to("infinispan:objectStore?operation=PUT")`, `.to("infinispan:objectStore?operation=GET")` | Breaks the build or startup | `No configuration found for the default Infinispan client`. Key and value of the element are not read |
 | `vm:publish`, `vm:consume` | `.to("seda:work")`, `.to("seda:work?timeout=10000")` | Breaks the build or startup | `No endpoint could be found for: seda://work` (no `camel-quarkus-seda`, see `vm:listener`) |
 | `anypoint-mq:publish` | `// TODO: manual mapping for anypoint-mq:publish` | Not migrated - flagged only | No rule is loaded for it (see `anypoint-mq:subscriber`) |
 | `sap:sync-rfc` | `// TODO: manual mapping for sap:sync-rfc` | Not migrated - flagged only | There is no rule for an SAP element in `mappings/` |
+
+### A rule placeholder without a value
+
+The `camel_uri` of a rule is a template: `{attr}` stands for the value of an
+attribute of the Mule element, `{config.attr}` for one of the element its
+`config-ref` names. `{{key}}` (a Camel property placeholder) and `${...}`
+(Simple) are text of the template and go into the URI as they are. The value
+of an attribute is written as it is, braces included
+(`path="/orders/{id}"` gives `platform-http:/orders/{id}`), and is not
+expanded again.
+
+Every placeholder of a `camel_uri` is needed, those in its query string
+included. An element that has no value for one of them (no such attribute, or
+a blank one) is **not migrated**: no endpoint is emitted with a placeholder in
+it, no value is made up, and the element is `MANUAL_REVIEW`. The row in the
+report names the rule, its template and the missing attributes:
+
+> `sftp:write` is not migrated: rule sftp-write names the endpoint
+> `sftp:{host}:{port}/{path}`, and the element has no attributes host, port.
+> Nothing is put in the place of a missing value: Mule may read it from a
+> child element or from the connection of the config, which a rule does not
+> read, or have a default for it. The route fails at this step until it is
+> replaced
+
+Where the value is, is not looked for: the statement of a `db:select` is in
+its `<db:sql>` child, host and port of an SFTP, FTP or mail operation are on
+the connection of its config, the frequency of a `scheduler` is in its
+`<scheduling-strategy>`, and an `http:listener` need not have
+`allowedMethods` at all. None of these is read.
+
+* **A processor** becomes a step that throws, like a `scatter-gather`:
+
+  ```java
+  // TODO: review this sftp:write, it is not migrated
+  // - rule sftp-write names the endpoint sftp:<host>:<port>/outbox/result.txt for it, and the element has no attributes host, port: nothing is put in the place of a missing value (Mule may read it from a child element or from the connection of the config, which a rule does not read, or have a default for it)
+  // - the route fails at this step instead of sending to an endpoint that is not the one of the Mule element; replace it with the converted step
+  .throwException(new UnsupportedOperationException("sftp:write not migrated: missing attributes host, port (rule sftp-write)"))
+  ```
+
+  The `TODO` quotes the endpoint with the values that are there and
+  `<attr>` for each missing one; no `{placeholder}` is written into the
+  generated code, not even in a comment. What is said about the exception
+  under [What an unconverted expression is emitted as](#what-an-unconverted-expression-is-emitted-as)
+  holds here too (an `onException` clause for every exception handles it).
+
+* **A source** has no step to fail at, and an endpoint with a value missing
+  does not start. The route consumes from a `direct:` endpoint that nothing
+  sends to, as the route of a source without mapping does, and says so in
+  front of `from(...)`:
+
+  ```java
+  // TODO: review the source of this flow, it is not migrated (Mule: sftp:listener)
+  // - rule sftp-listener names the endpoint sftp:<host>:<port>/inbox for it, and the element has no attributes host, port: nothing is put in the place of a missing value (...)
+  // - the route consumes from direct:sftp-listener-probeFlow instead, which nothing sends to: its steps do not run until from(...) is replaced with the endpoint of the source
+  from("direct:sftp-listener-probeFlow")
+      .routeId("probeFlow")
+      .log(LoggingLevel.INFO, "after")
+  ```
+
+  The endpoint is `direct:<element>-<flow>` (characters other than letters,
+  digits, `.`, `_` and `-` become `-`), with a number behind it if that
+  name is taken by a flow or by another route: an application with two
+  routes that consume from the same `direct:` endpoint does not start
+  (run, see [Known defects](#known-defects), item 21). Run with the
+  per-flow names: an application with two `http:listener` flows without
+  `allowedMethods`, an `sftp:listener` flow, a `scheduler` flow and a
+  listener with `allowedMethods="GET"` was built and started; the last one
+  answered with 200, the paths of the two others with 404. The steps of
+  the flow are
+  emitted behind it and do not run. The generated smoke test of the route
+  is the one of a route without HTTP source; `docs/flows/<flow>.md` says
+  "**Source not migrated:** `sftp:listener` - ..." and the route diagram
+  labels the source `NOT MIGRATED: sftp:listener`.
+
+The options a rule lists under `camel_params` (the Kafka `brokers` and
+`groupId`) are the ones an endpoint works without: an option whose value is
+missing is left out of the URI, and the element stays `DONE`.
+
+What used to be emitted: the template with the placeholder still in it,
+reported `DONE` - `.to("sql:{query}?dataSource=default")`,
+`from("sftp:{host}:{port}/inbox")`,
+`from("timer:scheduler?period={frequency}")`,
+`from("platform-http:/orders?httpMethodRestrict={allowedMethods}")`. Of the 29
+probes that were emitted like that, 18 did not build or did not start, and in
+the other 11 the step failed, or worked on something else, when it was
+reached (measured on 2026-11-25, see [How this was measured](#how-this-was-measured)).
 
 ## Routing / EIP
 
@@ -737,13 +830,13 @@ them.
 | Output | Written | Notes |
 |---|---|---|
 | Java RouteBuilder classes | yes | `src/main/java/generated/routes/<Flow>Route.java`, one per flow and per sub-flow that is not inlined |
-| `pom.xml` | yes | Quarkus 3.33.1 with the Camel Quarkus extensions of the rules and built-in mappings that matched. `mvn package -DskipTests` passed for 97 of the 98 probes. A JMS client, `camel-quarkus-seda`, `camel-quarkus-bean`, a JDBC driver and a data source are not added when the routes need them (see [Known defects](#known-defects)) |
+| `pom.xml` | yes | Quarkus 3.33.1 with the Camel Quarkus extensions of the rules and built-in mappings that matched. `mvn package -DskipTests` passed for all 98 probes. A JMS client, `camel-quarkus-seda`, `camel-quarkus-bean`, a JDBC driver and a data source are not added when the routes need them (see [Known defects](#known-defects)) |
 | `application.properties`, `application.prod.properties` | yes | HTTP port (always 8080), application name, health, Camel context name. A JMS probe additionally got `quarkus.artemis.*` keys; the database and Kafka probes got nothing about a data source or brokers |
 | `Dockerfile` | yes | Stages `build`, `jvm`, `native-build` and `native`. Not built |
 | Kubernetes manifests | yes | `k8s/base` (deployment, service, configmap, kustomization), `k8s/overlays/dev` and `prod` (with an HPA). Not applied |
 | Kong Gateway config | yes, with `emit_kong_config` | `kong/kong.yaml`. Not validated |
 | GitHub Actions workflows | yes | `.github/workflows/ci.yaml` and `release.yaml`. Not run |
-| Smoke tests (JUnit 5) | yes | `src/test/java/generated/<Flow>RouteTest.java`. Compiled in 97 probes, not run. For an `http:listener` without `allowedMethods` the test does not compile |
+| Smoke tests (JUnit 5) | yes | `src/test/java/generated/<Flow>RouteTest.java`. Compiled in all 98 probes, not run |
 | Migration report | yes | `MIGRATION_REPORT.md`: one row per element that was mapped, with status, rule id and rationale. Its `File` and `Flow` columns are empty and its `Line` column is not a line number (543 for an element on line 10 of a file of 26 lines). The processors in a scope that is not migrated have no row. No row had the status `Skipped` in any probe |
 | Project documentation | yes | `README.md`, `CHECKLIST.md`, `docs/architecture.md`, `docs/contributing.md`, `docs/development/local-setup.md` and `testing.md`, `docs/flows/<flow>.md`, `docs/migration/overview.md`, `docs/operations/runbook.md`, `docs/route-diagram.md` |
 | `Makefile`, `docker-compose.yml`, `.env.example` | yes | |
@@ -773,9 +866,16 @@ has no rule. Adding a row means measuring: migrate an application with the
 element and write down what is emitted.
 
 A rule with a `camel_uri` is the whole mapping of its element: the URI
-template with the attributes of the element filled in, reported `DONE`. A
-rule without one only puts its id on the report row of the built-in mapping,
-if there is one, and adds its dependencies.
+template with the attributes of the element filled in, reported `DONE`. An
+element that has no value for a placeholder of the template is not migrated
+and `MANUAL_REVIEW`: a processor is a step that throws, a source a `direct:`
+endpoint that nothing sends to (see
+[A rule placeholder without a value](#a-rule-placeholder-without-a-value)).
+The rule's dependencies are added to the `pom.xml` either way. A test
+(`no_rule_leaves_a_placeholder_in_the_emitted_java_or_reports_it_as_done`)
+migrates an element without attributes for every rule in this table. A
+rule without `camel_uri` only puts its id on the report row of the built-in
+mapping, if there is one, and adds its dependencies.
 
 The two files in `mappings/connectors/` (`http.yaml`, `kafka.yaml`, with rules
 such as `mule.http.listener` and `mule.anypoint-mq.subscriber`) are not
@@ -786,8 +886,8 @@ no rule.
 
 | Rule id | File | Mule element | `camel_uri` | Class of the probe(s) |
 |---|---|---|---|---|
-| `amqp-listener` | `amqp.yaml` | `amqp:listener` | `amqp:queue:{destination}` | Wrong, reported `DONE` |
-| `amqp-publish` | `amqp.yaml` | `amqp:publish` | `amqp:queue:{destination}` | Wrong, reported `DONE` |
+| `amqp-listener` | `amqp.yaml` | `amqp:listener` | `amqp:queue:{destination}` | Not migrated - flagged only |
+| `amqp-publish` | `amqp.yaml` | `amqp:publish` | `amqp:queue:{destination}` | Not migrated - fails loudly |
 | `batch-job` | `batch.yaml` | `batch:job` | none | Not migrated - flagged only |
 | `batch-step` | `batch.yaml` | `batch:step` | none | Never reached: a `batch:job` is flagged only and what is in it is not mapped |
 | `batch-aggregator` | `batch.yaml` | `batch:aggregator` | none | Never reached, as `batch-step` |
@@ -796,25 +896,25 @@ no rule.
 | `scatter-gather` | `choice.yaml` | `scatter-gather` | none | Not migrated - fails loudly |
 | `first-successful` | `choice.yaml` | `first-successful` | none | Not migrated - flagged only |
 | `round-robin` | `choice.yaml` | `round-robin` | none | Not migrated - flagged only |
-| `db-select` | `db.yaml` | `db:select` | `sql:{query}?dataSource=default` | Breaks the build or startup |
-| `db-insert` | `db.yaml` | `db:insert` | `sql:{query}?dataSource=default` | Breaks the build or startup |
-| `db-update` | `db.yaml` | `db:update` | `sql:{query}?dataSource=default` | Breaks the build or startup |
-| `db-delete` | `db.yaml` | `db:delete` | `sql:{query}?dataSource=default` | Breaks the build or startup |
-| `db-stored-procedure` | `db.yaml` | `db:stored-procedure` | `sql-stored:{procedureName}?dataSource=default` | Breaks the build or startup |
-| `email-listener` | `email.yaml` | `email:listener-imap` | `imap://{host}:{port}` | Breaks the build or startup |
-| `email-send` | `email.yaml` | `email:send` | `smtp://{host}:{port}` | Breaks the build or startup |
-| `email-listener-pop3` | `email.yaml` | `email:listener-pop3` | `pop3://{host}:{port}` | Breaks the build or startup |
+| `db-select` | `db.yaml` | `db:select` | `sql:{query}?dataSource=default` | Not migrated - fails loudly |
+| `db-insert` | `db.yaml` | `db:insert` | `sql:{query}?dataSource=default` | Not migrated - fails loudly |
+| `db-update` | `db.yaml` | `db:update` | `sql:{query}?dataSource=default` | Not migrated - fails loudly |
+| `db-delete` | `db.yaml` | `db:delete` | `sql:{query}?dataSource=default` | Not migrated - fails loudly |
+| `db-stored-procedure` | `db.yaml` | `db:stored-procedure` | `sql-stored:{procedureName}?dataSource=default` | Not migrated - fails loudly |
+| `email-listener` | `email.yaml` | `email:listener-imap` | `imap://{host}:{port}` | Not migrated - flagged only |
+| `email-send` | `email.yaml` | `email:send` | `smtp://{host}:{port}` | Not migrated - fails loudly |
+| `email-listener-pop3` | `email.yaml` | `email:listener-pop3` | `pop3://{host}:{port}` | Not migrated - flagged only |
 | `on-error-propagate` | `error-handler.yaml` | `on-error-propagate` | none | By `type`, see [Error Handling](#error-handling). The id does not appear in the report |
 | `on-error-continue` | `error-handler.yaml` | `on-error-continue` | none | By `type`, see [Error Handling](#error-handling). The id does not appear in the report |
 | `try-scope` | `error-handler.yaml` | `try` | none | Not migrated - flagged only |
-| `file-listener` | `file.yaml` | `file:listener` | `file:{directory}?recursive={recursive}` | Wrong, reported `DONE`; Breaks the build or startup |
-| `file-read` | `file.yaml` | `file:read` | `file:{directory}` | Wrong, reported `DONE` |
+| `file-listener` | `file.yaml` | `file:listener` | `file:{directory}?recursive={recursive}` | Wrong, reported `DONE`; Not migrated - flagged only |
+| `file-read` | `file.yaml` | `file:read` | `file:{directory}` | Not migrated - fails loudly |
 | `file-write` | `file.yaml` | `file:write` | `file:{path}` | Wrong, reported `DONE` |
-| `ftp-listener` | `ftp.yaml` | `ftp:listener` | `ftp://{host}:{port}/{directory}` | Breaks the build or startup |
-| `ftp-read` | `ftp.yaml` | `ftp:read` | `ftp://{host}:{port}/{directory}` | Wrong, reported `DONE` |
-| `ftp-write` | `ftp.yaml` | `ftp:write` | `ftp://{host}:{port}/{path}` | Wrong, reported `DONE` |
-| `http-listener` | `http.yaml` | `http:listener` | `platform-http:{path}?httpMethodRestrict={allowedMethods}` | Converted; Breaks the build or startup |
-| `http-request` | `http.yaml` | `http:request` | `http:{url}{path}?httpMethod={method}` | Wrong, reported `DONE` |
+| `ftp-listener` | `ftp.yaml` | `ftp:listener` | `ftp://{host}:{port}/{directory}` | Not migrated - flagged only |
+| `ftp-read` | `ftp.yaml` | `ftp:read` | `ftp://{host}:{port}/{directory}` | Not migrated - fails loudly |
+| `ftp-write` | `ftp.yaml` | `ftp:write` | `ftp://{host}:{port}/{path}` | Not migrated - fails loudly |
+| `http-listener` | `http.yaml` | `http:listener` | `platform-http:{path}?httpMethodRestrict={allowedMethods}` | Converted; Not migrated - flagged only |
+| `http-request` | `http.yaml` | `http:request` | `http:{url}{path}?httpMethod={method}` | Not migrated - fails loudly |
 | `jms-listener` | `jms.yaml` | `jms:listener` | `jms:queue:{destination}` | Breaks the build or startup |
 | `jms-publish` | `jms.yaml` | `jms:publish` | `jms:queue:{destination}` | Wrong, reported `DONE` |
 | `jms-consume` | `jms.yaml` | `jms:consume` | `jms:queue:{destination}?receiveTimeout=10000` | Wrong, reported `DONE` |
@@ -826,19 +926,19 @@ no rule.
 | `vm-publish` | `objectstore.yaml` | `vm:publish` | `seda:{queueName}` | Breaks the build or startup |
 | `vm-listener` | `objectstore.yaml` | `vm:listener` | `seda:{queueName}` | Breaks the build or startup |
 | `vm-consume` | `objectstore.yaml` | `vm:consume` | `seda:{queueName}?timeout=10000` | Breaks the build or startup |
-| `sfdc-query` | `salesforce.yaml` | `salesforce:query` | `salesforce:query?sObjectQuery={query}` | Breaks the build or startup |
+| `sfdc-query` | `salesforce.yaml` | `salesforce:query` | `salesforce:query?sObjectQuery={query}` | Not migrated - fails loudly |
 | `sfdc-create` | `salesforce.yaml` | `salesforce:create` | `salesforce:createSObject?sObjectName={type}` | Breaks the build or startup |
 | `sfdc-update` | `salesforce.yaml` | `salesforce:update` | `salesforce:updateSObject?sObjectName={type}` | Breaks the build or startup |
-| `sfdc-delete` | `salesforce.yaml` | `salesforce:delete` | `salesforce:deleteSObject?sObjectName={type}` | Breaks the build or startup |
-| `sfdc-upsert` | `salesforce.yaml` | `salesforce:upsert` | `salesforce:upsertSObject?sObjectName={type}&sObjectIdName={externalIdFieldName}` | Breaks the build or startup |
+| `sfdc-delete` | `salesforce.yaml` | `salesforce:delete` | `salesforce:deleteSObject?sObjectName={type}` | Not migrated - fails loudly |
+| `sfdc-upsert` | `salesforce.yaml` | `salesforce:upsert` | `salesforce:upsertSObject?sObjectName={type}&sObjectIdName={externalIdFieldName}` | Not migrated - fails loudly |
 | `sfdc-subscribe-topic` | `salesforce.yaml` | `salesforce:subscribe-topic` | `salesforce:subscribe?topicName={topic}` | Breaks the build or startup |
-| `scheduler-fixed` | `scheduler.yaml` | `scheduler` | `timer:scheduler?period={frequency}` | Wrong, reported `DONE` |
-| `scheduler-cron` | `scheduler.yaml` | `scheduling-strategy:cron-scheduler` | `quartz:scheduler?cron={expression}` | Matches nothing. A scheduler with a `cron` strategy is Wrong, reported `DONE`, under `scheduler-fixed` |
-| `sftp-listener` | `sftp.yaml` | `sftp:listener` | `sftp:{host}:{port}/{directory}` | Breaks the build or startup |
-| `sftp-read` | `sftp.yaml` | `sftp:read` | `sftp:{host}:{port}/{directory}` | Wrong, reported `DONE` |
-| `sftp-write` | `sftp.yaml` | `sftp:write` | `sftp:{host}:{port}/{path}` | Wrong, reported `DONE` |
-| `wsc-consume` | `soap.yaml` | `wsc:consume` | `cxf://{address}?serviceClass={serviceClass}&wsdlURL={wsdlLocation}` | Breaks the build or startup |
-| `ws-consumer` | `soap.yaml` | `ws:consumer` | `cxf://{address}?wsdlURL={wsdlLocation}` | Breaks the build or startup |
+| `scheduler-fixed` | `scheduler.yaml` | `scheduler` | `timer:scheduler?period={frequency}` | Not migrated - flagged only |
+| `scheduler-cron` | `scheduler.yaml` | `scheduling-strategy:cron-scheduler` | `quartz:scheduler?cron={expression}` | Matches nothing. A scheduler with a `cron` strategy is Not migrated - flagged only, under `scheduler-fixed` |
+| `sftp-listener` | `sftp.yaml` | `sftp:listener` | `sftp:{host}:{port}/{directory}` | Not migrated - flagged only |
+| `sftp-read` | `sftp.yaml` | `sftp:read` | `sftp:{host}:{port}/{directory}` | Not migrated - fails loudly |
+| `sftp-write` | `sftp.yaml` | `sftp:write` | `sftp:{host}:{port}/{path}` | Not migrated - fails loudly |
+| `wsc-consume` | `soap.yaml` | `wsc:consume` | `cxf://{address}?serviceClass={serviceClass}&wsdlURL={wsdlLocation}` | Not migrated - fails loudly |
+| `ws-consumer` | `soap.yaml` | `ws:consumer` | `cxf://{address}?wsdlURL={wsdlLocation}` | Not migrated - fails loudly |
 | `set-payload` | `transform.yaml` | `set-payload` | none | Converted; Not migrated - fails loudly |
 | `set-variable` | `transform.yaml` | `set-variable` | none | Converted |
 | `remove-variable` | `transform.yaml` | `remove-variable` | none | Not migrated - flagged only |
@@ -887,27 +987,59 @@ another place in the flow) may come out differently. Not done: no Mule
 runtime was used, no generated test was run, no connector was run against
 its broker, database or server, no LLM provider was configured.
 
-Probes per class: Converted 14, Converted, to review 3, Wrong, reported `DONE`
-16, Breaks the build or startup 29, Not migrated - fails loudly 5,
-Not migrated - flagged only 31.
+Probes per class on 2026-11-25: Converted 14, Converted, to review 3, Wrong,
+reported `DONE` 16, Breaks the build or startup 29, Not migrated - fails
+loudly 5, Not migrated - flagged only 31.
+
+### Measured again on 2026-11-26
+
+After the change described under
+[A rule placeholder without a value](#a-rule-placeholder-without-a-value)
+(branch `autopilot/2026-11-26-unfilled-uri-placeholders` at `4a60285`), with
+the same 98 probes and the same steps:
+
+* The probes were migrated with the binary built from `main` at `806b761`
+  and with the one built from the branch. The projects `main` emits are, file
+  for file, those of 2026-11-25 (the path of the input, which
+  `MIGRATION_REPORT.md` and `docs/migration/overview.md` quote, aside).
+* With the change, 69 emitted projects are the same as before, every file
+  of them; their rows are those of 2026-11-25 and were not measured again.
+* The other 29 are the probes whose element has no value for a placeholder
+  of its rule. They were built, started and called again (steps 3 to 5).
+  All 29 built, with their generated tests compiled, and started. The 20
+  with the element as a processor answered `GET /probe` with 500: the
+  `logger` in front of the element wrote its line, the one behind it did
+  not, and the log has the `UnsupportedOperationException` of the step. The
+  9 with the element as the source started and ran nothing; the
+  `http:listener` probe answered `POST` and `GET /orders` with 404.
+
+Of the 29, 18 were in "Breaks the build or startup" and 11 in "Wrong,
+reported `DONE`"; 20 are now "Not migrated - fails loudly" and 9
+"Not migrated - flagged only". With the 69 others: 98 built, 87 started, 11
+did not.
+
+Probes per class now: Converted 14, Converted, to review 3, Wrong, reported
+`DONE` 5, Breaks the build or startup 11, Not migrated - fails loudly 25,
+Not migrated - flagged only 40.
 
 ## Known defects
 
-Found by the measurement above. Each is what was observed, in one line; none
-is fixed.
+Found by the measurement of 2026-11-25. Each is what was observed, in one
+line. Item 1 has been fixed since; the others have not, and an item says so
+where that fix changed what its probes show.
 
-1. A rule with a `camel_uri` leaves every placeholder that is not an attribute of the element in the URI and reports `DONE`: `sql:{query}`, `sql-stored:{procedureName}`, `http:{url}...`, `amqp:queue:{destination}`, `sftp:{host}:{port}/...`, `ftp://{host}:{port}/...`, `imap://{host}:{port}`, `pop3://{host}:{port}`, `smtp://{host}:{port}`, `file:{directory}`, `timer:scheduler?period={frequency}`, `cxf://{address}?...`, `salesforce:query?sObjectQuery={query}`, `...?sObjectName={type}`, `file:in?recursive={recursive}`, `platform-http:/orders?httpMethodRestrict={allowedMethods}`.
-2. `http:listener` without `allowedMethods`: the generated smoke test does not compile (`.when().{allowedmethods}("/orders")`), and the application does not start (`No enum constant ...Method.{ALLOWEDMETHODS}`).
+1. **Fixed** (2026-11-26, see [A rule placeholder without a value](#a-rule-placeholder-without-a-value)). A rule with a `camel_uri` left every placeholder that is not an attribute of the element in the URI and reported `DONE`: `sql:{query}`, `sql-stored:{procedureName}`, `http:{url}...`, `amqp:queue:{destination}`, `sftp:{host}:{port}/...`, `ftp://{host}:{port}/...`, `imap://{host}:{port}`, `pop3://{host}:{port}`, `smtp://{host}:{port}`, `file:{directory}`, `timer:scheduler?period={frequency}`, `cxf://{address}?...`, `salesforce:query?sObjectQuery={query}`, `...?sObjectName={type}`, `file:in?recursive={recursive}`, `platform-http:/orders?httpMethodRestrict={allowedMethods}`. Such an element is now not migrated and `MANUAL_REVIEW`. The values themselves are still not read: that is what remains of items 2, 6, 7, 8 and 12.
+2. `http:listener` without `allowedMethods` is not migrated (a `direct:` endpoint, flagged): the option is in the URI template of rule `http-listener`, where every placeholder is needed. Before the fix of item 1 the generated smoke test did not compile (`.when().{allowedmethods}("/orders")`) and the application did not start (`No enum constant ...Method.{ALLOWEDMETHODS}`). Run on 2026-11-26, outside the probes: with the option left out (`from("platform-http:/orders")`, from a copy of the rule that has `httpMethodRestrict` under `camel_params`) the endpoint answered `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` and `OPTIONS` with 200 or 204; without any rule, the built-in mapping makes up `httpMethodRestrict=GET` and reports `DONE`, and every method but `GET` was answered with 405.
 3. `logger` with `#[payload.field]` in its message is reported `DONE` and the application does not start: `No language could be found for: bean`.
 4. `vm:listener`, `vm:publish`, `vm:consume`: `seda:` endpoints without `camel-quarkus-seda` in the `pom.xml`; the application does not start.
 5. `jms:listener`, `jms:publish`, `jms:consume`: no JMS client and no connection factory in the emitted project (`connectionFactory must be specified`); a listener stops the application from starting. A topic listener is emitted as `jms:queue:`.
-6. `db:select`, `db:insert`, `db:update`, `db:delete`, `db:stored-procedure`: the SQL text and its parameters are not in the route, and `dataSource=default` stops the application from starting.
-7. `scheduler`: the frequency is not read (the timer fired once), a `cron` strategy is ignored, and rule `scheduler-cron` matches nothing.
-8. `http:request`: the host and port of its `http:request-config` are not read, and behind an `http:listener` the step fails with `Invalid url: ... enable the bridgeEndpoint option`.
-9. `file:read`, `sftp:read`, `ftp:read` and `jms:consume` are emitted as producer steps (`.to(...)`): `file:read` wrote instead of reading.
+6. `db:select`, `db:insert`, `db:update`, `db:delete`, `db:stored-procedure`: the SQL text (`<db:sql>`) and its parameters are not read, so the step is not migrated (it throws). No JDBC driver and no data source are in the emitted project. On 2026-11-25, with `sql:{query}?dataSource=default` in the route, `dataSource=default` stopped the application from starting; not measured again.
+7. `scheduler`: the frequency (`<fixed-frequency>`) and a `cron` strategy are not read, so the scheduler is not migrated (a `direct:` endpoint, flagged); rule `scheduler-cron` matches nothing.
+8. `http:request`: the host and port of its `http:request-config` are not read, and rule `http-request` needs both a `url` and a `path`: neither probe is migrated (the step throws). On 2026-11-25, with the URI that was emitted then, the step failed behind an `http:listener` with `Invalid url: ... enable the bridgeEndpoint option`; not measured again.
+9. `jms:consume` is emitted as a producer step (`.to(...)`). The rules of `file:read`, `sftp:read` and `ftp:read` give a producer step as well (on 2026-11-25 `file:read` wrote instead of reading); in the probes these three are not migrated, for lack of a `directory`, a host or a port.
 10. `file:write` writes to a directory named after the file (`out/result.txt/<message id>`); the `workingDir` of a `file:config` is dropped for `file:listener` and `file:write`.
-11. `salesforce:*`: nothing of the connector config is carried over and the application does not start (`loginUrl must be specified`); `salesforce:subscribe-topic` gives an endpoint Camel rejects (`topicName must be supplied`).
-12. `wsc:consume`, `ws:consumer`, `os:store`, `os:retrieve`, `email:send`, `email:listener-imap`, `email:listener-pop3`, `sftp:listener`, `ftp:listener`: reported `DONE`, and the application does not start.
+11. `salesforce:create`, `salesforce:update`: nothing of the connector config is carried over and the application does not start (`loginUrl must be specified`); `salesforce:subscribe-topic` gives an endpoint Camel rejects (`topicName must be supplied`). `salesforce:query`, `salesforce:delete`, `salesforce:upsert`: the SOQL text and the object type are not read, so the step is not migrated (it throws).
+12. `os:store`, `os:retrieve`: reported `DONE`, and the application does not start. `wsc:consume`, `ws:consumer`, `email:send`, `email:listener-imap`, `email:listener-pop3`, `sftp:listener`, `ftp:listener`: address, host and port are on the connection of the config, which is not read, so they are not migrated.
 13. The processors in a scope that is not migrated (`async`, `try`, `until-successful`, `first-successful`, `round-robin`, `parallel-foreach`, `batch:job`, the routes of a `scatter-gather`) are not emitted and have no row in the report.
 14. A flow without source: its first processor is taken as the source, reported as `Unknown source` and not emitted; a `set-payload` there also gets a `DONE` row.
 15. `ee:transform` as Mule 4 writes it (`ee:message` / `ee:set-payload`): the script is not found, the comment in the route does not quote it and no bean is written. Where a stub bean is written, the route does not reference it.
@@ -916,3 +1048,4 @@ is fixed.
 18. `MIGRATION_REPORT.md`: the `File` and `Flow` columns are empty and `Line` is not a line number.
 19. The core binary ignores the `llm` block of a request: the output is the same with and without it. (Read in the code, not run: the DataWeave pattern matcher is only called on the path that has an LLM provider.)
 20. `application.properties` gets `quarkus.artemis.*` keys for JMS without an extension that reads them, and nothing for a database or for Kafka.
+21. (Found on 2026-11-26, outside the 98 probes.) Two flows with the same source that has no mapping at all (two `anypoint-mq:subscriber` flows) both get `from("direct:anypoint-mq-subscriber")`, and the application does not start: `Failed to start route: pricesFlow because: Multiple consumers for the same endpoint is not allowed: direct://anypoint-mq-subscriber`. A source that is not migrated for lack of a value has an endpoint per flow; this older placeholder does not.
