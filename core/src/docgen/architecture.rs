@@ -23,10 +23,7 @@ pub fn generate(ir: &CamelProject, docs_dir: &Path) -> Result<()> {
     md.push_str("| Route ID | Source | Steps |\n");
     md.push_str("|----------|--------|-------|\n");
     for route in &ir.routes {
-        let source = match &route.source {
-            crate::ast::camel_ir::RouteEndpoint::Uri(u) => u.clone(),
-            crate::ast::camel_ir::RouteEndpoint::Direct(d) => format!("direct:{}", d),
-        };
+        let source = route.source.uri();
         md.push_str(&format!(
             "| {} | `{}` | {} |\n",
             route.id,

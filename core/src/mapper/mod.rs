@@ -27,12 +27,17 @@ pub struct Rule {
     pub id: String,
     pub mule_ns: String,
     pub mule_name: String,
+    /// The endpoint URI, with `{attr}` for the value of an attribute of the
+    /// Mule element and `{config.attr}` for one of the element its
+    /// `config-ref` names. `{{key}}` and `${...}` are left to Camel. Every
+    /// placeholder in it is needed: an element that has no value for one of
+    /// them is not migrated.
     pub camel_uri_template: Option<String>,
     /// Camel endpoint options appended to the URI as a query string, in
-    /// declaration order: `(option name, value template)`. A template may
-    /// reference `{attr}` (an attribute of the Mule element) and
-    /// `{config.attr}` (an attribute of the element's `config-ref` target).
-    /// An option whose template cannot be fully resolved is left out.
+    /// declaration order: `(option name, value template)`, with the same
+    /// placeholders as the URI template. These are the options the endpoint
+    /// works without: an option whose template names a value the element
+    /// does not have is left out.
     pub camel_params: Vec<(String, String)>,
     pub camel_component: Option<String>,
     pub maven_deps: Vec<MavenDependency>,
@@ -177,6 +182,8 @@ pub async fn map_project(
         }
     }
 
+    name_unmigrated_sources(&mut camel.routes);
+
     // Sub-flows are `from("direct:...")` routes and flow-refs call them with
     // `.to("direct:...")`. Without the direct component the application does
     // not start ("No endpoint could be found for: direct://...").
@@ -204,7 +211,7 @@ pub async fn map_project(
 /// Whether the route consumes from or sends to a `direct:` endpoint.
 fn route_uses_direct(route: &CamelRoute) -> bool {
     let from_direct = match &route.source {
-        RouteEndpoint::Direct(_) => true,
+        RouteEndpoint::Direct(_) | RouteEndpoint::Unmigrated { .. } => true,
         RouteEndpoint::Uri(uri) => uri.starts_with("direct:"),
     };
     from_direct
@@ -301,8 +308,37 @@ fn map_source(
 ) -> RouteEndpoint {
     let qname = elem.qualified_name();
 
-    // Try rule match first
+    // Try rule match first. A rule with a URI template is the whole
+    // mapping, if the element has a value for every placeholder of the
+    // template. If it does not, the source is not migrated: an endpoint
+    // with a placeholder left in it is not the source of the Mule flow, and
+    // the built-in mappings below would make a value up.
     if let Some(rule) = find_rule(rules, &elem.namespace, &elem.name) {
+        deps.extend(rule.maven_deps.iter().cloned());
+        let endpoint = rule
+            .camel_uri_template
+            .as_deref()
+            .map(|template| (template, rule_endpoint_uri(rule, template, elem)));
+        if let Some((template, Err(unfilled))) = &endpoint {
+            record_decision(
+                decisions,
+                elem,
+                DecisionStatus::ManualReview,
+                Some(&rule.id),
+                &format!(
+                    "{}. The route consumes from a direct: endpoint that nothing sends to, so \
+                     the steps of the flow do not run until from(...) is replaced",
+                    unfilled.rationale(elem, rule, template)
+                ),
+            );
+            return RouteEndpoint::Unmigrated {
+                element: qname,
+                // `name_unmigrated_sources` makes a name of its own of it
+                // for every flow.
+                placeholder: elem.qualified_name().replace(':', "-"),
+                notes: vec![unfilled.note(rule)],
+            };
+        }
         record_decision(
             decisions,
             elem,
@@ -310,9 +346,8 @@ fn map_source(
             Some(&rule.id),
             &rule.notes,
         );
-        deps.extend(rule.maven_deps.iter().cloned());
-        if let Some(ref tmpl) = rule.camel_uri_template {
-            return RouteEndpoint::Uri(rule_endpoint_uri(rule, tmpl, elem));
+        if let Some((_, Ok(uri))) = endpoint {
+            return RouteEndpoint::Uri(uri);
         }
     }
 
@@ -445,23 +480,43 @@ fn map_processor(
     let qname = elem.qualified_name();
 
     // Try rule match first. A rule with a URI template is the whole
-    // mapping. A rule without one (`set-payload`, `choice-router`, ...)
-    // only names the Camel construct: the built-in mapping below does the
-    // work and records the element's one decision, under the rule's id. The
-    // rule must not report the element as done on its own, the built-in
-    // mapping may find that it is not.
+    // mapping, if the element has a value for every placeholder of the
+    // template; if it does not, the element is not migrated and the route
+    // fails at this step (see `unfilled_step`). A rule without a template
+    // (`set-payload`, `choice-router`, ...) only names the Camel construct:
+    // the built-in mapping below does the work and records the element's
+    // one decision, under the rule's id. The rule must not report the
+    // element as done on its own, the built-in mapping may find that it is
+    // not.
     let mut rule_id = None;
     if let Some(rule) = find_rule(rules, &elem.namespace, &elem.name) {
         deps.extend(rule.maven_deps.iter().cloned());
-        if let Some(ref uri) = rule.camel_uri_template {
-            record_decision(
-                decisions,
-                elem,
-                DecisionStatus::Done,
-                Some(&rule.id),
-                &rule.notes,
-            );
-            return vec![RouteStep::ToUri(rule_endpoint_uri(rule, uri, elem))];
+        if let Some(ref template) = rule.camel_uri_template {
+            return match rule_endpoint_uri(rule, template, elem) {
+                Ok(uri) => {
+                    record_decision(
+                        decisions,
+                        elem,
+                        DecisionStatus::Done,
+                        Some(&rule.id),
+                        &rule.notes,
+                    );
+                    vec![RouteStep::ToUri(uri)]
+                }
+                Err(unfilled) => {
+                    record_decision(
+                        decisions,
+                        elem,
+                        DecisionStatus::ManualReview,
+                        Some(&rule.id),
+                        &format!(
+                            "{}. The route fails at this step until it is replaced",
+                            unfilled.rationale(elem, rule, template)
+                        ),
+                    );
+                    unfilled_step(elem, rule, &unfilled)
+                }
+            };
         }
         rule_id = Some(rule.id.as_str());
     }
@@ -1140,24 +1195,313 @@ fn has_attr_value(elem: &MuleElement, key: &str) -> bool {
     elem.attr(key).is_some_and(|v| !v.trim().is_empty())
 }
 
-fn expand_uri_template(template: &str, elem: &MuleElement) -> String {
-    let mut result = template.to_string();
-    for (k, v) in &elem.attributes {
-        result = result.replace(&format!("{{{}}}", k), v);
+/// A piece of the template of a mapping rule: of its `camel_uri`, or of the
+/// value of one of its `camel_params`.
+#[derive(Debug, PartialEq, Eq)]
+enum TemplatePart<'a> {
+    /// Text that goes into the result as it is written.
+    Text(&'a str),
+    /// `{attr}` or `{config.attr}`: the value of an attribute of the Mule
+    /// element, or of the element its `config-ref` names.
+    Placeholder(&'a str),
+}
+
+/// Split the template of a mapping rule into text and placeholders.
+///
+/// * `{name}` is a placeholder.
+/// * `{{key}}` is a Camel property placeholder and `${...}` a Simple
+///   expression: Camel resolves them, and they are text here, braces
+///   included.
+/// * A brace that is not closed starts a placeholder that runs to the end
+///   of the template, so that it does not reach a URI as text either.
+fn template_parts(template: &str) -> Vec<TemplatePart<'_>> {
+    let mut parts = Vec::new();
+    // Where the text that is not yet in `parts` starts, and where the
+    // search for the next brace goes on.
+    let (mut text_start, mut pos) = (0, 0);
+    while let Some(offset) = template[pos..].find('{') {
+        let open = pos + offset;
+        let rest = &template[open..];
+        if rest.starts_with("{{") {
+            if let Some(end) = rest.find("}}") {
+                pos = open + end + 2;
+                continue;
+            }
+        }
+        if template[..open].ends_with('$') {
+            if let Some(end) = closing_brace(rest) {
+                pos = open + end + 1;
+                continue;
+            }
+        }
+        if text_start < open {
+            parts.push(TemplatePart::Text(&template[text_start..open]));
+        }
+        let (name, next) = match rest.find('}') {
+            Some(end) => (&rest[1..end], open + end + 1),
+            None => (&rest[1..], template.len()),
+        };
+        parts.push(TemplatePart::Placeholder(name));
+        (text_start, pos) = (next, next);
     }
-    result
+    if text_start < template.len() {
+        parts.push(TemplatePart::Text(&template[text_start..]));
+    }
+    parts
+}
+
+/// Where the brace that `text` starts with is closed, counting the braces
+/// in between (`${header.{{name}}}`).
+fn closing_brace(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, c) in text.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The value a placeholder of a template stands for: attribute `name` of
+/// the element or, for `config.<name>`, of the element its `config-ref`
+/// names. `None` if there is no such attribute, or if it is blank.
+fn placeholder_value<'a>(name: &str, elem: &'a MuleElement) -> Option<&'a str> {
+    let value = match name.strip_prefix("config.") {
+        Some(config_name) => elem.resolved_config.as_ref()?.attr(config_name)?,
+        None => elem.attr(name)?,
+    };
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// A template that an element has not every value for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unfilled {
+    /// The placeholders without a value, as the template names them
+    /// (`host`, `config.bootstrapServers`): each once, in the order of the
+    /// template.
+    missing: Vec<String>,
+    /// The template with the values that are there filled in and `<name>`
+    /// in the place of each of the others: what the result would look
+    /// like, for a person to read. It is never written into a URI.
+    partial: String,
+}
+
+impl Unfilled {
+    /// The attributes that are missing, in words: `attribute query`,
+    /// `attributes host, port`, `attribute bootstrapServers on its config
+    /// (the element its config-ref names)`.
+    fn missing_attributes(&self) -> String {
+        let named = |names: &[&str]| {
+            let noun = if names.len() == 1 {
+                "attribute"
+            } else {
+                "attributes"
+            };
+            format!("{noun} {}", names.join(", "))
+        };
+        let (on_config, own): (Vec<&str>, Vec<&str>) = self
+            .missing
+            .iter()
+            .map(|name| name.as_str())
+            .partition(|name| name.starts_with("config."));
+        let on_config: Vec<&str> = on_config
+            .iter()
+            .map(|name| name.strip_prefix("config.").unwrap_or(name))
+            .collect();
+        let mut out = Vec::new();
+        if !own.is_empty() {
+            out.push(named(&own));
+        }
+        if !on_config.is_empty() {
+            out.push(format!(
+                "{} on its config (the element its config-ref names)",
+                named(&on_config)
+            ));
+        }
+        out.join(" and no ")
+    }
+
+    /// Why `elem` is not migrated, for its row in the report.
+    fn rationale(&self, elem: &MuleElement, rule: &Rule, template: &str) -> String {
+        format!(
+            "{} is not migrated: rule {} names the endpoint `{template}`, and the element has no \
+             {}. Nothing is put in the place of a missing value: Mule may read it from a child \
+             element or from the connection of the config, which a rule does not read, or have \
+             a default for it",
+            elem.qualified_name(),
+            rule.id,
+            self.missing_attributes()
+        )
+    }
+
+    /// The same for the `TODO` in the route. The template is quoted as
+    /// [`Unfilled::partial`]: no `{placeholder}` is written into the
+    /// generated code, not even in a comment.
+    fn note(&self, rule: &Rule) -> String {
+        format!(
+            "rule {} names the endpoint {} for it, and the element has no {}: nothing is put in \
+             the place of a missing value (Mule may read it from a child element or from the \
+             connection of the config, which a rule does not read, or have a default for it)",
+            rule.id,
+            self.partial,
+            self.missing_attributes()
+        )
+    }
+}
+
+/// Expand the template of a mapping rule for `elem`: every placeholder is
+/// replaced by its value (see [`placeholder_value`]), passed through
+/// `convert`.
+///
+/// Whether a placeholder can be filled is decided here, from the template
+/// and the element, and not by looking for braces in the result afterwards:
+/// the value of an attribute may contain braces of its own (the URI
+/// parameter in `path="/orders/{id}"`), and the text of the template may
+/// (`{{key}}`, `${body}`). A value is written as it is and not expanded
+/// again.
+///
+/// If a placeholder has no value there is no result, only what is missing
+/// ([`Unfilled`]): the caller decides what that means, and cannot write a
+/// placeholder into the generated code by accident.
+fn expand_template(
+    template: &str,
+    elem: &MuleElement,
+    convert: impl Fn(&str) -> String,
+) -> std::result::Result<String, Unfilled> {
+    let mut out = String::new();
+    let mut missing: Vec<String> = Vec::new();
+    for part in template_parts(template) {
+        match part {
+            TemplatePart::Text(text) => out.push_str(text),
+            TemplatePart::Placeholder(name) => match placeholder_value(name, elem) {
+                Some(value) => out.push_str(&convert(value)),
+                None => {
+                    out.push_str(&format!("<{name}>"));
+                    if !missing.iter().any(|known| known == name) {
+                        missing.push(name.to_string());
+                    }
+                }
+            },
+        }
+    }
+    if missing.is_empty() {
+        Ok(out)
+    } else {
+        Err(Unfilled {
+            missing,
+            partial: out,
+        })
+    }
+}
+
+/// Expand the `camel_uri` template of a rule. Every placeholder in it is
+/// needed: without a value for each of them there is no endpoint, and the
+/// element is not migrated.
+fn expand_uri_template(
+    template: &str,
+    elem: &MuleElement,
+) -> std::result::Result<String, Unfilled> {
+    expand_template(template, elem, str::to_string)
 }
 
 /// The endpoint URI a rule produces for `elem`: its URI template plus the
-/// rule's `camel_params`.
-fn rule_endpoint_uri(rule: &Rule, template: &str, elem: &MuleElement) -> String {
-    append_uri_params(
-        expand_uri_template(template, elem),
+/// rule's `camel_params`. `Err` if the element has no value for a
+/// placeholder of the URI template.
+fn rule_endpoint_uri(
+    rule: &Rule,
+    template: &str,
+    elem: &MuleElement,
+) -> std::result::Result<String, Unfilled> {
+    Ok(append_uri_params(
+        expand_uri_template(template, elem)?,
         rule.camel_params
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
         elem,
-    )
+    ))
+}
+
+/// The steps of a processor that has a rule and is not migrated, because
+/// the element has no value for a placeholder of the rule's URI template.
+///
+/// Sending to the URI with the placeholder in it (what used to be emitted,
+/// reported as done) is sending somewhere else, if the application starts
+/// at all; leaving the step out would let the route go on without it. So
+/// the route says what is missing (`TODO`) and fails when it gets there,
+/// like a scatter-gather that is not migrated.
+fn unfilled_step(elem: &MuleElement, rule: &Rule, unfilled: &Unfilled) -> Vec<RouteStep> {
+    let qname = elem.qualified_name();
+    vec![
+        RouteStep::RawDsl(format!(
+            "TODO: review this {qname}, it is not migrated\n\
+             - {}\n\
+             - the route fails at this step instead of sending to an endpoint that is not the \
+             one of the Mule element; replace it with the converted step",
+            unfilled.note(rule)
+        )),
+        RouteStep::ThrowException {
+            class: "UnsupportedOperationException".into(),
+            message: format!(
+                "{qname} not migrated: missing {} (rule {})",
+                unfilled.missing_attributes(),
+                rule.id
+            ),
+        },
+    ]
+}
+
+/// Give the route of every flow whose source is not migrated
+/// ([`RouteEndpoint::Unmigrated`]) a `direct:` endpoint of its own to
+/// consume from: `direct:<source element>-<flow>`.
+///
+/// Camel does not start an application in which two routes consume from
+/// the same `direct:` endpoint, and nothing may send to the placeholder by
+/// accident. So the name is not one that another route consumes from, nor
+/// the name of a flow (a sub-flow consumes from `direct:<its name>`, a
+/// flow-ref sends to `direct:<name of its target>`); a number is added to
+/// it if it is.
+fn name_unmigrated_sources(routes: &mut [CamelRoute]) {
+    let mut taken: std::collections::HashSet<String> =
+        routes.iter().map(|route| route.id.clone()).collect();
+    taken.extend(routes.iter().filter_map(|route| match &route.source {
+        RouteEndpoint::Uri(uri) => uri.strip_prefix("direct:").map(str::to_string),
+        _ => None,
+    }));
+    for route in routes {
+        let RouteEndpoint::Unmigrated { placeholder, .. } = &mut route.source else {
+            continue;
+        };
+        let base = endpoint_name(&format!("{placeholder}-{}", route.id));
+        let mut name = base.clone();
+        let mut number = 2;
+        while !taken.insert(name.clone()) {
+            name = format!("{base}-{number}");
+            number += 1;
+        }
+        *placeholder = name;
+    }
+}
+
+/// `text` as the name of a `direct:` endpoint: letters, digits, `.`, `_`
+/// and `-` are kept, anything else (a flow may be named `get:\orders`)
+/// becomes `-`, so that the name needs no escaping in a URI or in Java.
+fn endpoint_name(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Append endpoint options to `uri` as a query string, skipping every option
@@ -1178,34 +1522,15 @@ fn append_uri_params<'a>(
     uri
 }
 
-/// Expand `{attr}` and `{config.attr}` placeholders in an endpoint option
-/// template. Returns `None` when a referenced attribute is missing (or the
-/// value comes out empty), so optional options simply drop out of the URI.
-/// Text in double braces (`{{key}}`) is a Camel property placeholder and is
-/// kept as written.
+/// Expand the value template of an endpoint option (`camel_params`).
+/// Returns `None` when the element has no value for a placeholder of the
+/// template (or the result is empty): an option is something the endpoint
+/// works without, so it simply drops out of the URI. Mule `${key}`
+/// property placeholders in a value become Camel `{{key}}` placeholders.
 fn expand_param_template(template: &str, elem: &MuleElement) -> Option<String> {
-    let mut out = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        if rest.starts_with("{{") {
-            let end = rest.find("}}")? + 2;
-            out.push_str(&rest[..end]);
-            rest = &rest[end..];
-            continue;
-        }
-        let end = rest.find('}')?;
-        let key = &rest[1..end];
-        let value = match key.strip_prefix("config.") {
-            Some(config_key) => elem.resolved_config.as_ref()?.attr(config_key)?,
-            None => elem.attr(key)?,
-        };
-        out.push_str(&mule_placeholders_to_camel(value));
-        rest = &rest[end + 1..];
-    }
-    out.push_str(rest);
-    (!out.is_empty()).then_some(out)
+    expand_template(template, elem, mule_placeholders_to_camel)
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 /// Rewrite Mule `${key}` property placeholders (the ones the normalizer could

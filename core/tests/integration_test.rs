@@ -775,7 +775,8 @@ async fn emitted_build_files_use_the_java_release_of_the_pom() {
 /// `HTTP:CONNECTIVITY`.
 ///
 /// The whole `SafeFlowRoute.java` is not a golden file yet, because its
-/// `http:` endpoint URI is still wrong; this pins the error handler in it.
+/// `http:request` is not migrated (the rule names a `path` the element does
+/// not have, so the step throws); this pins the error handler in it.
 #[tokio::test]
 async fn hello_world_example_error_handler_is_a_handled_on_exception_clause() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

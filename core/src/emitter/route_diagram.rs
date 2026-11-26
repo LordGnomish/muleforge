@@ -19,20 +19,11 @@ pub fn generate(ir: &CamelProject, output_dir: &Path) -> Result<()> {
         let route_id = sanitize_id(&route.id);
 
         // Source node
-        let source_label = match &route.source {
-            RouteEndpoint::Uri(u) => {
-                let short = u.split('?').next().unwrap_or(u);
-                if short.len() > 40 {
-                    format!("{}...", &short[..37])
-                } else {
-                    short.to_string()
-                }
-            }
-            RouteEndpoint::Direct(d) => format!("direct:{}", d),
-        };
         mermaid.push_str(&format!(
             "    {}__src[\"{}\\n{}\"]:::source\n",
-            route_id, route.id, source_label
+            route_id,
+            route.id,
+            source_label(&route.source)
         ));
 
         // Process steps
@@ -97,6 +88,27 @@ fn sanitize_id(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// The label of the source of a route in the diagram: its endpoint without
+/// options.
+///
+/// A source that is not migrated is a `direct:` endpoint nothing sends to
+/// (see `RouteEndpoint::Unmigrated`): the label names the Mule element and
+/// says so, instead of showing that endpoint like a source that runs.
+fn source_label(source: &RouteEndpoint) -> String {
+    match source {
+        RouteEndpoint::Uri(u) => {
+            let short = u.split('?').next().unwrap_or(u);
+            if short.len() > 40 {
+                format!("{}...", &short[..37])
+            } else {
+                short.to_string()
+            }
+        }
+        RouteEndpoint::Direct(d) => format!("direct:{}", d),
+        RouteEndpoint::Unmigrated { element, .. } => format!("NOT MIGRATED: {element}"),
+    }
 }
 
 /// The label of a step in the diagram.

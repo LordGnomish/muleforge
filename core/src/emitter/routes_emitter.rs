@@ -70,12 +70,25 @@ fn generate_route_builder(class_name: &str, route: &CamelRoute) -> String {
         java.push('\n');
     }
 
-    // Route definition
-    let from_uri = match &route.source {
-        RouteEndpoint::Uri(uri) => format!("\"{}\"", uri),
-        RouteEndpoint::Direct(name) => format!("\"direct:{}\"", name),
-    };
-    java.push_str(&format!("        from({})\n", from_uri));
+    // Route definition. A source that is not migrated is a `direct:`
+    // endpoint that nothing sends to: the TODO in front of it says what the
+    // source is and what is missing.
+    let from_uri = route.source.uri();
+    if let RouteEndpoint::Unmigrated { element, notes, .. } = &route.source {
+        let stands_in = format!(
+            "the route consumes from {from_uri} instead, which nothing sends to: its steps do \
+             not run until from(...) is replaced with the endpoint of the source"
+        );
+        let mut notes: Vec<&str> = notes.iter().map(String::as_str).collect();
+        notes.push(&stands_in);
+        push_todo(
+            &mut java,
+            "        ",
+            &format!("review the source of this flow, it is not migrated (Mule: {element})"),
+            &notes,
+        );
+    }
+    java.push_str(&format!("        from(\"{}\")\n", from_uri));
     java.push_str(&format!("            .routeId(\"{}\")\n", route.id));
     if leaves_failures_to_caller(route) {
         java.push_str("            .errorHandler(noErrorHandler())\n");
