@@ -1248,6 +1248,74 @@ mod tests {
         }
     }
 
+    /// A flow whose source is not migrated. An endpoint with a value
+    /// missing does not start, and a route cannot fail at its source: the
+    /// route consumes from a `direct:` endpoint nothing sends to, and the
+    /// TODO in front of `from(...)` names the Mule source and what is
+    /// missing.
+    #[test]
+    fn source_that_is_not_migrated_is_a_direct_endpoint_with_a_todo() {
+        let source = || RouteEndpoint::Unmigrated {
+            element: "sftp:listener".into(),
+            placeholder: "sftp-listener-shared".into(),
+            notes: vec![
+                "rule sftp-listener names the endpoint sftp:<host>:<port>/inbox for it, and \
+                 the element has no attributes host, port"
+                    .into(),
+            ],
+        };
+        let java = shared_route_java(source(), vec![]);
+
+        let route = r#"
+    public void configure() throws Exception {
+        // TODO: review the source of this flow, it is not migrated (Mule: sftp:listener)
+        // - rule sftp-listener names the endpoint sftp:<host>:<port>/inbox for it, and the element has no attributes host, port
+        // - the route consumes from direct:sftp-listener-shared instead, which nothing sends to: its steps do not run until from(...) is replaced with the endpoint of the source
+        from("direct:sftp-listener-shared")
+            .routeId("shared")
+            .setProperty("enriched", constant("true"))
+            ;
+    }
+"#;
+        assert!(java.contains(route), "expected route:{route}\nin:\n{java}");
+
+        // It is the route of a flow, not of a sub-flow: it keeps its error
+        // handler, and its exception clauses stay in front of the TODO.
+        let java = shared_route_java(
+            source(),
+            vec![handler(&["java.lang.Exception"], true, vec![])],
+        );
+        assert!(!java.contains("errorHandler"), "{java}");
+        let clause = java.find("onException(java.lang.Exception.class)").unwrap();
+        let todo = java
+            .find("// TODO: review the source of this flow")
+            .unwrap();
+        let from = java.find("from(\"direct:sftp-listener-shared\")").unwrap();
+        assert!(clause < todo && todo < from, "{java}");
+    }
+
+    /// What the notes quote comes from the Mule XML (the value of an
+    /// attribute): it stays in the comment.
+    #[test]
+    fn todo_of_a_source_that_is_not_migrated_stays_a_comment() {
+        let java = shared_route_java(
+            RouteEndpoint::Unmigrated {
+                element: "x:listener".into(),
+                placeholder: "x-listener-shared".into(),
+                notes: vec!["the endpoint x:C:\\users\\a\nfrom(\"x:b\")\rfrom(\"x:c\")".into()],
+            },
+            vec![],
+        );
+
+        assert!(!starts_unicode_escape(&java), "{java}");
+        let from: Vec<&str> = javac_lines(&java)
+            .into_iter()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("from("))
+            .collect();
+        assert_eq!(from, ["from(\"direct:x-listener-shared\")"], "{java}");
+    }
+
     #[test]
     fn direct_route_with_exception_handlers_keeps_them_in_force() {
         // onException clauses only work with an error handler: without one

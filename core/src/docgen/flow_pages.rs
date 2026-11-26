@@ -147,6 +147,37 @@ mod tests {
     use super::*;
     use crate::ast::camel_ir::{ComparedValue, Expression, SplitSource};
 
+    /// A source that is not migrated is a `direct:` endpoint nothing sends
+    /// to. The page must not list it like the source of a flow that runs.
+    #[test]
+    fn source_that_is_not_migrated_is_described_as_not_migrated() {
+        assert_eq!(
+            describe_source(&RouteEndpoint::Unmigrated {
+                element: "sftp:listener".into(),
+                placeholder: "sftp-listener-ordersFlow".into(),
+                notes: vec!["why".into()],
+            }),
+            "**Source endpoint:** `direct:sftp-listener-ordersFlow`\n\n\
+             **Source not migrated:** `sftp:listener` - the route consumes from the `direct:` \
+             endpoint above instead, which nothing sends to, so its steps do not run (see the \
+             TODO in the route class)\n\n"
+        );
+    }
+
+    #[test]
+    fn source_that_is_migrated_is_described_as_before() {
+        assert_eq!(
+            describe_source(&RouteEndpoint::Uri(
+                "platform-http:/orders?httpMethodRestrict=GET".into()
+            )),
+            "**Source endpoint:** `platform-http:/orders?httpMethodRestrict=GET`\n\n"
+        );
+        assert_eq!(
+            describe_source(&RouteEndpoint::Direct("shared".into())),
+            "**Source endpoint:** `direct:shared`\n\n"
+        );
+    }
+
     fn unconverted() -> Expression {
         Expression::Unconverted {
             original: "#[now()]".into(),

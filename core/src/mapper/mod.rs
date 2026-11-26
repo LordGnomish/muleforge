@@ -1630,6 +1630,558 @@ mappings:
         );
     }
 
+    // ── Templates: placeholders the element has no value for ────────────
+
+    fn missing(template: &str, e: &MuleElement) -> Vec<String> {
+        expand_uri_template(template, e)
+            .expect_err("a placeholder has no value")
+            .missing
+    }
+
+    #[test]
+    fn uri_template_is_filled_from_the_attributes_of_the_element() {
+        let e = elem(
+            "sftp",
+            "write",
+            &[
+                ("host", "files.example.org"),
+                ("port", "22"),
+                ("path", "out/a.txt"),
+            ],
+        );
+        assert_eq!(
+            expand_uri_template("sftp:{host}:{port}/{path}", &e),
+            Ok("sftp:files.example.org:22/out/a.txt".to_string())
+        );
+        // A template without placeholders needs nothing.
+        assert_eq!(
+            expand_uri_template(
+                "infinispan:objectStore?operation=PUT",
+                &elem("os", "store", &[])
+            ),
+            Ok("infinispan:objectStore?operation=PUT".to_string())
+        );
+    }
+
+    /// What used to happen: the placeholder stayed in the URI
+    /// (`sftp:{host}:{port}/out/a.txt`) and the caller could not tell.
+    #[test]
+    fn uri_template_names_every_placeholder_the_element_has_no_value_for() {
+        let e = elem("sftp", "write", &[("path", "out/a.txt")]);
+        let unfilled = expand_uri_template("sftp:{host}:{port}/{path}", &e).unwrap_err();
+        assert_eq!(unfilled.missing, ["host", "port"]);
+        // For a person to read: what is there is filled in, and nothing
+        // in it is a `{placeholder}`.
+        assert_eq!(unfilled.partial, "sftp:<host>:<port>/out/a.txt");
+
+        // An element without attributes has a value for none of them.
+        assert_eq!(
+            missing("sftp:{host}:{port}/{path}", &elem("sftp", "write", &[])),
+            ["host", "port", "path"]
+        );
+    }
+
+    /// The options a rule writes into its URI template are part of the
+    /// endpoint like the rest of it (`camel_params` are the options that
+    /// may be left out).
+    #[test]
+    fn placeholder_in_the_query_of_a_uri_template_is_needed_like_any_other() {
+        let template = "platform-http:{path}?httpMethodRestrict={allowedMethods}";
+        let listener = elem("http", "listener", &[("path", "/orders")]);
+        assert_eq!(missing(template, &listener), ["allowedMethods"]);
+        assert_eq!(
+            missing(
+                "timer:scheduler?period={frequency}",
+                &elem("", "scheduler", &[])
+            ),
+            ["frequency"]
+        );
+    }
+
+    #[test]
+    fn blank_attribute_does_not_fill_a_placeholder() {
+        for blank in ["", " ", "\t"] {
+            let e = elem("jms", "publish", &[("destination", blank)]);
+            assert_eq!(
+                missing("jms:queue:{destination}", &e),
+                ["destination"],
+                "{blank:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_named_twice_is_missing_once() {
+        let unfilled =
+            expand_uri_template("x:{name}/{name}?id={id}", &elem("x", "send", &[])).unwrap_err();
+        assert_eq!(unfilled.missing, ["name", "id"]);
+        assert_eq!(unfilled.partial, "x:<name>/<name>?id=<id>");
+    }
+
+    /// `{{key}}` is resolved by Camel from the application's properties and
+    /// `${...}` by Simple: neither is a placeholder of the template, whether
+    /// or not the element happens to have an attribute of that name.
+    #[test]
+    fn camel_property_placeholders_and_simple_expressions_pass_through() {
+        let template = "x:{name}?brokers={{key}}&fileName=${body}-${header.{{key}}}";
+        for attrs in [
+            vec![("name", "n")],
+            vec![("name", "n"), ("key", "K"), ("body", "B")],
+        ] {
+            assert_eq!(
+                expand_uri_template(template, &elem("x", "send", &attrs)),
+                Ok("x:n?brokers={{key}}&fileName=${body}-${header.{{key}}}".to_string()),
+                "{attrs:?}"
+            );
+        }
+        // They are not what is missing either.
+        assert_eq!(missing(template, &elem("x", "send", &[])), ["name"]);
+    }
+
+    /// The value of an attribute is written as it is. Braces in it are its
+    /// own (a URI parameter of an HTTP listener): they are neither a
+    /// placeholder that is filled from another attribute, nor one that is
+    /// missing.
+    #[test]
+    fn value_with_braces_is_written_as_it_is_and_not_expanded_again() {
+        let listener = elem(
+            "http",
+            "listener",
+            &[
+                ("path", "/orders/{id}/{allowedMethods}"),
+                ("allowedMethods", "GET"),
+                ("id", "7"),
+            ],
+        );
+        assert_eq!(
+            expand_uri_template(
+                "platform-http:{path}?httpMethodRestrict={allowedMethods}",
+                &listener
+            ),
+            Ok("platform-http:/orders/{id}/{allowedMethods}?httpMethodRestrict=GET".to_string())
+        );
+    }
+
+    #[test]
+    fn config_placeholder_in_a_uri_template_is_filled_from_the_resolved_config() {
+        let template = "x://{config.host}:{config.port}/{name}";
+        let bare = elem("x", "send", &[("name", "n"), ("host", "not-this-one")]);
+        assert_eq!(missing(template, &bare), ["config.host", "config.port"]);
+
+        let configured = with_config(bare, elem("x", "config", &[("host", "h"), ("port", " ")]));
+        assert_eq!(missing(template, &configured), ["config.port"]);
+
+        let complete = with_config(
+            configured,
+            elem("x", "config", &[("host", "h"), ("port", "22")]),
+        );
+        assert_eq!(
+            expand_uri_template(template, &complete),
+            Ok("x://h:22/n".to_string())
+        );
+    }
+
+    /// A template with a brace that is not closed is a mistake in the rule.
+    /// The brace must not reach the URI as text.
+    #[test]
+    fn brace_that_is_not_closed_never_reaches_the_uri() {
+        let e = elem("x", "send", &[("name", "n")]);
+        assert_eq!(missing("x:{name?fixed=1", &e), ["name?fixed=1"]);
+        assert_eq!(missing("x:{name}?a={{key", &e), ["{key"]);
+        assert_eq!(expand_uri_template("x:{name", &e), Ok("x:n".to_string()));
+    }
+
+    #[test]
+    fn camel_param_with_a_placeholder_it_cannot_fill_drops_out_whole() {
+        let e = elem("x", "send", &[("a", "1"), ("blank", " ")]);
+        assert_eq!(expand_param_template("{a}", &e), Some("1".to_string()));
+        assert_eq!(expand_param_template("{a}:{b}", &e), None);
+        assert_eq!(expand_param_template("{blank}", &e), None);
+        assert_eq!(expand_param_template("{a}-{blank}", &e), None);
+        assert_eq!(expand_param_template("{config.a}", &e), None);
+        // Text that Camel resolves is kept, with or without a placeholder.
+        assert_eq!(
+            expand_param_template("${header.CamelFileName}", &e),
+            Some("${header.CamelFileName}".to_string())
+        );
+        assert_eq!(
+            expand_param_template("{{prefix}}-{a}", &e),
+            Some("{{prefix}}-1".to_string())
+        );
+    }
+
+    fn shipped_rules() -> Vec<Rule> {
+        load_rules(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../mappings"))
+            .expect("load mappings/")
+    }
+
+    /// A `db:select` as Mule 4 writes it: the statement is in a child
+    /// element. Rule `db-select` names `sql:{query}?dataSource=default`.
+    fn db_select() -> MuleElement {
+        let mut sql = elem("db", "sql", &[]);
+        sql.text = Some("SELECT id FROM orders".into());
+        let mut select = elem("db", "select", &[("config-ref", "Database_Config")]);
+        select.children = vec![sql];
+        select
+    }
+
+    /// The step used to be `.to("sql:{query}?dataSource=default")`, reported
+    /// as done. It is not migrated: the route says so and fails there.
+    #[test]
+    fn processor_with_a_placeholder_it_cannot_fill_is_a_step_that_throws() {
+        let mut deps = Vec::new();
+        let mut decisions = Vec::new();
+        let steps = map_processor(
+            &db_select(),
+            App::default(),
+            &shipped_rules(),
+            &mut decisions,
+            &mut deps,
+        );
+
+        match &steps[..] {
+            [RouteStep::RawDsl(todo), RouteStep::ThrowException { class, message }] => {
+                let lines: Vec<&str> = todo.lines().collect();
+                assert_eq!(lines[0], "TODO: review this db:select, it is not migrated");
+                assert!(
+                    lines[1].starts_with(
+                        "- rule db-select names the endpoint sql:<query>?dataSource=default \
+                         for it, and the element has no attribute query:"
+                    ),
+                    "{todo}"
+                );
+                assert!(
+                    lines[2].starts_with("- the route fails at this step"),
+                    "{todo}"
+                );
+                assert_eq!(lines.len(), 3, "{todo}");
+                assert_eq!(class, "UnsupportedOperationException");
+                assert_eq!(
+                    message,
+                    "db:select not migrated: missing attribute query (rule db-select)"
+                );
+                // What goes into the route class has no placeholder in it,
+                // not even in a comment.
+                assert!(!todo.contains('{') && !message.contains('{'), "{steps:?}");
+            }
+            other => panic!("expected a TODO and a step that throws, got {other:?}"),
+        }
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].mule_element, "db:select");
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+        assert_eq!(decisions[0].rule_id.as_deref(), Some("db-select"));
+        let rationale = &decisions[0].rationale;
+        assert!(
+            rationale.starts_with(
+                "db:select is not migrated: rule db-select names the endpoint \
+                 `sql:{query}?dataSource=default`, and the element has no attribute query."
+            ),
+            "{rationale}"
+        );
+        assert!(
+            rationale.ends_with("The route fails at this step until it is replaced"),
+            "{rationale}"
+        );
+    }
+
+    /// Every element of the same kind, wherever a rule is applied: several
+    /// missing attributes are all named, in the message too.
+    #[test]
+    fn step_that_throws_names_every_missing_attribute() {
+        let write = elem(
+            "sftp",
+            "write",
+            &[("config-ref", "SFTP_Config"), ("path", "outbox/a.txt")],
+        );
+        let (steps, decisions) = steps_and_decisions(&write, &shipped_rules());
+        assert!(
+            matches!(
+                &steps[..],
+                [RouteStep::RawDsl(todo), RouteStep::ThrowException { message, .. }]
+                    if todo.contains("sftp:<host>:<port>/outbox/a.txt")
+                        && todo.contains("the element has no attributes host, port:")
+                        && message == "sftp:write not migrated: missing attributes host, port \
+                                       (rule sftp-write)"
+            ),
+            "{steps:?}"
+        );
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+    }
+
+    /// A value on the config is named as such.
+    #[test]
+    fn step_that_throws_says_which_missing_attribute_is_one_of_the_config() {
+        let rules = rules_from_yaml(
+            r#"
+mappings:
+  - id: x-send
+    mule_ns: x
+    mule_name: send
+    camel_uri: "x://{config.host}/{name}"
+"#,
+        );
+        let (steps, decisions) = steps_and_decisions(&elem("x", "send", &[]), &rules);
+        assert!(
+            matches!(
+                &steps[..],
+                [RouteStep::RawDsl(todo), RouteStep::ThrowException { message, .. }]
+                    if todo.contains("x://<config.host>/<name>")
+                        && message == "x:send not migrated: missing attribute name and no \
+                                       attribute host on its config (the element its \
+                                       config-ref names) (rule x-send)"
+            ),
+            "{steps:?}"
+        );
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+    }
+
+    /// The guard is about a value that is missing. An element that has
+    /// every value its rule names is mapped as before.
+    #[test]
+    fn processor_with_a_value_for_every_placeholder_is_mapped_as_before() {
+        let publish = elem("jms", "publish", &[("destination", "orders.out")]);
+        let (steps, decisions) = steps_and_decisions(&publish, &shipped_rules());
+        assert!(
+            matches!(&steps[..], [RouteStep::ToUri(uri)] if uri == "jms:queue:orders.out"),
+            "{steps:?}"
+        );
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].status, DecisionStatus::Done);
+        assert_eq!(decisions[0].rule_id.as_deref(), Some("jms-publish"));
+    }
+
+    /// A rule is applied to a processor at every depth: in a branch of a
+    /// choice, in a foreach, in an on-error scope.
+    #[test]
+    fn nested_processor_with_a_placeholder_it_cannot_fill_is_a_step_that_throws_too() {
+        let rules = shipped_rules();
+        let throws = |steps: &[RouteStep]| {
+            matches!(
+                steps,
+                [RouteStep::RawDsl(_), RouteStep::ThrowException { message, .. }]
+                    if message.starts_with("db:select not migrated: ")
+            )
+        };
+
+        let mut when = elem("", "when", &[("expression", "#[true]")]);
+        when.children = vec![db_select()];
+        let (steps, _) = steps_and_decisions(&choice(vec![when]), &rules);
+        let (whens, _) = only_choice(steps);
+        assert!(throws(&whens[0].1), "{whens:?}");
+
+        let (steps, _) = steps_and_decisions(&foreach(&[], vec![db_select()]), &rules);
+        let (_, _, in_split, _) = only_split(steps);
+        assert!(throws(&in_split), "{in_split:?}");
+
+        let mut scope = on_error("on-error-continue", &[]);
+        scope.children = vec![db_select()];
+        let mut decisions = Vec::new();
+        let handlers = map_error_handler(
+            &error_handler(vec![scope]),
+            App::default(),
+            &rules,
+            &mut decisions,
+            &mut Vec::new(),
+        );
+        assert!(throws(&handlers[0].steps), "{handlers:?}");
+        let select = decisions_for(&decisions, "db:select");
+        assert_eq!(select.len(), 1, "{decisions:?}");
+        assert_eq!(select[0].status, DecisionStatus::ManualReview);
+    }
+
+    /// The source used to be `from("sftp:{host}:{port}/inbox")`, reported
+    /// as done, and the application did not start. There is no step to fail
+    /// at: the source is not migrated, and says so.
+    #[test]
+    fn source_with_a_placeholder_it_cannot_fill_is_not_migrated() {
+        let listener = elem(
+            "sftp",
+            "listener",
+            &[("config-ref", "SFTP_Config"), ("directory", "inbox")],
+        );
+        let mut decisions = Vec::new();
+        let mut deps = Vec::new();
+        let source = map_source(&listener, &shipped_rules(), &mut decisions, &mut deps);
+
+        match &source {
+            RouteEndpoint::Unmigrated { element, notes, .. } => {
+                assert_eq!(element, "sftp:listener");
+                assert_eq!(notes.len(), 1, "{notes:?}");
+                assert!(
+                    notes[0].starts_with(
+                        "rule sftp-listener names the endpoint sftp:<host>:<port>/inbox for \
+                         it, and the element has no attributes host, port:"
+                    ),
+                    "{notes:?}"
+                );
+                assert!(!notes[0].contains('{'), "{notes:?}");
+            }
+            other => panic!("expected a source that is not migrated, got {other:?}"),
+        }
+        assert!(source.uri().starts_with("direct:"), "{}", source.uri());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].mule_element, "sftp:listener");
+        assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+        assert_eq!(decisions[0].rule_id.as_deref(), Some("sftp-listener"));
+        let rationale = &decisions[0].rationale;
+        assert!(
+            rationale.starts_with(
+                "sftp:listener is not migrated: rule sftp-listener names the endpoint \
+                 `sftp:{host}:{port}/{directory}`, and the element has no attributes host, port."
+            ),
+            "{rationale}"
+        );
+        assert!(
+            rationale.contains("consumes from a direct: endpoint that nothing sends to"),
+            "{rationale}"
+        );
+    }
+
+    /// No value is made up for the missing one either: the built-in
+    /// mappings behind the rules would take `GET`, `60000`, `/tmp/input`.
+    #[test]
+    fn source_with_a_placeholder_it_cannot_fill_does_not_fall_back_to_a_made_up_value() {
+        let rules = shipped_rules();
+        for (source, missing) in [
+            (
+                elem("http", "listener", &[("path", "/orders")]),
+                "attribute allowedMethods",
+            ),
+            (elem("", "scheduler", &[]), "attribute frequency"),
+            (
+                elem("file", "listener", &[("recursive", "true")]),
+                "attribute directory",
+            ),
+        ] {
+            let mut decisions = Vec::new();
+            let mapped = map_source(&source, &rules, &mut decisions, &mut Vec::new());
+            assert!(
+                matches!(&mapped, RouteEndpoint::Unmigrated { notes, .. }
+                    if notes[0].contains(&format!("the element has no {missing}:"))),
+                "{mapped:?}"
+            );
+            assert_eq!(decisions.len(), 1, "{decisions:?}");
+            assert_eq!(decisions[0].status, DecisionStatus::ManualReview);
+        }
+    }
+
+    #[test]
+    fn source_with_a_value_for_every_placeholder_is_mapped_as_before() {
+        let rules = shipped_rules();
+        let mut decisions = Vec::new();
+        assert_eq!(
+            source_uri(&http_listener(), &rules),
+            "platform-http:/orders?httpMethodRestrict=GET"
+        );
+        map_source(&http_listener(), &rules, &mut decisions, &mut Vec::new());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].status, DecisionStatus::Done);
+        assert_eq!(decisions[0].rule_id.as_deref(), Some("http-listener"));
+    }
+
+    async fn map_flows_with_shipped_rules(flows: Vec<MuleFlow>) -> CamelProject {
+        let project = MuleProject {
+            name: "orders".into(),
+            flows,
+            configs: vec![],
+            properties: Default::default(),
+            globals: vec![],
+        };
+        map_project(&project, &shipped_rules(), None)
+            .await
+            .unwrap()
+            .0
+    }
+
+    fn placeholder_of(camel: &CamelProject, route: &str) -> String {
+        let route = camel.routes.iter().find(|r| r.id == route).unwrap();
+        assert!(
+            matches!(route.source, RouteEndpoint::Unmigrated { .. }),
+            "{:?}",
+            route.source
+        );
+        route.source.uri()
+    }
+
+    /// Camel does not start an application in which two routes consume
+    /// from the same `direct:` endpoint ("Cannot add a 2nd consumer to the
+    /// same endpoint"), and a flow-ref must not reach a placeholder.
+    #[tokio::test]
+    async fn every_flow_whose_source_is_not_migrated_consumes_from_an_endpoint_of_its_own() {
+        let listener = || elem("http", "listener", &[("path", "/orders")]);
+        let camel = map_flows_with_shipped_rules(vec![
+            flow("ordersFlow", false, vec![listener(), logger("orders")]),
+            flow("pricesFlow", false, vec![listener(), logger("prices")]),
+            // Names that are the same once they are made safe for a URI.
+            flow("get:\\stock", false, vec![listener()]),
+            flow("get:/stock", false, vec![listener()]),
+            // A sub-flow that has the name a placeholder would get, called
+            // twice so that it is a route of its own.
+            flow("http-listener-callerFlow", true, vec![logger("shared")]),
+            flow(
+                "callerFlow",
+                false,
+                vec![
+                    listener(),
+                    elem("", "flow-ref", &[("name", "http-listener-callerFlow")]),
+                    elem("", "flow-ref", &[("name", "http-listener-callerFlow")]),
+                ],
+            ),
+        ])
+        .await;
+
+        assert_eq!(
+            placeholder_of(&camel, "ordersFlow"),
+            "direct:http-listener-ordersFlow"
+        );
+        assert_eq!(
+            placeholder_of(&camel, "pricesFlow"),
+            "direct:http-listener-pricesFlow"
+        );
+        assert_eq!(
+            placeholder_of(&camel, "get:\\stock"),
+            "direct:http-listener-get--stock"
+        );
+        assert_eq!(
+            placeholder_of(&camel, "get:/stock"),
+            "direct:http-listener-get--stock-2"
+        );
+        assert_eq!(
+            placeholder_of(&camel, "callerFlow"),
+            "direct:http-listener-callerFlow-2"
+        );
+
+        let consumed: Vec<String> = camel.routes.iter().map(|r| r.source.uri()).collect();
+        let distinct: std::collections::BTreeSet<&String> = consumed.iter().collect();
+        assert_eq!(distinct.len(), consumed.len(), "{consumed:?}");
+    }
+
+    /// The placeholder is a `direct:` endpoint: without the extension the
+    /// application does not start ("No endpoint could be found for:
+    /// direct://...").
+    #[tokio::test]
+    async fn source_that_is_not_migrated_brings_the_direct_component() {
+        let camel = map_flows_with_shipped_rules(vec![flow(
+            "ordersFlow",
+            false,
+            vec![
+                elem("http", "listener", &[("path", "/orders")]),
+                logger("orders"),
+            ],
+        )])
+        .await;
+        assert!(
+            camel
+                .maven_dependencies
+                .iter()
+                .any(|d| d.artifact_id == "camel-quarkus-direct"),
+            "{:?}",
+            camel.maven_dependencies
+        );
+    }
+
     // ── direct: endpoints ───────────────────────────────────────────────
 
     fn flow(name: &str, is_sub_flow: bool, processors: Vec<MuleElement>) -> MuleFlow {

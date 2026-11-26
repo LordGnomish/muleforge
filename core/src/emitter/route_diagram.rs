@@ -192,6 +192,30 @@ mod tests {
         }
     }
 
+    /// A source that is not migrated is a `direct:` endpoint nothing sends
+    /// to: the diagram names the Mule source and says so.
+    #[test]
+    fn source_that_is_not_migrated_is_labelled_as_not_migrated() {
+        assert_eq!(
+            source_label(&RouteEndpoint::Unmigrated {
+                element: "sftp:listener".into(),
+                placeholder: "sftp-listener-ordersFlow".into(),
+                notes: vec!["why".into()],
+            }),
+            "NOT MIGRATED: sftp:listener"
+        );
+        assert_eq!(
+            source_label(&RouteEndpoint::Uri(
+                "platform-http:/orders?httpMethodRestrict=GET".into()
+            )),
+            "platform-http:/orders"
+        );
+        assert_eq!(
+            source_label(&RouteEndpoint::Direct("shared".into())),
+            "direct:shared"
+        );
+    }
+
     /// A step whose value is not converted is emitted as a step that
     /// throws: the diagram must not label it as the step it would be.
     #[test]
